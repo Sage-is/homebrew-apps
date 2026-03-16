@@ -1,0 +1,156 @@
+#!/bin/bash
+set -euo pipefail
+
+IMAGE="ghcr.io/sage-is/ai-ui:latest"
+CONTAINER="sage-ai"
+VOLUME="sage-ai-data"
+DATA_MOUNT="/app/backend/data"
+DEFAULT_PORT=8080
+
+usage() {
+  cat <<EOF
+Usage: ai-ui <command> [options]
+
+Commands:
+  start [--port PORT]   Pull image and start Sage AI UI (default port: $DEFAULT_PORT)
+  stop                  Stop the running container
+  update                Pull latest image and restart
+  logs                  Tail container logs
+  open                  Open the UI in your default browser
+  status                Show container status
+
+EOF
+}
+
+# Minimum VM memory in MB — Vite builds OOM at the 2GB default
+MIN_VM_MEMORY_MB=8192
+
+# Ensure Podman is reachable; on macOS, init/start a machine if needed.
+ensure_podman() {
+  # Quick connectivity check — works on both Linux (native) and macOS (machine)
+  if podman info &>/dev/null; then
+    return 0
+  fi
+
+  # On Linux, Podman runs natively — if `podman info` failed, it's a real problem.
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "Error: Cannot connect to Podman."
+    echo "  Verify the Podman service is running:  systemctl --user start podman.socket"
+    echo "  Or check connections:                  podman system connection list"
+    exit 1
+  fi
+
+  # --- macOS: we need a Podman machine ---
+  echo "Podman is not reachable. Setting up a Podman machine..."
+
+  # If no machine exists yet, create one with enough memory
+  if ! podman machine inspect &>/dev/null; then
+    echo "Initializing Podman machine (memory: ${MIN_VM_MEMORY_MB}MB)..."
+    if ! podman machine init --memory "$MIN_VM_MEMORY_MB"; then
+      echo "Error: 'podman machine init' failed."
+      echo "  Try running manually:  podman machine init --memory $MIN_VM_MEMORY_MB"
+      exit 1
+    fi
+  fi
+
+  # Start the machine
+  echo "Starting Podman machine..."
+  if ! podman machine start; then
+    echo "Error: 'podman machine start' failed."
+    echo "  Check status with:  podman machine list"
+    echo "  Try removing and re-creating:  podman machine rm && podman machine init --memory $MIN_VM_MEMORY_MB"
+    exit 1
+  fi
+
+  # Final connectivity check
+  if ! podman info &>/dev/null; then
+    echo "Error: Podman machine is running but still cannot connect."
+    echo "  Check your connections:  podman system connection list"
+    exit 1
+  fi
+
+  echo "Podman machine is ready."
+}
+
+cmd_start() {
+  local port=$DEFAULT_PORT
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  ensure_podman
+
+  echo "Pulling latest image..."
+  podman pull "$IMAGE"
+
+  # Stop existing container if running
+  podman rm -f "$CONTAINER" 2>/dev/null || true
+
+  echo "Starting Sage AI UI on port $port..."
+  podman run -d \
+    -p "$port:8080" \
+    -v "$VOLUME:$DATA_MOUNT" \
+    --name "$CONTAINER" \
+    "$IMAGE"
+
+  echo ""
+  echo "Sage AI UI is running at http://localhost:$port"
+  echo "Run 'ai-ui open' to open in your browser."
+}
+
+cmd_stop() {
+  echo "Stopping Sage AI UI..."
+  podman stop "$CONTAINER" 2>/dev/null || true
+  podman rm "$CONTAINER" 2>/dev/null || true
+  echo "Stopped."
+}
+
+cmd_update() {
+  echo "Pulling latest image..."
+  podman pull "$IMAGE"
+  cmd_stop
+  cmd_start "$@"
+}
+
+cmd_logs() {
+  podman logs -f "$CONTAINER"
+}
+
+cmd_open() {
+  local port
+  port=$(podman port "$CONTAINER" 8080 2>/dev/null | head -1 | cut -d: -f2)
+  if [[ -z "$port" ]]; then
+    echo "Container is not running. Start it first with: ai-ui start"
+    exit 1
+  fi
+  open "http://localhost:$port"
+}
+
+cmd_status() {
+  podman inspect --format='Status: {{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "Container is not running."
+  local port
+  port=$(podman port "$CONTAINER" 8080 2>/dev/null | head -1 | cut -d: -f2)
+  if [[ -n "$port" ]]; then
+    echo "URL: http://localhost:$port"
+  fi
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+command="$1"; shift
+case "$command" in
+  start)  cmd_start "$@" ;;
+  stop)   cmd_stop ;;
+  update) cmd_update "$@" ;;
+  logs)   cmd_logs ;;
+  open)   cmd_open ;;
+  status) cmd_status ;;
+  -h|--help|help) usage ;;
+  *) echo "Unknown command: $command"; usage; exit 1 ;;
+esac
