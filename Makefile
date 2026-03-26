@@ -59,7 +59,10 @@ sha256:
 		exit 1; \
 	fi
 	@echo "Downloading: $(FORMULA_URL)"
-	@curl -fsSL "$(FORMULA_URL)" | shasum -a 256 | awk '{print $$1}'
+	$(eval HASH := $(shell curl -fsSL "$(FORMULA_URL)" | shasum -a 256 | awk '{print $$1}'))
+	@echo "sha256: $(HASH)"
+	@sed -i '' 's/sha256 ".*"/sha256 "$(HASH)"/' $(FORMULA)
+	@echo "Updated $(FORMULA)"
 
 # ---------------------------------------------------------------------------
 # Formula Management
@@ -127,21 +130,27 @@ hotfix:
 
 release_finish:
 	@echo "=== Finishing release ==="
-	git flow release finish "$$(git branch --show-current | sed 's/release\///')" && git push origin develop && git push origin master && git push --tags && git checkout develop
+	git flow release finish "$$(git branch --show-current | sed 's/release\///')" && git push origin develop && git push origin master && git push --tags
+	@echo ""
+	@echo "=== Updating sha256 ==="
+	@make sha256
+	@git add $(FORMULA) && git commit -m "Update sha256 for v$(IMAGE_TAG)"
+	@git push origin master
+	@git checkout develop && git merge master && git push origin develop
 	@echo ""
 	@echo "=== Release complete ==="
-	@echo "Now compute and update sha256:"
-	@echo "  make sha256"
-	@echo "  # Update sha256 in $(FORMULA), commit, push"
 
 hotfix_finish:
 	@echo "=== Finishing hotfix ==="
-	git flow hotfix finish "$$(git branch --show-current | sed 's/hotfix\///')" && git push origin develop && git push origin master && git push --tags && git checkout develop
+	git flow hotfix finish "$$(git branch --show-current | sed 's/hotfix\///')" && git push origin develop && git push origin master && git push --tags
+	@echo ""
+	@echo "=== Updating sha256 ==="
+	@make sha256
+	@git add $(FORMULA) && git commit -m "Update sha256 for v$(IMAGE_TAG)"
+	@git push origin master
+	@git checkout develop && git merge master && git push origin develop
 	@echo ""
 	@echo "=== Hotfix complete ==="
-	@echo "Now compute and update sha256:"
-	@echo "  make sha256"
-	@echo "  # Update sha256 in $(FORMULA), commit, push"
 
 .PHONY: help show-version sha256 bump_formula_url test \
 	minor_release patch_release major_release hotfix \
