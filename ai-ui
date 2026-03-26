@@ -22,16 +22,67 @@ Commands:
 EOF
 }
 
-# Ensure Docker is reachable.
+# Ensure Docker is reachable. Auto-starts or installs a provider if needed.
 ensure_docker() {
   if docker info &>/dev/null; then
     return 0
   fi
 
-  echo "Error: Cannot connect to Docker."
-  echo "  Make sure Docker Desktop is running, or start the Docker daemon."
-  echo "  Install: https://docs.docker.com/get-docker/"
-  exit 1
+  case "$(uname)" in
+    Darwin)
+      if [ -d "/Applications/Docker.app" ]; then
+        echo "Starting Docker Desktop..."
+        open -a Docker
+      elif [ -d "/Applications/OrbStack.app" ]; then
+        echo "Starting OrbStack..."
+        open -a OrbStack
+      elif command -v colima &>/dev/null; then
+        echo "Starting Colima..."
+        colima start
+      elif command -v brew &>/dev/null; then
+        echo "No Docker provider found. Installing Docker Desktop via Homebrew..."
+        brew install --cask docker
+        echo "Starting Docker Desktop..."
+        open -a Docker
+      else
+        echo "Error: No Docker provider found and Homebrew is not available."
+        echo "  Install Docker Desktop: https://docs.docker.com/get-docker/"
+        exit 1
+      fi
+
+      echo "Waiting for Docker daemon..."
+      for i in $(seq 1 30); do
+        if docker info &>/dev/null; then
+          echo "Docker is ready."
+          return 0
+        fi
+        sleep 1
+      done
+
+      echo "Error: Docker daemon did not start within 30 seconds."
+      echo "  Try starting it manually and run 'ai-ui start' again."
+      exit 1
+      ;;
+
+    Linux)
+      if ! command -v docker &>/dev/null && command -v brew &>/dev/null; then
+        echo "Docker not found. Installing via Homebrew..."
+        brew install docker
+        echo "Note: You also need Docker Engine running."
+        echo "  See: https://docs.docker.com/engine/install/"
+        exit 1
+      fi
+      echo "Error: Docker daemon is not running."
+      echo "  Start it with: sudo systemctl start docker"
+      echo "  Enable on boot: sudo systemctl enable docker"
+      exit 1
+      ;;
+
+    *)
+      echo "Error: Cannot connect to Docker."
+      exit 1
+      ;;
+  esac
 }
 
 cmd_start() {
