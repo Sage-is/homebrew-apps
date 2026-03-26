@@ -22,54 +22,16 @@ Commands:
 EOF
 }
 
-# Minimum VM memory in MB — Vite builds OOM at the 2GB default
-MIN_VM_MEMORY_MB=8192
-
-# Ensure Podman is reachable; on macOS, init/start a machine if needed.
-ensure_podman() {
-  # Quick connectivity check — works on both Linux (native) and macOS (machine)
-  if podman info &>/dev/null; then
+# Ensure Docker is reachable.
+ensure_docker() {
+  if docker info &>/dev/null; then
     return 0
   fi
 
-  # On Linux, Podman runs natively — if `podman info` failed, it's a real problem.
-  if [[ "$(uname)" != "Darwin" ]]; then
-    echo "Error: Cannot connect to Podman."
-    echo "  Verify the Podman service is running:  systemctl --user start podman.socket"
-    echo "  Or check connections:                  podman system connection list"
-    exit 1
-  fi
-
-  # --- macOS: we need a Podman machine ---
-  echo "Podman is not reachable. Setting up a Podman machine..."
-
-  # If no machine exists yet, create one with enough memory
-  if ! podman machine inspect &>/dev/null; then
-    echo "Initializing Podman machine (memory: ${MIN_VM_MEMORY_MB}MB)..."
-    if ! podman machine init --memory "$MIN_VM_MEMORY_MB"; then
-      echo "Error: 'podman machine init' failed."
-      echo "  Try running manually:  podman machine init --memory $MIN_VM_MEMORY_MB"
-      exit 1
-    fi
-  fi
-
-  # Start the machine
-  echo "Starting Podman machine..."
-  if ! podman machine start; then
-    echo "Error: 'podman machine start' failed."
-    echo "  Check status with:  podman machine list"
-    echo "  Try removing and re-creating:  podman machine rm && podman machine init --memory $MIN_VM_MEMORY_MB"
-    exit 1
-  fi
-
-  # Final connectivity check
-  if ! podman info &>/dev/null; then
-    echo "Error: Podman machine is running but still cannot connect."
-    echo "  Check your connections:  podman system connection list"
-    exit 1
-  fi
-
-  echo "Podman machine is ready."
+  echo "Error: Cannot connect to Docker."
+  echo "  Make sure Docker Desktop is running, or start the Docker daemon."
+  echo "  Install: https://docs.docker.com/get-docker/"
+  exit 1
 }
 
 cmd_start() {
@@ -81,16 +43,16 @@ cmd_start() {
     esac
   done
 
-  ensure_podman
+  ensure_docker
 
   echo "Pulling latest image..."
-  podman pull "$IMAGE"
+  docker pull "$IMAGE"
 
   # Stop existing container if running
-  podman rm -f "$CONTAINER" 2>/dev/null || true
+  docker rm -f "$CONTAINER" 2>/dev/null || true
 
   echo "Starting Sage AI UI on port $port..."
-  podman run -d \
+  docker run -d \
     -p "$port:8080" \
     -v "$VOLUME:$DATA_MOUNT" \
     --name "$CONTAINER" \
@@ -103,25 +65,25 @@ cmd_start() {
 
 cmd_stop() {
   echo "Stopping Sage AI UI..."
-  podman stop "$CONTAINER" 2>/dev/null || true
-  podman rm "$CONTAINER" 2>/dev/null || true
+  docker stop "$CONTAINER" 2>/dev/null || true
+  docker rm "$CONTAINER" 2>/dev/null || true
   echo "Stopped."
 }
 
 cmd_update() {
   echo "Pulling latest image..."
-  podman pull "$IMAGE"
+  docker pull "$IMAGE"
   cmd_stop
   cmd_start "$@"
 }
 
 cmd_logs() {
-  podman logs -f "$CONTAINER"
+  docker logs -f "$CONTAINER"
 }
 
 cmd_open() {
   local port
-  port=$(podman port "$CONTAINER" 8080 2>/dev/null | head -1 | cut -d: -f2)
+  port=$(docker port "$CONTAINER" 8080 2>/dev/null | head -1 | cut -d: -f2)
   if [[ -z "$port" ]]; then
     echo "Container is not running. Start it first with: ai-ui start"
     exit 1
@@ -130,9 +92,9 @@ cmd_open() {
 }
 
 cmd_status() {
-  podman inspect --format='Status: {{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "Container is not running."
+  docker inspect --format='Status: {{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "Container is not running."
   local port
-  port=$(podman port "$CONTAINER" 8080 2>/dev/null | head -1 | cut -d: -f2)
+  port=$(docker port "$CONTAINER" 8080 2>/dev/null | head -1 | cut -d: -f2)
   if [[ -n "$port" ]]; then
     echo "URL: http://localhost:$port"
   fi

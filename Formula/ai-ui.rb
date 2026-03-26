@@ -1,31 +1,27 @@
 class AiUi < Formula
-  desc "One-command local deployment of Sage AI UI via Podman"
+  desc "One-command local deployment of Sage AI UI via Docker"
   homepage "https://github.com/Sage-is/AI-UI"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "" # TODO: fill after first release tag
+  sha256 "PLACEHOLDER"
   license "MIT"
 
-  depends_on "podman"
+  depends_on "docker"
   depends_on "ollama"
 
   def install
     bin.install "ai-ui"
   end
 
-  def post_install
-    system Formula["ollama"].opt_bin/"ollama", "pull", "phi"
-  end
-
   def caveats
     <<~EOS
-      To start Sage AI UI:
+      Start Sage AI UI:
         ai-ui start
 
-      To configure LLM backends (Ollama, OpenAI, etc.), open the admin UI:
-        ai-ui open
-      Then go to Admin > Settings > Connections.
+      For local LLM inference, start the Ollama service:
+        brew services start ollama
 
-      Ollama is installed as a dependency for local LLM inference, along with the 'phi' model.
+      Configure LLM backends in the admin UI:
+        ai-ui open → Admin > Settings > Connections
     EOS
   end
 
