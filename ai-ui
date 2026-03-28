@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+VERSION="0.1.2"
+
 IMAGE="ghcr.io/sage-is/ai-ui:latest"
 CONTAINER="sage-ai"
 VOLUME="sage-ai-data"
@@ -15,11 +17,17 @@ Commands:
   start [--port PORT]   Pull image and start Sage AI UI (default port: $DEFAULT_PORT)
   stop                  Stop the running container
   update                Pull latest image and restart
+  dev [--port PORT] [--dir DIR]  Clone and run in dev mode with hot reload
   logs                  Tail container logs
   open                  Open the UI in your default browser
   status                Show container status
+  version               Show CLI version
 
 EOF
+}
+
+cmd_version() {
+  echo "ai-ui $VERSION"
 }
 
 # Ensure Docker is reachable. Auto-starts or installs a provider if needed.
@@ -121,6 +129,55 @@ cmd_stop() {
   echo "Stopped."
 }
 
+cmd_dev() {
+  local port=$DEFAULT_PORT
+  local repo_dir="${SAGE_DEV_DIR:-${HOME}/src/ai-ui}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      --dir) repo_dir="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  ensure_docker
+
+  # Clone if not already present
+  if [ ! -d "$repo_dir" ]; then
+    echo "Cloning Sage AI UI source to $repo_dir..."
+    git clone https://github.com/Sage-is/AI-UI.git "$repo_dir"
+  else
+    echo "Using existing source at $repo_dir"
+  fi
+
+  # Stop existing container
+  docker rm -f "$CONTAINER" 2>/dev/null || true
+
+  echo "Pulling latest image..."
+  docker pull "$IMAGE"
+
+  echo "Starting in dev mode on port $port..."
+  docker run -d \
+    -p "$port:8080" \
+    -p 5173:5173 \
+    -v "$VOLUME:$DATA_MOUNT" \
+    -v "$repo_dir/app/src:/app/src" \
+    -v "$repo_dir/app/backend:/app/backend" \
+    -v "$repo_dir/app/static:/app/static" \
+    -e DEV_MODE=true \
+    --name "$CONTAINER" \
+    "$IMAGE"
+
+  echo ""
+  echo "Dev mode running. Source: $repo_dir"
+  echo "App:      http://localhost:$port"
+  echo "Vite HMR: http://localhost:5173 (when Node.js installed)"
+  echo ""
+  echo "Run 'ai-ui logs' to see output."
+  echo "Run 'ai-ui open' to open in your browser."
+}
+
 cmd_update() {
   echo "Pulling latest image..."
   docker pull "$IMAGE"
@@ -139,7 +196,11 @@ cmd_open() {
     echo "Container is not running. Start it first with: ai-ui start"
     exit 1
   fi
-  open "http://localhost:$port"
+  local url="http://localhost:$port"
+  case "$(uname)" in
+    Darwin) open "$url" ;;
+    *)      xdg-open "$url" 2>/dev/null || echo "Open $url in your browser." ;;
+  esac
 }
 
 cmd_status() {
@@ -161,9 +222,11 @@ case "$command" in
   start)  cmd_start "$@" ;;
   stop)   cmd_stop ;;
   update) cmd_update "$@" ;;
+  dev)    cmd_dev "$@" ;;
   logs)   cmd_logs ;;
   open)   cmd_open ;;
   status) cmd_status ;;
+  version|-v|--version) cmd_version ;;
   -h|--help|help) usage ;;
   *) echo "Unknown command: $command"; usage; exit 1 ;;
 esac

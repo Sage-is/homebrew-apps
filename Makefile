@@ -38,7 +38,7 @@ help:
 	@echo "  hotfix              Start hotfix"
 	@echo "  release_finish      Finish release: merge, tag, push"
 	@echo "  hotfix_finish       Finish hotfix: merge, tag, push"
-	@echo "  bump_formula_url    Update formula URL to match RELEASE_VERSION"
+	@echo "  bump_formula_url    Update formula URL and script VERSION"
 	@echo "  test                Run brew audit and test on formula"
 	@echo ""
 
@@ -75,7 +75,10 @@ bump_formula_url:
 	fi
 	@echo "Updating formula URL to v$(RELEASE_VERSION)..."
 	@sed -i '' 's|/archive/refs/tags/v[^"]*\.tar\.gz|/archive/refs/tags/v'"$(RELEASE_VERSION)"'.tar.gz|' $(FORMULA)
-	@echo "Done. Remember to update sha256 after tagging."
+	@echo "Updating ai-ui VERSION to $(RELEASE_VERSION)..."
+	@sed -i '' 's/^VERSION="[^"]*"/VERSION="$(RELEASE_VERSION)"/' ai-ui
+	@echo "Done. Formula URL and script VERSION updated to v$(RELEASE_VERSION)."
+	@echo "Remember to update sha256 after tagging."
 
 # ---------------------------------------------------------------------------
 # Testing
@@ -87,9 +90,16 @@ test:
 # ---------------------------------------------------------------------------
 # Version Management with Git Flow
 # ---------------------------------------------------------------------------
+# Requires git-flow-next (Go rewrite). Install: brew install git-flow-next
 # All version tags start with 'v' (e.g., v0.1.0) following semantic versioning.
 
-minor_release:
+require_gitflow_next:
+	@if ! git flow version 2>/dev/null | grep -q 'git-flow-next'; then \
+		echo "Error: git-flow-next required (Go rewrite). Install: brew install git-flow-next"; \
+		exit 1; \
+	fi
+
+minor_release: require_gitflow_next
 	git flow release start $$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2+1".0"}')
 	@echo ""
 	@echo "=== Release branch created ==="
@@ -99,7 +109,7 @@ minor_release:
 	@echo "  3. git add -A && git commit"
 	@echo "  4. make release_finish"
 
-patch_release:
+patch_release: require_gitflow_next
 	git flow release start $$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2"."$$3+1}')
 	@echo ""
 	@echo "=== Release branch created ==="
@@ -109,7 +119,7 @@ patch_release:
 	@echo "  3. git add -A && git commit"
 	@echo "  4. make release_finish"
 
-major_release:
+major_release: require_gitflow_next
 	git flow release start $$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1+1".0.0"}')
 	@echo ""
 	@echo "=== Release branch created ==="
@@ -119,7 +129,7 @@ major_release:
 	@echo "  3. git add -A && git commit"
 	@echo "  4. make release_finish"
 
-hotfix:
+hotfix: require_gitflow_next
 	git flow hotfix start $$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{if (NF < 4) print $$1"."$$2"."$$3".1"; else print $$1"."$$2"."$$3"."$$4+1}')
 	@echo ""
 	@echo "=== Hotfix branch created ==="
@@ -128,30 +138,60 @@ hotfix:
 	@echo "  2. git add -A && git commit"
 	@echo "  3. make hotfix_finish"
 
-release_finish:
+release_finish: require_gitflow_next
 	@echo "=== Finishing release ==="
-	git flow release finish "$$(git branch --show-current | sed 's/release\///')" && git push origin develop && git push origin master && git push --tags
+	git flow release finish && git push origin develop && git push origin master && git push --tags
 	@echo ""
-	@echo "=== Updating sha256 ==="
-	@make sha256
-	@git add $(FORMULA) && git commit -m "Update sha256 for v$(IMAGE_TAG)"
-	@git push origin master
-	@git checkout develop && git merge master && git push origin develop
+	@echo "=== Updating sha256 (waiting for GitHub archive) ==="
+	@for i in 1 2 3 4 5; do \
+		sleep $$(( i * 3 )); \
+		if curl -fsSL -o /dev/null "$$(sed -n 's/.*url "\(.*\)"/\1/p' $(FORMULA))" 2>/dev/null; then \
+			make sha256; \
+			break; \
+		fi; \
+		echo "  Attempt $$i/5: archive not ready, retrying..."; \
+		if [ $$i -eq 5 ]; then \
+			echo "WARNING: Archive not available after 45s. Run 'make sha256' manually."; \
+			exit 1; \
+		fi; \
+	done
+	@NEW_TAG=$$(git tag --sort=-v:refname | head -1); \
+	git add $(FORMULA) && git commit -m "Update sha256 for $$NEW_TAG" && \
+	git push origin master && \
+	git checkout develop && git merge master && git push origin develop || \
+	(echo "ERROR: Post-sha256 steps failed. Current branch: $$(git branch --show-current)"; \
+	 echo "  If on master: git checkout develop && git merge master && git push origin develop"; \
+	 exit 1)
 	@echo ""
 	@echo "=== Release complete ==="
 
-hotfix_finish:
+hotfix_finish: require_gitflow_next
 	@echo "=== Finishing hotfix ==="
-	git flow hotfix finish "$$(git branch --show-current | sed 's/hotfix\///')" && git push origin develop && git push origin master && git push --tags
+	git flow hotfix finish && git push origin develop && git push origin master && git push --tags
 	@echo ""
-	@echo "=== Updating sha256 ==="
-	@make sha256
-	@git add $(FORMULA) && git commit -m "Update sha256 for v$(IMAGE_TAG)"
-	@git push origin master
-	@git checkout develop && git merge master && git push origin develop
+	@echo "=== Updating sha256 (waiting for GitHub archive) ==="
+	@for i in 1 2 3 4 5; do \
+		sleep $$(( i * 3 )); \
+		if curl -fsSL -o /dev/null "$$(sed -n 's/.*url "\(.*\)"/\1/p' $(FORMULA))" 2>/dev/null; then \
+			make sha256; \
+			break; \
+		fi; \
+		echo "  Attempt $$i/5: archive not ready, retrying..."; \
+		if [ $$i -eq 5 ]; then \
+			echo "WARNING: Archive not available after 45s. Run 'make sha256' manually."; \
+			exit 1; \
+		fi; \
+	done
+	@NEW_TAG=$$(git tag --sort=-v:refname | head -1); \
+	git add $(FORMULA) && git commit -m "Update sha256 for $$NEW_TAG" && \
+	git push origin master && \
+	git checkout develop && git merge master && git push origin develop || \
+	(echo "ERROR: Post-sha256 steps failed. Current branch: $$(git branch --show-current)"; \
+	 echo "  If on master: git checkout develop && git merge master && git push origin develop"; \
+	 exit 1)
 	@echo ""
 	@echo "=== Hotfix complete ==="
 
 .PHONY: help show-version sha256 bump_formula_url test \
-	minor_release patch_release major_release hotfix \
+	require_gitflow_next minor_release patch_release major_release hotfix \
 	release_finish hotfix_finish
