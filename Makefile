@@ -130,22 +130,6 @@ sha256:
 	@echo "Updated $(FORMULA)"
 
 # ---------------------------------------------------------------------------
-# Formula Management
-# ---------------------------------------------------------------------------
-# Updates the formula URL tag to match RELEASE_VERSION
-bump_formula_url:
-	@if [ -z "$(RELEASE_VERSION)" ]; then \
-		echo "Error: RELEASE_VERSION not defined. Are you on a release/ branch?"; \
-		exit 1; \
-	fi
-	@echo "Updating formula URL to v$(RELEASE_VERSION)..."
-	@sed -i '' 's|/archive/refs/tags/v[^"]*\.tar\.gz|/archive/refs/tags/v'"$(RELEASE_VERSION)"'.tar.gz|' $(FORMULA)
-	@echo "Updating ai-ui VERSION to $(RELEASE_VERSION)..."
-	@sed -i '' 's/^VERSION="[^"]*"/VERSION="$(RELEASE_VERSION)"/' ai-ui
-	@echo "Done. Formula URL and script VERSION updated to v$(RELEASE_VERSION)."
-	@echo "Remember to update sha256 after tagging."
-
-# ---------------------------------------------------------------------------
 # Testing
 # ---------------------------------------------------------------------------
 test:
