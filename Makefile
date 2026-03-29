@@ -35,8 +35,8 @@ endif
 # Bump formula URL and ai-ui VERSION to a given version.
 # Usage: $(call bump_version,0.2.1)
 define bump_version
-	sed -i '' 's|/archive/refs/tags/v[^"]*\.tar\.gz|/archive/refs/tags/v$(1).tar.gz|' $(FORMULA) && \
-	sed -i '' 's/^VERSION="[^"]*"/VERSION="$(1)"/' ai-ui
+	sed -i '' 's|/archive/refs/tags/v[^"]*\.tar\.gz|/archive/refs/tags/v'"$(1)"'.tar.gz|' $(FORMULA) && \
+	sed -i '' 's/^VERSION="[^"]*"/VERSION="'"$(1)"'"/' ai-ui
 endef
 
 # Clear stale git-flow-next merge state from a prior interrupted finish.
