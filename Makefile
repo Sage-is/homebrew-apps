@@ -104,6 +104,7 @@ help:
 	@echo "  patch_release       Start patch version bump (0.0.X)"
 	@echo "  major_release       Start major version bump (X.0.0)"
 	@echo "  hotfix              Start hotfix (0.0.0.X)"
+	@echo "  feature_finish      Finish feature: merge into develop, push"
 	@echo "  release_finish      Finish release: merge, tag, push, sha256"
 	@echo "  hotfix_finish       Finish hotfix: merge, tag, push, sha256"
 	@echo "  test                Run brew audit and test on formula"
@@ -226,6 +227,23 @@ release_finish: require_gitflow_next
 	@echo "=== Release $(RELEASE_VERSION) complete ==="
 
 # ---------------------------------------------------------------------------
+# Feature finish
+# ---------------------------------------------------------------------------
+# Detects current feature/ branch and merges it into develop.
+
+feature_finish: require_gitflow_next
+	@FEATURE=$$(echo $(GIT_BRANCH) | sed -n 's/^feature\///p'); \
+	if [ -z "$$FEATURE" ]; then \
+		echo "Error: not on a feature/ branch (current: $(GIT_BRANCH))"; \
+		exit 1; \
+	fi; \
+	echo "=== Finishing feature $$FEATURE ===" && \
+	git flow feature finish $$FEATURE && \
+	git push origin develop && \
+	echo "" && \
+	echo "=== Feature $$FEATURE merged into develop ==="
+
+# ---------------------------------------------------------------------------
 # Hotfix finish
 # ---------------------------------------------------------------------------
 # Same flow as release_finish but for hotfix branches.
@@ -277,5 +295,5 @@ require_gitflow_next:
 
 .PHONY: help show-version sha256 test \
 	minor_release patch_release major_release hotfix \
-	release_finish hotfix_finish \
+	feature_finish release_finish hotfix_finish \
 	bump_formula_url require_gitflow_next
