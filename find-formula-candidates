@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# find-formula-candidates — Scan GitHub orgs for repos that could become Homebrew formulas/casks
+# Usage:
+#   ./find-formula-candidates              # auto-discover all orgs + personal repos
+#   ./find-formula-candidates Sage-is      # scan specific org(s)
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FORMULA_DIR="$SCRIPT_DIR/Formula"
+TAP_ORG="Sage-is"  # this tap's owning org
+
+# Colors (disabled if not a terminal)
+if [ -t 1 ]; then
+  GREEN='\033[0;32m' DIM='\033[2m' YELLOW='\033[0;33m'
+  CYAN='\033[0;36m' MAGENTA='\033[0;35m'
+  BOLD='\033[1m' RESET='\033[0m'
+else
+  GREEN='' DIM='' YELLOW='' CYAN='' MAGENTA='' BOLD='' RESET=''
+fi
+
+# GUI app indicator patterns (file paths that signal a desktop/GUI app)
+# Checked via GitHub API tree listing per repo
+GUI_PATTERNS=(
+  # Electron
+  "electron-builder.json" "electron-builder.yml" "electron.js" "electron/main"
+  # Tauri
+  "src-tauri/tauri.conf.json" "tauri.conf.json"
+  # macOS native / Xcode
+  ".xcodeproj" ".xcworkspace" "Info.plist"
+  # Flutter desktop
+  "macos/Runner" "windows/runner" "linux/my_application.cc"
+  # PyQt / PySide / Tkinter
+  "pyqt" "pyside" "tkinter"
+  # Swift UI / SwiftPM with GUI
+  "Package.swift"
+  # Godot / Game engines
+  "project.godot"
+  # React Native desktop
+  "react-native.config.js"
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+die() { echo "Error: $*" >&2; exit 1; }
+
+# Collect existing formula names (lowercase, without .rb)
+existing_formulas() {
+  ls "$FORMULA_DIR"/*.rb 2>/dev/null \
+    | xargs -n1 basename \
+    | sed 's/\.rb$//' \
+    | tr '[:upper:]' '[:lower:]'
+}
+
+# Check if a repo name (lowercased) already has a formula
+has_formula() {
+  local name
+  name="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+  existing_formulas | grep -qx "$name"
+}
+
+# ---------------------------------------------------------------------------
+# Prerequisites
+# ---------------------------------------------------------------------------
+command -v gh >/dev/null 2>&1 || die "gh CLI required. Install: brew install gh"
+gh auth status >/dev/null 2>&1 || die "Not authenticated. Run: gh auth login"
+
+# ---------------------------------------------------------------------------
+# Determine which orgs to scan
+# ---------------------------------------------------------------------------
+if [ $# -gt 0 ]; then
+  ORGS=("$@")
+else
+  echo -e "${BOLD}Discovering orgs...${RESET}"
+  # Get orgs the user belongs to
+  mapfile -t ORGS < <(gh api /user/orgs --jq '.[].login' 2>/dev/null)
+  # Also include the user's personal account
+  GH_USER="$(gh api /user --jq '.login' 2>/dev/null)"
+  ORGS+=("$GH_USER")
+  echo "  Found: ${ORGS[*]}"
+  echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# Scan each org
+# ---------------------------------------------------------------------------
+for org in "${ORGS[@]}"; do
+  echo -e "${BOLD}=== $org ===${RESET}"
+
+  # Decide if this is a user or org account
+  # gh repo list works for both, but we note non-tap orgs
+  is_tap_org=false
+  [ "$org" = "$TAP_ORG" ] && is_tap_org=true
+
+  if ! $is_tap_org; then
+    echo -e "  ${DIM}(not the tap org — candidates here would need publishing to $TAP_ORG tap)${RESET}"
+  fi
+
+  # Fetch repos: non-archived, non-fork, sorted by push date
+  repos_json="$(gh repo list "$org" \
+    --limit 100 \
+    --no-archived \
+    --source \
+    --json name,description,pushedAt,repositoryTopics,primaryLanguage \
+    2>/dev/null)" || { echo "  Could not list repos for $org"; echo ""; continue; }
+
+  repo_count="$(echo "$repos_json" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)"
+  if [ "$repo_count" = "0" ] || [ -z "$repo_count" ]; then
+    echo "  No source repos found."
+    echo ""
+    continue
+  fi
+
+  # Header
+  printf "  ${DIM}%-35s %-14s %-8s %-6s %s${RESET}\n" "REPO" "LATEST TAG" "STATUS" "TYPE" "DESCRIPTION"
+  printf "  ${DIM}%-35s %-14s %-8s %-6s %s${RESET}\n" "---" "---" "---" "---" "---"
+
+  # Iterate repos — python extracts name, desc, topics, and language
+  echo "$repos_json" | python3 -c "
+import json, sys
+repos = json.load(sys.stdin)
+for r in sorted(repos, key=lambda x: x.get('pushedAt',''), reverse=True):
+    topics = ','.join(t.get('name','') for t in r.get('repositoryTopics',[] ) or [])
+    lang = (r.get('primaryLanguage') or {}).get('name','') or ''
+    print(r['name'] + '\t' + (r.get('description') or '')[:50] + '\t' + topics + '\t' + lang)
+" 2>/dev/null | while IFS=$'\t' read -r repo_name repo_desc repo_topics repo_lang; do
+    # -- Detect type: GUI app vs CLI tool --
+    app_type="cli"
+
+    # Check topics for GUI signals (topics are comma-separated, match whole words)
+    gui_topic_hits="$(echo ",$repo_topics," | grep -iEc ',(electron|tauri|desktop|gui|macos-app|swift|swiftui|flutter|godot|game|gtk|qt|native-app),' || true)"
+    if [ "$gui_topic_hits" -gt 0 ]; then
+      app_type="gui"
+    fi
+
+    # Check language for GUI-leaning languages
+    case "$repo_lang" in
+      Swift|Objective-C|Dart|C#|Kotlin) app_type="gui" ;;
+    esac
+
+    # Check repo name patterns for GUI/game/desktop signals
+    name_lower="$(echo "$repo_name" | tr '[:upper:]' '[:lower:]')"
+    desc_lower="$(echo "$repo_desc" | tr '[:upper:]' '[:lower:]')"
+    case "$name_lower" in
+      *-desktop|*-desktop-*|*desktop-*|game-*|*-game) app_type="gui" ;;
+    esac
+    # APP- prefix is a weak signal — only flag as gui if desc also hints at it
+    if [[ "$name_lower" == app-* ]]; then
+      case "$desc_lower" in
+        *gui*|*desktop*|*native*|*interface*|*window*|*screen*|*visual*) app_type="gui" ;;
+      esac
+    fi
+
+    # For repos that look interesting, do a quick file tree check via API
+    # (only if not already tagged as gui and language is ambiguous)
+    if [ "$app_type" = "cli" ]; then
+      tree_snippet="$(gh api "repos/$org/$repo_name/git/trees/HEAD" --jq '.tree[].path' 2>/dev/null || true)"
+      if [ -n "$tree_snippet" ]; then
+        for pattern in "electron-builder" "tauri.conf" ".xcodeproj" ".xcworkspace" "project.godot" "src-tauri"; do
+          if echo "$tree_snippet" | grep -qi "$pattern"; then
+            app_type="gui"
+            break
+          fi
+        done
+      fi
+    fi
+
+    # -- Determine release status --
+    if has_formula "$repo_name"; then
+      status="formula"
+      tag_display="—"
+      color="$DIM"
+    else
+      latest_release="$(gh release list -R "$org/$repo_name" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+
+      if [ -n "$latest_release" ]; then
+        tag_display="$latest_release"
+        status="ready"
+        color="$GREEN"
+      else
+        tag_display="—"
+        status="no rel."
+        color="$DIM"
+      fi
+    fi
+
+    # Color the type column
+    if [ "$app_type" = "gui" ]; then
+      type_display="${CYAN}gui${RESET}"
+      # Override color for gui+ready to stand out more
+      [ "$status" = "ready" ] && color="$CYAN"
+    else
+      type_display="cli"
+    fi
+
+    printf "  ${color}%-35s %-14s %-8s${RESET} %-6b ${color}%s${RESET}\n" \
+      "$repo_name" "$tag_display" "$status" "$type_display" "$repo_desc"
+  done
+
+  echo ""
+done
+
+echo -e "${BOLD}Legend:${RESET} ${GREEN}ready${RESET} = has release, no formula yet | ${DIM}no rel.${RESET} = no releases | ${DIM}formula${RESET} = already in tap"
+echo -e "       ${CYAN}gui${RESET} = detected GUI/desktop app (cask candidate) | cli = command-line tool (formula candidate)"
