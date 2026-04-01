@@ -1,9 +1,10 @@
-class AiUi < Formula
+class AiUiAT1 < Formula
   desc "One-command local deployment of Sage AI UI via Docker"
   homepage "https://github.com/Sage-is/AI-UI"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/v1.0.0.tar.gz"
   sha256 "de57831a204d3a2ad4669bee947379ecf8db312336c99fe33c11862cbf0738bc"
   license "MIT"
+  keg_only :versioned_formula
 
   depends_on "docker"
   depends_on "ollama"
