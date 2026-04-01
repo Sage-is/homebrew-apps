@@ -99,9 +99,9 @@ endef
 # Info targets
 # ---------------------------------------------------------------------------
 help:
-	@echo "====================================="
-	@echo "  homebrew-apps (Sage-is tap)"
-	@echo "====================================="
+	@echo "========================================="
+	@echo "  homebrew-apps — Sage-is Homebrew Tap"
+	@echo "========================================="
 	@echo ""
 	@echo "  Current version: $(IMAGE_TAG)"
 	@echo "  Branch:          $(GIT_BRANCH)"
