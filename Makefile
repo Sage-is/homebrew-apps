@@ -106,11 +106,11 @@ help:
 	@echo "  Current version: $(IMAGE_TAG)"
 	@echo "  Branch:          $(GIT_BRANCH)"
 	@echo ""
-	@echo "Release workflow (two commands):"
-	@echo "  make minor_release    → create branch, bump version, commit"
-	@echo "  make release_finish   → merge, tag, push, update sha256"
+	@echo "Quick start:"
+	@echo "  make release          → interactive full release flow"
 	@echo ""
 	@echo "Targets:"
+	@echo "  release             Interactive full release flow"
 	@echo "  sha256              Compute sha256 for current formula URL"
 	@echo "  show-version        Show current version info"
 	@echo "  check-upstream      Compare local version against upstream AI-UI repo"
@@ -174,6 +174,12 @@ sha256:
 test:
 	brew audit --formula $(FORMULA)
 	brew test ai-ui
+
+# ---------------------------------------------------------------------------
+# Interactive release (full flow)
+# ---------------------------------------------------------------------------
+release:
+	@scripts/release.sh
 
 # ---------------------------------------------------------------------------
 # Release start targets
@@ -360,7 +366,7 @@ require_gitflow_next:
 		exit 1; \
 	fi
 
-.PHONY: help show-version check-upstream sha256 test \
+.PHONY: help show-version check-upstream sha256 test release \
 	minor_release patch_release major_release hotfix custom_release \
 	feature_finish release_finish hotfix_finish \
 	bump_formula_url require_gitflow_next
