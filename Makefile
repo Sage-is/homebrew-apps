@@ -28,16 +28,19 @@ ifeq ($(RELEASE_VERSION),)
   RELEASE_VERSION := $(GIT_TAG)
 endif
 
+# Major version number for versioned formula support (ai-ui@1, ai-ui@2, etc.)
+MAJOR_VERSION := $(shell echo $(RELEASE_VERSION) | awk -F'.' '{print $$1}')
+
+# Upstream repo URL (extracted from formula homepage)
+UPSTREAM_REPO := $(shell sed -n 's/.*homepage "\(.*\)"/\1/p' $(FORMULA))
+
 # ---------------------------------------------------------------------------
 # Shared shell snippets (DRY helpers used by multiple targets)
 # ---------------------------------------------------------------------------
 
-# Bump formula URL and ai-ui VERSION to a given version.
-# Usage: $(call bump_version,0.2.1)
-define bump_version
-	sed -i '' 's|/archive/refs/tags/v[^"]*\.tar\.gz|/archive/refs/tags/v$(1).tar.gz|' $(FORMULA) && \
-	sed -i '' 's/^VERSION="[^"]*"/VERSION="$(1)"/' ai-ui
-endef
+# Source shell helpers for bump_version / create_versioned_formula.
+# Usage in recipes: @. scripts/formula-helpers.sh && bump_version 1.0.0
+HELPERS := . scripts/formula-helpers.sh
 
 # Clear stale git-flow-next merge state from a prior interrupted finish.
 # git-flow-next leaves .git/gitflow/state/merge.json even after failures.
@@ -60,6 +63,16 @@ define wait_and_update_sha256
 			echo "sha256: $$HASH"; \
 			sed -i '' "s/sha256 \".*\"/sha256 \"$$HASH\"/" $(FORMULA); \
 			echo "Updated $(FORMULA)"; \
+			MAIN_URL=$$(sed -n 's/.*url "\(.*\)"/\1/p' $(FORMULA)); \
+			for vf in Formula/ai-ui@*.rb; do \
+				if [ -f "$$vf" ]; then \
+					VF_URL=$$(sed -n 's/.*url "\(.*\)"/\1/p' "$$vf"); \
+					if [ "$$VF_URL" = "$$MAIN_URL" ]; then \
+						sed -i '' "s/sha256 \".*\"/sha256 \"$$HASH\"/" "$$vf"; \
+						echo "Updated $$vf"; \
+					fi; \
+				fi; \
+			done; \
 			break; \
 		fi; \
 		echo "  Attempt $$i/5: archive not ready, retrying..."; \
@@ -74,7 +87,7 @@ endef
 # Must be called while on master.
 define commit_sha256_and_sync
 	NEW_TAG=$$(git tag --sort=-v:refname | head -1); \
-	git add $(FORMULA) && \
+	git add $(FORMULA) $$(ls Formula/ai-ui@*.rb 2>/dev/null) && \
 	git commit -m "Update sha256 for $$NEW_TAG" && \
 	git push origin master && \
 	git checkout develop && \
@@ -100,10 +113,12 @@ help:
 	@echo "Targets:"
 	@echo "  sha256              Compute sha256 for current formula URL"
 	@echo "  show-version        Show current version info"
+	@echo "  check-upstream      Compare local version against upstream AI-UI repo"
 	@echo "  minor_release       Start minor version bump (0.X.0)"
 	@echo "  patch_release       Start patch version bump (0.0.X)"
 	@echo "  major_release       Start major version bump (X.0.0)"
 	@echo "  hotfix              Start hotfix (0.0.0.X)"
+	@echo "  custom_release      Start release with explicit version (VER=X.Y.Z)"
 	@echo "  feature_finish      Finish feature: merge into develop, push"
 	@echo "  release_finish      Finish release: merge, tag, push, sha256"
 	@echo "  hotfix_finish       Finish hotfix: merge, tag, push, sha256"
@@ -115,6 +130,29 @@ show-version:
 	@echo "Branch:  $(GIT_BRANCH)"
 	@echo "Release: $(RELEASE_VERSION)"
 	@echo "URL:     $(FORMULA_URL)"
+
+check-upstream:
+	@echo "Upstream: $(UPSTREAM_REPO)"
+	@echo "Local:    v$(IMAGE_TAG)"
+	@echo ""
+	@echo "Upstream tags:"
+	@git ls-remote --tags $(UPSTREAM_REPO) 2>/dev/null \
+		| sed -n 's|.*refs/tags/\(v[0-9][^{}]*\)$$|\1|p' \
+		| sort -V \
+		| while read tag; do \
+			echo "  $$tag"; \
+		done
+	@echo ""
+	@LATEST=$$(git ls-remote --tags $(UPSTREAM_REPO) 2>/dev/null \
+		| sed -n 's|.*refs/tags/\(v[0-9][^{}]*\)$$|\1|p' \
+		| sort -V | tail -1); \
+	if [ "$$LATEST" = "v$(IMAGE_TAG)" ]; then \
+		echo "Up to date."; \
+	elif [ -n "$$LATEST" ]; then \
+		echo "Behind: local v$(IMAGE_TAG) < upstream $$LATEST"; \
+	else \
+		echo "Could not fetch upstream tags."; \
+	fi
 
 # ---------------------------------------------------------------------------
 # SHA256 (standalone — used when you need to update manually)
@@ -144,10 +182,11 @@ test:
 # After this, you only need `make release_finish`.
 
 minor_release: require_gitflow_next
-	@NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2+1".0"}'); \
+	@$(HELPERS) && \
+	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2+1".0"}') && \
 	git flow release start $$NEW_VER && \
 	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
-	$(call bump_version,$$NEW_VER) && \
+	bump_version $$NEW_VER && \
 	git add -A && \
 	git commit -m "Bump version to $$NEW_VER" && \
 	echo "" && \
@@ -155,10 +194,11 @@ minor_release: require_gitflow_next
 	echo "Next: make release_finish"
 
 patch_release: require_gitflow_next
-	@NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2"."$$3+1}'); \
+	@$(HELPERS) && \
+	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2"."$$3+1}') && \
 	git flow release start $$NEW_VER && \
 	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
-	$(call bump_version,$$NEW_VER) && \
+	bump_version $$NEW_VER && \
 	git add -A && \
 	git commit -m "Bump version to $$NEW_VER" && \
 	echo "" && \
@@ -166,26 +206,47 @@ patch_release: require_gitflow_next
 	echo "Next: make release_finish"
 
 major_release: require_gitflow_next
-	@NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1+1".0.0"}'); \
+	@$(HELPERS) && \
+	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1+1".0.0"}') && \
+	MAJOR=$$(echo $$NEW_VER | awk -F'.' '{print $$1}') && \
 	git flow release start $$NEW_VER && \
 	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
-	$(call bump_version,$$NEW_VER) && \
+	bump_version $$NEW_VER && \
+	create_versioned_formula $$MAJOR && \
 	git add -A && \
-	git commit -m "Bump version to $$NEW_VER" && \
+	git commit -m "Bump version to $$NEW_VER (create ai-ui@$$MAJOR)" && \
 	echo "" && \
 	echo "=== Release $$NEW_VER ready ===" && \
 	echo "Next: make release_finish"
 
 hotfix: require_gitflow_next
-	@NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{if (NF < 4) print $$1"."$$2"."$$3".1"; else print $$1"."$$2"."$$3"."$$4+1}'); \
+	@$(HELPERS) && \
+	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{if (NF < 4) print $$1"."$$2"."$$3".1"; else print $$1"."$$2"."$$3"."$$4+1}') && \
 	git flow hotfix start $$NEW_VER && \
 	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
-	$(call bump_version,$$NEW_VER) && \
+	bump_version $$NEW_VER && \
 	git add -A && \
 	git commit -m "Bump version to $$NEW_VER" && \
 	echo "" && \
 	echo "=== Hotfix $$NEW_VER ready ===" && \
 	echo "Next: fix the issue, commit, then make hotfix_finish"
+
+# ---------------------------------------------------------------------------
+# Custom release (arbitrary version jump, e.g. make custom_release VER=2.1.0)
+# ---------------------------------------------------------------------------
+custom_release: require_gitflow_next
+	@if [ -z "$(VER)" ]; then echo "Usage: make custom_release VER=2.1.0"; exit 1; fi
+	@$(HELPERS) && \
+	MAJOR=$$(echo $(VER) | awk -F'.' '{print $$1}') && \
+	git flow release start $(VER) && \
+	echo "Bumping formula URL and VERSION to v$(VER)..." && \
+	bump_version $(VER) && \
+	create_versioned_formula $$MAJOR && \
+	git add -A && \
+	git commit -m "Bump version to $(VER)" && \
+	echo "" && \
+	echo "=== Release $(VER) ready ===" && \
+	echo "Next: make release_finish"
 
 # ---------------------------------------------------------------------------
 # Release finish
@@ -238,7 +299,12 @@ feature_finish: require_gitflow_next
 		exit 1; \
 	fi; \
 	echo "=== Finishing feature $$FEATURE ===" && \
-	git flow feature finish $$FEATURE && \
+	FETCH_FLAG=""; \
+	if ! git ls-remote --exit-code --heads origin feature/$$FEATURE >/dev/null 2>&1; then \
+		echo "No remote branch found — skipping fetch"; \
+		FETCH_FLAG="--no-fetch"; \
+	fi; \
+	git flow feature finish $$FETCH_FLAG $$FEATURE && \
 	git push origin develop && \
 	echo "" && \
 	echo "=== Feature $$FEATURE merged into develop ==="
@@ -280,9 +346,10 @@ bump_formula_url:
 		echo "Error: RELEASE_VERSION not set. Are you on a release/ branch?"; \
 		exit 1; \
 	fi
-	@echo "Updating formula URL and VERSION to v$(RELEASE_VERSION)..."
-	@$(call bump_version,$(RELEASE_VERSION))
-	@echo "Done. sha256 will be updated automatically by release_finish / hotfix_finish."
+	@$(HELPERS) && \
+	echo "Updating formula URL and VERSION to v$(RELEASE_VERSION)..." && \
+	bump_version $(RELEASE_VERSION) && \
+	echo "Done. sha256 will be updated automatically by release_finish / hotfix_finish."
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -293,7 +360,7 @@ require_gitflow_next:
 		exit 1; \
 	fi
 
-.PHONY: help show-version sha256 test \
-	minor_release patch_release major_release hotfix \
+.PHONY: help show-version check-upstream sha256 test \
+	minor_release patch_release major_release hotfix custom_release \
 	feature_finish release_finish hotfix_finish \
 	bump_formula_url require_gitflow_next
