@@ -1,13 +1,16 @@
 #!/bin/bash
-# release.sh — Full release flow with optional interactive mode.
+# git-release — Full git-flow release workflow with optional interactive mode.
+# Works with any project that has standard Makefile targets:
+#   patch_release, minor_release, major_release, hotfix, custom_release,
+#   release_finish, hotfix_finish
 #
 # Usage:
-#   ./scripts/release.sh                  # interactive — prompts for type
-#   ./scripts/release.sh patch            # non-interactive patch release
-#   ./scripts/release.sh major            # non-interactive major release
-#   ./scripts/release.sh minor            # non-interactive minor release
-#   ./scripts/release.sh custom 2.1.0     # non-interactive custom version
-#   ./scripts/release.sh -i patch         # interactive with pauses between steps
+#   git-release                   # interactive — prompts for type
+#   git-release patch             # non-interactive patch release
+#   git-release major             # non-interactive major release
+#   git-release minor             # non-interactive minor release
+#   git-release custom 2.1.0     # non-interactive custom version
+#   git-release -i patch          # interactive with pauses between steps
 #
 set -euo pipefail
 
@@ -24,7 +27,7 @@ while [[ $# -gt 0 ]]; do
 			TYPE="custom"
 			VER="${2:-}"
 			if [ -z "$VER" ]; then
-				echo "Error: custom release requires a version (e.g. ./scripts/release.sh custom 2.1.0)"
+				echo "Error: custom release requires a version (e.g. git-release custom 2.1.0)"
 				exit 1
 			fi
 			shift 2
@@ -46,6 +49,12 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
+# Check we're in a git repo with a Makefile
+if [ ! -f Makefile ]; then
+	echo "Error: no Makefile in current directory"
+	exit 1
+fi
+
 pause() {
 	if $INTERACTIVE; then
 		echo ""
@@ -54,21 +63,24 @@ pause() {
 	fi
 }
 
+# Helper: run a make target only if it exists
+has_target() {
+	make -n "$1" >/dev/null 2>&1
+}
+
 # If no type given, prompt
 if [ -z "$TYPE" ]; then
 	INTERACTIVE=true
 	echo "========================================="
-	echo "  Release Flow — Sage-is Homebrew Tap"
+	echo "  Release Flow"
 	echo "========================================="
 	echo ""
-	make show-version
-	echo ""
-	make check-upstream
-	echo ""
+	has_target show-version && make show-version && echo ""
+	has_target check-upstream && make check-upstream && echo ""
 	echo "Release type:"
 	echo "  1) patch   — bump X.Y.Z+1"
 	echo "  2) minor   — bump X.Y+1.0"
-	echo "  3) major   — bump X+1.0.0 (creates versioned formula)"
+	echo "  3) major   — bump X+1.0.0"
 	echo "  4) hotfix  — hotfix from master"
 	echo "  5) custom  — specify exact version"
 	echo ""
@@ -127,4 +139,4 @@ make "$FINISH_TARGET"
 echo ""
 echo ">>> Done! Release complete."
 echo ""
-make show-version
+has_target show-version && make show-version
