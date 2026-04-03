@@ -9,6 +9,70 @@ VOLUME="sage-ai-data"
 DATA_MOUNT="/app/backend/data"
 DEFAULT_PORT=8080
 
+# ---------------------------------------------------------------------------
+# Sage project registry (~/.sage-is/)
+# Remembers where you cloned things so you never lose your code.
+# ---------------------------------------------------------------------------
+SAGE_CONFIG_DIR="${HOME}/.sage-is"
+SAGE_PROJECTS="${SAGE_CONFIG_DIR}/projects"
+
+# The upstream remote URL pattern (matches any protocol/suffix).
+AI_UI_REMOTE="Sage-is/AI-UI"
+
+# Read saved clone path for a project. Prints nothing if unset.
+sage_project_dir() {
+  [[ -f "$SAGE_PROJECTS" ]] && sed -n "s/^${1}=//p" "$SAGE_PROJECTS"
+}
+
+# Save (or update) the clone path for a project.
+sage_set_project_dir() {
+  local project="$1" dir="$2"
+  mkdir -p "$SAGE_CONFIG_DIR"
+  # Remove existing entry, then append. sed -i.bak for macOS compat.
+  if [[ -f "$SAGE_PROJECTS" ]]; then
+    sed -i.bak "/^${project}=/d" "$SAGE_PROJECTS" && rm -f "${SAGE_PROJECTS}.bak"
+  fi
+  echo "${project}=${dir}" >> "$SAGE_PROJECTS"
+}
+
+# Check if a directory is a clone of a given repo (by git remote, not folder name).
+is_repo_for() {
+  local dir="$1" pattern="$2"
+  [[ -d "$dir/.git" ]] && git -C "$dir" remote -v 2>/dev/null | grep -qi "$pattern"
+}
+
+# Find a matching repo nearby: check cwd (walk up to git root), then scan subdirs.
+# Detects by content (git remote), not directory name — works with any folder name.
+find_repo_nearby() {
+  local pattern="$1"
+
+  # Are we already inside a matching repo?
+  local git_root
+  git_root="$(git rev-parse --show-toplevel 2>/dev/null)" || true
+  if [[ -n "$git_root" ]] && is_repo_for "$git_root" "$pattern"; then
+    echo "$git_root"; return 0
+  fi
+
+  # Scan immediate subdirectories (one level) for any matching clone.
+  local subdir
+  for subdir in ./*/; do
+    [[ -d "$subdir/.git" ]] || continue
+    if is_repo_for "$subdir" "$pattern"; then
+      (cd "$subdir" && pwd); return 0
+    fi
+  done
+
+  return 1
+}
+
+# Check if a path is ephemeral (won't survive reboot).
+is_ephemeral_path() {
+  case "$1" in
+    /tmp/*|/private/tmp/*|/var/folders/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 Usage: ai-ui <command> [options]
@@ -17,11 +81,12 @@ Commands:
   start [--port PORT]   Pull image and start Sage AI UI (default port: $DEFAULT_PORT)
   stop                  Stop the running container
   update                Pull latest image and restart
-  dev [--port PORT] [--dir DIR]  Clone and run in dev mode with hot reload
+  dev [--port PORT] [--dir DIR] [--where]  Clone and run in dev mode with hot reload
   logs                  Tail container logs
   open                  Open the UI in your default browser
   status                Show container status
   version               Show CLI version
+  nuke                  Remove everything Sage AI UI — clean slate
 
 EOF
 }
@@ -131,27 +196,97 @@ cmd_stop() {
 
 cmd_dev() {
   local port=$DEFAULT_PORT
-  local repo_dir="${SAGE_DEV_DIR:-${HOME}/src/ai-ui}"
+  local explicit_dir=""
+  local repo_dir=""
+  local saved
+  saved="$(sage_project_dir ai-ui)" || true
+  local needs_clone=false
 
+  # --- Parse flags ---
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --port) port="$2"; shift 2 ;;
-      --dir) repo_dir="$2"; shift 2 ;;
+      --port)  port="$2"; shift 2 ;;
+      --dir)   explicit_dir="$2"; shift 2 ;;
+      --where)
+        # Quick lookup: where's my code?
+        if [[ -n "$saved" ]]; then
+          echo "$saved"
+        else
+          echo "No saved location yet. Run 'ai-ui dev' to set one up."
+        fi
+        return 0
+        ;;
       *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
 
-  ensure_docker
+  # --- Step 1: Explicit --dir? Trust the user. ---
+  if [[ -n "$explicit_dir" ]]; then
+    repo_dir="$explicit_dir"
+    if [[ -n "$saved" && "$saved" != "$repo_dir" ]]; then
+      echo "Note: switching from $saved (previously saved) to $repo_dir."
+    fi
 
-  # Clone if not already present
-  if [ ! -d "$repo_dir" ]; then
-    echo "Cloning Sage AI UI source to $repo_dir..."
-    git clone https://github.com/Sage-is/AI-UI.git "$repo_dir"
+  # --- Step 2: SAGE_DEV_DIR env var? Backwards compat. ---
+  elif [[ -n "${SAGE_DEV_DIR:-}" ]]; then
+    repo_dir="$SAGE_DEV_DIR"
+    if [[ -n "$saved" && "$saved" != "$repo_dir" ]]; then
+      echo "Note: SAGE_DEV_DIR is set — switching from $saved to $repo_dir."
+    fi
+
+  # --- Step 3: Are we inside (or next to) an AI-UI repo right now? ---
+  elif repo_dir="$(find_repo_nearby "$AI_UI_REMOTE")"; then
+    if [[ -n "$saved" && "$saved" != "$repo_dir" ]]; then
+      echo "Found AI-UI source here ($repo_dir)."
+      echo "  Note: previously saved as $saved — updating."
+    elif [[ -z "$saved" ]]; then
+      echo "Found AI-UI source here ($repo_dir). Saving for next time."
+    else
+      echo "Using AI-UI source at $repo_dir"
+    fi
+
+  # --- Step 4: Do we have a saved path from last time? ---
+  elif [[ -n "$saved" ]]; then
+    if [[ -d "$saved" ]]; then
+      echo "Using your AI-UI source at $saved (saved from last time)."
+      repo_dir="$saved"
+    else
+      # The directory is gone — don't silently forget.
+      echo "Heads up — your AI-UI source was at $saved, but that directory is gone."
+      echo "  (If you moved it, you can point us there with: ai-ui dev --dir /new/path)"
+      echo ""
+      repo_dir="${HOME}/src/ai-ui"
+      needs_clone=true
+    fi
+
+  # --- Step 5: First time, nothing found. Clone fresh. ---
   else
-    echo "Using existing source at $repo_dir"
+    repo_dir="${HOME}/src/ai-ui"
+    needs_clone=true
   fi
 
-  # Stop existing container
+  # --- Clone if needed ---
+  if [[ "$needs_clone" == true ]] || [[ ! -d "$repo_dir" ]]; then
+    echo "Cloning Sage AI UI to $repo_dir..."
+    git clone https://github.com/Sage-is/AI-UI.git "$repo_dir"
+    echo "  (We'll remember this location for next time.)"
+  fi
+
+  # --- Step 6: Ephemeral path warning ---
+  if is_ephemeral_path "$repo_dir"; then
+    echo ""
+    echo "  ⚠ Heads up: $repo_dir may not survive a reboot."
+    echo "    Your code changes could be lost."
+    echo "    For a permanent location: ai-ui dev --dir ~/src/ai-ui"
+    echo ""
+  fi
+
+  # --- Save the resolved path for next time ---
+  sage_set_project_dir ai-ui "$repo_dir"
+
+  # --- Start dev container ---
+  ensure_docker
+
   docker rm -f "$CONTAINER" 2>/dev/null || true
 
   echo "Pulling latest image..."
@@ -176,6 +311,19 @@ cmd_dev() {
   echo ""
   echo "Run 'ai-ui logs' to see output."
   echo "Run 'ai-ui open' to open in your browser."
+}
+
+# Nuke from orbit — delegates to standalone script so it works without ai-ui installed too.
+cmd_nuke() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -x "$script_dir/scripts/nuke-sage-ai" ]]; then
+    exec "$script_dir/scripts/nuke-sage-ai" "$@"
+  else
+    echo "Error: scripts/nuke-sage-ai not found relative to $(basename "$0")."
+    echo "  Run it directly: scripts/nuke-sage-ai"
+    exit 1
+  fi
 }
 
 cmd_update() {
@@ -226,6 +374,7 @@ case "$command" in
   logs)   cmd_logs ;;
   open)   cmd_open ;;
   status) cmd_status ;;
+  nuke)   cmd_nuke ;;
   version|-v|--version) cmd_version ;;
   -h|--help|help) usage ;;
   *) echo "Unknown command: $command"; usage; exit 1 ;;
