@@ -313,15 +313,15 @@ cmd_dev() {
   echo "Run 'ai-ui open' to open in your browser."
 }
 
-# Nuke from orbit — delegates to standalone script so it works without ai-ui installed too.
+# Nuke from orbit — delegates to the Genesis Device (standalone, works without ai-ui installed).
 cmd_nuke() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [[ -x "$script_dir/scripts/nuke-sage-ai" ]]; then
-    exec "$script_dir/scripts/nuke-sage-ai" "$@"
+  if [[ -x "$script_dir/scripts/nuke-sage" ]]; then
+    exec "$script_dir/scripts/nuke-sage" ai-ui "$@"
   else
-    echo "Error: scripts/nuke-sage-ai not found relative to $(basename "$0")."
-    echo "  Run it directly: scripts/nuke-sage-ai"
+    echo "Error: scripts/nuke-sage not found relative to $(basename "$0")."
+    echo "  Run it directly: scripts/nuke-sage ai-ui"
     exit 1
   fi
 }
