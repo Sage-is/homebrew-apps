@@ -175,7 +175,7 @@ Major releases (`make major_release`) also create a versioned formula — `ai-ui
 
 ## The vision
 
-This tap is the home for every Sage project that ships as a CLI or app. One repo, one `brew install`, done.
+This tap is the home for every Sage project that ships as a CLI or app. One repo, one `brew install`.
 
 ```mermaid
 mindmap
