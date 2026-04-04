@@ -115,7 +115,7 @@ The main `ai-ui` formula always tracks the latest. Versioned formulas (`ai-ui@1`
 Need to reset everything for testing or a fresh start? `nuke-sage` is the Genesis Device.
 
 ```bash
-scripts/nuke-sage ai-ui          # remove just ai-ui
+scripts/nuke-sage ai-ui           # remove just ai-ui
 scripts/nuke-sage --all           # remove all Sage artifacts, keep config vault
 scripts/nuke-sage --genesis       # scorched earth — everything goes
 ```
