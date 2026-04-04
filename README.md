@@ -186,8 +186,6 @@ mindmap
         ai-ui@2
       db-sage-pb
         Coming soon
-      open-webui
-        Coming soon
       sage-education
         Coming soon
     Shared Tooling
