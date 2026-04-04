@@ -1,6 +1,6 @@
 # homebrew-apps
 
-**The Sage Homebrew Tap.** One command to install, one command to run.
+**The Sage Homebrew Tap.** One command to install and run.
 
 ```bash
 brew install sage-is/apps/ai-ui
