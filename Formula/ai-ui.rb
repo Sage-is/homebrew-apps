@@ -17,11 +17,18 @@ class AiUi < Formula
       Start Sage AI UI:
         ai-ui start
 
+      Or boot a try.sage trial (seeded personas, hidden LLM, 24h auto-reset):
+        ai-ui try
+      First run prompts for a Groq API key (free tier at https://console.groq.com).
+      Saved chmod 600 to ~/.sage-is/try.env.
+
       For local LLM inference, start the Ollama service:
         brew services start ollama
 
       Configure LLM backends in the admin UI:
         ai-ui open → Admin > Settings > Connections
+
+      Data lives in the `sage-ai-data` Docker volume (`sage-try-data` for trial).
     EOS
   end
 

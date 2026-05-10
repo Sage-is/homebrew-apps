@@ -103,6 +103,8 @@ brew install sage-is/apps/ai-ui@1
 
 The main `ai-ui` formula always tracks the latest. Versioned formulas (`ai-ui@1`, `ai-ui@2`, ...) let you lock to a major release — useful when stability matters more than features.
 
+For the *why* behind the two-file pattern (and the poka-yoke that keeps the v1 freeze from breaking when v2 ships), see [docs/versioned-formulas.md](docs/versioned-formulas.md).
+
 ## Dependencies
 
 - **Docker** — the container runtime (Docker Desktop, OrbStack, or Colima all work)
