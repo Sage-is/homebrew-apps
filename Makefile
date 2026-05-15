@@ -264,7 +264,7 @@ custom_release: require_gitflow_next
 # 5. Waits for GitHub archive, computes sha256
 # 6. Commits sha256 on master, merges to develop
 
-release_finish: require_gitflow_next
+release_finish: require_gitflow_next distribution_verify
 	@echo "=== Finishing release $(RELEASE_VERSION) ==="
 	@# Step 1: Clear stale git-flow state if no real merge is in progress
 	@$(clear_stale_gitflow_state)
@@ -320,7 +320,7 @@ feature_finish: require_gitflow_next
 # ---------------------------------------------------------------------------
 # Same flow as release_finish but for hotfix branches.
 
-hotfix_finish: require_gitflow_next
+hotfix_finish: require_gitflow_next distribution_verify
 	@echo "=== Finishing hotfix ==="
 	@$(clear_stale_gitflow_state)
 	@git flow hotfix finish --no-fetch || ( \
@@ -369,4 +369,50 @@ require_gitflow_next:
 .PHONY: help show-version check-upstream sha256 test release \
 	minor_release patch_release major_release hotfix custom_release \
 	feature_finish release_finish hotfix_finish \
-	bump_formula_url require_gitflow_next
+	bump_formula_url require_gitflow_next \
+	distribution_sync distribution_verify
+
+# ---------------------------------------------------------------------------
+# Distribution.env hardlink chain (Jidoka 自働化 primitive)
+# ---------------------------------------------------------------------------
+# distribution.env is the canonical source of truth for distribution facts
+# (image, server tag, volume, install command, CLI version). It is hardlinked
+# from this repo into WEB-AI--Sage-is-AI-UI and WEB-Sage.Education-docs. An
+# edit in any one propagates to the other two immediately.
+#
+# Hardlinks don't survive a fresh `git clone` — re-run `make distribution_sync`
+# from any sibling after cloning to re-establish the chain.
+#
+# `release_finish` and `hotfix_finish` depend on `distribution_verify` so a
+# release halts if the chain has drifted.
+
+SIBLING_HOMEBREW ?= .
+SIBLING_AI_UI    ?= ../WEB-AI--Sage-is-AI-UI
+SIBLING_DOCS     ?= ../WEB-Sage.Education-docs
+DIST_SOURCE      := $(SIBLING_HOMEBREW)/distribution.env
+
+distribution_sync:
+	@test -f $(DIST_SOURCE) || { \
+		echo "ERROR: $(DIST_SOURCE) not found. This repo holds the canonical file."; \
+		exit 1; \
+	}
+	@test -d $(SIBLING_AI_UI) && ln -f $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env || \
+		echo "NOTE: $(SIBLING_AI_UI) not present; skipping AI-UI hardlink."
+	@test -d $(SIBLING_DOCS) && ln -f $(DIST_SOURCE) $(SIBLING_DOCS)/distribution.env || \
+		echo "NOTE: $(SIBLING_DOCS) not present; skipping docs hardlink."
+	@$(MAKE) distribution_verify
+
+distribution_verify:
+	@expected=1; \
+	test -d $(SIBLING_AI_UI) && expected=$$((expected + 1)); \
+	test -d $(SIBLING_DOCS) && expected=$$((expected + 1)); \
+	for f in $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env $(SIBLING_DOCS)/distribution.env; do \
+		test -e "$$f" || continue; \
+		links=$$(stat -f "%l" "$$f" 2>/dev/null || stat -c "%h" "$$f"); \
+		if [ "$$links" != "$$expected" ]; then \
+			echo "FAIL: $$f has $$links links, expected $$expected"; \
+			echo "  Run 'make distribution_sync' to re-establish the chain."; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "OK: distribution.env hardlink chain intact ($$expected links)."

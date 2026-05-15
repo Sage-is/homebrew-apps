@@ -23,15 +23,20 @@ Open your browser, you're in. Private, local, yours.
 | Command | What it does |
 |---------|-------------|
 | `ai-ui start` | Pull the image and start the UI (port 8080) |
+| `ai-ui start --tag 2.3.1` | Pin a specific server version |
 | `ai-ui stop` | Stop everything cleanly |
 | `ai-ui update` | Pull the latest image and restart |
+| `ai-ui update --tag 2.3.1` | Switch to a specific server tag and restart |
+| `ai-ui try` | Boot a try.sage trial (seeded personas, hidden LLM, 24h reset) |
 | `ai-ui dev` | Clone the source and run with hot reload |
 | `ai-ui open` | Open the UI in your browser |
 | `ai-ui logs` | Tail the container logs |
 | `ai-ui status` | Check what's running |
 | `ai-ui nuke` | Remove everything — clean slate |
 
-Pass `--port 3000` to `start` or `dev` if 8080 is taken.
+Pass `--port 3000` to `start`, `try`, or `dev` if 8080 is taken.
+
+`--tag X.Y.Z` pins any release that has been published to `ghcr.io/sage-is/ai-ui` — see the [AI-UI releases](https://github.com/Sage-is/AI-UI/releases) page for the full list. Default is `latest`.
 
 ### How it flows
 
@@ -146,9 +151,42 @@ graph LR
 
 `--all` keeps your `~/.sage-is/` vault so clone paths survive — re-setup is instant. `--genesis` erases everything including the Docker provider itself. Add `--dry-run` to preview, `--yes` for CI.
 
+## The distribution.env contract
+
+Three Sage repos — this one, [Sage-is/AI-UI](https://github.com/Sage-is/AI-UI), and [Sage-is/Sage.Education-docs](https://github.com/Sage-is/Sage.Education-docs) — read canonical distribution facts from a single hardlinked `distribution.env`. Image registry, server tag, volume name, install command, CLI version. Edit once, three repos see it. **This repo is the source of truth.**
+
+Hardlinks don't survive a `git clone`. After cloning the three siblings, run:
+
+```bash
+make distribution_sync       # from any sibling, re-establishes the hardlink chain
+make distribution_verify     # confirms link count == 3
+```
+
+`release_finish` here and in AI-UI depend on `distribution_verify` — a release halts if the chain has drifted. That's the Jidoka (自働化) primitive: the machine stops itself.
+
+The CLI's `IMAGE_REGISTRY`, `VOLUME`, and default server tag are sourced from `distribution.env` when running from a development checkout. Brew-installed users get the values baked into the formula at install time.
+
+## Two version tracks
+
+This tap ships on its own clock from the server it deploys. Two independent versions:
+
+- **CLI track** — the version of *this CLI script*. Currently **1.1.0**. Bumps only when the `ai-ui` shell wrapper changes. A new server release does NOT force a CLI bump.
+- **Server track** — the version of the container image at `ghcr.io/sage-is/ai-ui`. Currently **2.3.1**. Bumps on every AI-UI release. Independent of this CLI.
+
+Users on the brew path read [CHANGELOG.md](CHANGELOG.md) for CLI changes and [AI-UI's CHANGELOG](https://github.com/Sage-is/AI-UI/blob/master/CHANGELOG.md) for server changes.
+
 ## For contributors
 
-This repo uses [git-flow-next](https://github.com/will-stone/git-flow-next) for releases. The Makefile handles the full workflow — version bumping, formula URL updates, sha256 computation, the works.
+This repo uses [git-flow-next](https://github.com/will-stone/git-flow-next) for releases AND for feature work. **The Sage projects use feature branches, not pull requests, as the primary contribution flow.** The reason is portability: git-flow works against any git remote — self-hosted, mirrored, federated — not just centralized SaaS. A deliberate stance on resilience, not stylistic preference.
+
+```bash
+git flow feature start <feature-name>    # create branch
+# ... do the work ...
+git flow feature finish <feature-name>   # merge into develop, delete branch
+git push origin develop                  # push to whichever remote you use
+```
+
+PRs are accepted but not the primary path. The Makefile handles the full release workflow — version bumping, formula URL updates, sha256 computation, the works.
 
 ```bash
 make help               # see all targets

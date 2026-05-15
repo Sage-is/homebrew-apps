@@ -1,13 +1,41 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="1.0.3"
+VERSION="1.1.0"
 
-IMAGE="ghcr.io/sage-is/ai-ui:latest"
+# ---------------------------------------------------------------------------
+# Canonical distribution facts.
+# ---------------------------------------------------------------------------
+# These mirror values in distribution.env (hardlinked across homebrew-apps,
+# WEB-AI--Sage-is-AI-UI, WEB-Sage.Education-docs). When running this script
+# from a development checkout, distribution.env (next to the script) overrides
+# the hardcoded defaults. Brew-installed users get the defaults below.
+#
+# Bumping these without bumping VERSION is a footgun — they go together.
+
+IMAGE_REGISTRY="ghcr.io/sage-is/ai-ui"
+DEFAULT_SERVER_TAG="latest"
 CONTAINER="sage-ai"
 VOLUME="sage-ai-data"
 DATA_MOUNT="/app/backend/data"
 DEFAULT_PORT=8080
+
+# Source distribution.env if we're running from a checkout (overrides defaults).
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$_script_dir/distribution.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$_script_dir/distribution.env"
+  set +a
+  IMAGE_REGISTRY="${IMAGE:-$IMAGE_REGISTRY}"
+  DEFAULT_SERVER_TAG="${SERVER_TAG:-$DEFAULT_SERVER_TAG}"
+  VOLUME="${VOLUME:-$VOLUME}"
+  DATA_MOUNT="${DATA_MOUNT:-$DATA_MOUNT}"
+fi
+
+# Active image tag. Overridable per-invocation via `--tag X.Y.Z`.
+IMAGE_TAG="$DEFAULT_SERVER_TAG"
+IMAGE="$IMAGE_REGISTRY:$IMAGE_TAG"
 
 # try.sage trial mode runs the same image with ENABLE_TRY_SAGE=true. Separate
 # container + volume so a workstation can keep its prod install around without
@@ -85,11 +113,15 @@ usage() {
 Usage: ai-ui <command> [options]
 
 Commands:
-  start [--port PORT]   Pull image and start Sage AI UI (default port: $DEFAULT_PORT)
+  start [--port PORT] [--tag X.Y.Z]
+                        Pull image and start Sage AI UI (default port: $DEFAULT_PORT)
+                        --tag pins a specific server version (default: $DEFAULT_SERVER_TAG)
   stop                  Stop the running container (prod and trial)
-  try [--port PORT]     Start try.sage trial mode (BYO Groq key on first run)
-  update                Pull latest image and restart
-  dev [--port PORT] [--dir DIR] [--where]  Clone and run in dev mode with hot reload
+  try   [--port PORT] [--tag X.Y.Z]
+                        Start try.sage trial mode (BYO Groq key on first run)
+  update [--tag X.Y.Z]  Pull a tag (default latest) and restart
+  dev   [--port PORT] [--dir DIR] [--where]
+                        Clone and run in dev mode with hot reload
   logs                  Tail container logs
   open                  Open the UI in your default browser
   status                Show container status
@@ -171,13 +203,14 @@ cmd_start() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --port) port="$2"; shift 2 ;;
+      --tag)  IMAGE_TAG="$2"; IMAGE="$IMAGE_REGISTRY:$IMAGE_TAG"; shift 2 ;;
       *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
 
   ensure_docker
 
-  echo "Pulling latest image..."
+  echo "Pulling $IMAGE..."
   docker pull "$IMAGE"
 
   # Stop existing container if running
@@ -401,6 +434,7 @@ cmd_try() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --port) port="$2"; shift 2 ;;
+      --tag)  IMAGE_TAG="$2"; IMAGE="$IMAGE_REGISTRY:$IMAGE_TAG"; shift 2 ;;
       *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
@@ -480,7 +514,19 @@ cmd_nuke() {
 }
 
 cmd_update() {
-  echo "Pulling latest image..."
+  # Pre-parse --tag so the pull line shows the right image; cmd_start re-parses.
+  local i=0
+  while [[ $i -lt $# ]]; do
+    i=$((i + 1))
+    if [[ "${!i:-}" == "--tag" ]]; then
+      local next=$((i + 1))
+      IMAGE_TAG="${!next}"
+      IMAGE="$IMAGE_REGISTRY:$IMAGE_TAG"
+      break
+    fi
+  done
+
+  echo "Pulling $IMAGE..."
   docker pull "$IMAGE"
   cmd_stop
   cmd_start "$@"

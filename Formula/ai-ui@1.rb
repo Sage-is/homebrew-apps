@@ -15,13 +15,20 @@ class AiUiAT1 < Formula
 
   def caveats
     <<~EOS
-      Start Sage AI UI:
+      Start Sage AI UI (pulls ghcr.io/sage-is/ai-ui:latest):
         ai-ui start
+
+      Pin a specific server version:
+        ai-ui start --tag 2.3.1
 
       Or boot a try.sage trial (seeded personas, hidden LLM, 24h auto-reset):
         ai-ui try
       First run prompts for a Groq API key (free tier at https://console.groq.com).
       Saved chmod 600 to ~/.sage-is/try.env.
+
+      Update to the latest server image:
+        brew upgrade ai-ui   # updates this CLI when it changes
+        ai-ui update         # pulls the newest server image and restarts
 
       For local LLM inference, start the Ollama service:
         brew services start ollama
@@ -30,6 +37,7 @@ class AiUiAT1 < Formula
         ai-ui open → Admin > Settings > Connections
 
       Data lives in the `sage-ai-data` Docker volume (`sage-try-data` for trial).
+      Nothing leaves the volume unless you back it up.
     EOS
   end
 
