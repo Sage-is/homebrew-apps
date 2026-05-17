@@ -16,6 +16,14 @@
 # ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------
+
+# Pull canonical distribution facts from the shared contract. Hardlinked
+# from this repo into WEB-AI--Sage-is-AI-UI and WEB-Sage.Education-docs.
+# `-include` (vs `include`) means a fresh clone where distribution.env
+# hasn't been hardlinked yet won't fail the Makefile parse — the user
+# runs `make distribution_sync` to re-establish.
+-include distribution.env
+
 GIT_TAG     := $(shell git tag --sort=-v:refname | sed 's/^v//' | head -n 1)
 IMAGE_TAG   := $(if $(GIT_TAG),$(GIT_TAG),0.0.0)
 GIT_BRANCH  := $(shell git rev-parse --abbrev-ref HEAD)
