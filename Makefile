@@ -378,7 +378,7 @@ require_gitflow_next:
 	minor_release patch_release major_release hotfix custom_release \
 	feature_finish release_finish hotfix_finish \
 	bump_formula_url require_gitflow_next \
-	distribution_sync distribution_verify
+	setup setup_siblings distribution_sync distribution_verify
 
 # ---------------------------------------------------------------------------
 # Distribution.env hardlink chain (Jidoka 自働化 primitive)
@@ -399,28 +399,49 @@ SIBLING_AI_UI    ?= ../WEB-AI--Sage-is-AI-UI
 SIBLING_DOCS     ?= ../WEB-Sage.Education-docs
 DIST_SOURCE      := $(SIBLING_HOMEBREW)/distribution.env
 
+## setup_siblings — establish the distribution.env hardlink chain across siblings.
+##
+## Verifies all three repos are checked out side-by-side. If a sibling is
+## missing, prints the exact `git clone` command and exits non-zero. If
+## all three are present, calls distribution_sync to (re)establish the
+## hardlinks. Idempotent — safe to re-run.
+setup_siblings:
+	@chmod +x tools/setup_siblings.sh
+	@tools/setup_siblings.sh
+
+## setup — fresh-machine bootstrap. Currently equivalent to setup_siblings;
+## reserved for additional homebrew-apps setup steps (lint config, etc.).
+setup: setup_siblings
+	@echo ""
+	@echo "=== Setup complete ==="
+
 distribution_sync:
 	@test -f $(DIST_SOURCE) || { \
 		echo "ERROR: $(DIST_SOURCE) not found. This repo holds the canonical file."; \
 		exit 1; \
 	}
-	@test -d $(SIBLING_AI_UI) && ln -f $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env || \
-		echo "NOTE: $(SIBLING_AI_UI) not present; skipping AI-UI hardlink."
-	@test -d $(SIBLING_DOCS) && ln -f $(DIST_SOURCE) $(SIBLING_DOCS)/distribution.env || \
-		echo "NOTE: $(SIBLING_DOCS) not present; skipping docs hardlink."
+	@test -d $(SIBLING_AI_UI) || { \
+		echo "ERROR: $(SIBLING_AI_UI) not found."; \
+		echo "       Run 'make setup_siblings' first."; \
+		exit 1; \
+	}
+	@test -d $(SIBLING_DOCS) || { \
+		echo "ERROR: $(SIBLING_DOCS) not found."; \
+		echo "       Run 'make setup_siblings' first."; \
+		exit 1; \
+	}
+	@ln -f $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env
+	@ln -f $(DIST_SOURCE) $(SIBLING_DOCS)/distribution.env
 	@$(MAKE) distribution_verify
 
 distribution_verify:
-	@expected=1; \
-	test -d $(SIBLING_AI_UI) && expected=$$((expected + 1)); \
-	test -d $(SIBLING_DOCS) && expected=$$((expected + 1)); \
-	for f in $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env $(SIBLING_DOCS)/distribution.env; do \
-		test -e "$$f" || continue; \
+	@for f in $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env $(SIBLING_DOCS)/distribution.env; do \
+		test -e "$$f" || { echo "FAIL: $$f missing — run 'make setup_siblings'"; exit 1; }; \
 		links=$$(stat -f "%l" "$$f" 2>/dev/null || stat -c "%h" "$$f"); \
-		if [ "$$links" != "$$expected" ]; then \
-			echo "FAIL: $$f has $$links links, expected $$expected"; \
+		if [ "$$links" != "3" ]; then \
+			echo "FAIL: $$f has $$links links, expected 3"; \
 			echo "  Run 'make distribution_sync' to re-establish the chain."; \
 			exit 1; \
 		fi; \
-	done; \
-	echo "OK: distribution.env hardlink chain intact ($$expected links)."
+	done
+	@echo "OK: distribution.env hardlink chain intact (3 links)."
