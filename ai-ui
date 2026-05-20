@@ -479,6 +479,10 @@ cmd_try() {
         print_try_links "$port"
         echo "═══════════════════════════════════════════════════════════"
         echo ""
+        case "$(uname)" in
+          Darwin) open "http://localhost:$port" ;;
+          *)      xdg-open "http://localhost:$port" 2>/dev/null || true ;;
+        esac
         exit 0
       fi
       sleep 1
