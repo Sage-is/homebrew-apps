@@ -445,3 +445,12 @@ distribution_verify:
 		fi; \
 	done
 	@echo "OK: distribution.env hardlink chain intact (3 links)."
+	@server_tag=$$(grep '^SERVER_TAG=' $(DIST_SOURCE) | cut -d= -f2); \
+	image_reg=$$(grep '^IMAGE=' $(DIST_SOURCE) | cut -d= -f2); \
+	echo "Checking GHCR: $$image_reg:$$server_tag ..."; \
+	if ! docker manifest inspect "$$image_reg:$$server_tag" >/dev/null 2>&1; then \
+		echo "FAIL: $$image_reg:$$server_tag not found on GHCR."; \
+		echo "  Release AI-UI first: make release_and_push_GHCR (in WEB-AI--Sage-is-AI-UI)"; \
+		exit 1; \
+	fi; \
+	echo "OK: $$image_reg:$$server_tag verified on GHCR."
