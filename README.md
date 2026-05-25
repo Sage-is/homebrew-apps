@@ -1,6 +1,6 @@
 # homebrew-apps
 
-**The Sage Homebrew Tap.** One command to install, one command to run.
+**The Sage Homebrew Tap.** One command to install and run.
 
 ```bash
 brew install sage-is/apps/ai-ui
@@ -122,7 +122,7 @@ For the *why* behind the two-file pattern (and the poka-yoke that keeps the v1 f
 Need to reset everything for testing or a fresh start? `nuke-sage` is the Genesis Device.
 
 ```bash
-scripts/nuke-sage ai-ui          # remove just ai-ui
+scripts/nuke-sage ai-ui           # remove just ai-ui
 scripts/nuke-sage --all           # remove all Sage artifacts, keep config vault
 scripts/nuke-sage --genesis       # scorched earth — everything goes
 ```
@@ -225,8 +225,6 @@ mindmap
         ai-ui@1
         ai-ui@2
       db-sage-pb
-        Coming soon
-      open-webui
         Coming soon
       sage-education
         Coming soon
