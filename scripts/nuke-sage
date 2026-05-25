@@ -390,7 +390,7 @@ esac
 echo ""
 echo "  ╔══════════════════════════════════════════════════╗"
 echo "  ║  nuke-sage — the Genesis Device                  ║"
-echo "  ║  Mode: $(printf '%-41s' "$MODE_LABEL") ║"
+echo "  ║  Mode: $(printf '%-41s' "$MODE_LABEL")  ║"
 echo "  ╚══════════════════════════════════════════════════╝"
 echo ""
 

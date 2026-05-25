@@ -16,6 +16,14 @@
 # ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------
+
+# Pull canonical distribution facts from the shared contract. Hardlinked
+# from this repo into WEB-AI--Sage-is-AI-UI and WEB-Sage.Education-docs.
+# `-include` (vs `include`) means a fresh clone where distribution.env
+# hasn't been hardlinked yet won't fail the Makefile parse — the user
+# runs `make distribution_sync` to re-establish.
+-include distribution.env
+
 GIT_TAG     := $(shell git tag --sort=-v:refname | sed 's/^v//' | head -n 1)
 IMAGE_TAG   := $(if $(GIT_TAG),$(GIT_TAG),0.0.0)
 GIT_BRANCH  := $(shell git rev-parse --abbrev-ref HEAD)
@@ -264,7 +272,7 @@ custom_release: require_gitflow_next
 # 5. Waits for GitHub archive, computes sha256
 # 6. Commits sha256 on master, merges to develop
 
-release_finish: require_gitflow_next
+release_finish: require_gitflow_next distribution_verify
 	@echo "=== Finishing release $(RELEASE_VERSION) ==="
 	@# Step 1: Clear stale git-flow state if no real merge is in progress
 	@$(clear_stale_gitflow_state)
@@ -320,7 +328,7 @@ feature_finish: require_gitflow_next
 # ---------------------------------------------------------------------------
 # Same flow as release_finish but for hotfix branches.
 
-hotfix_finish: require_gitflow_next
+hotfix_finish: require_gitflow_next distribution_verify
 	@echo "=== Finishing hotfix ==="
 	@$(clear_stale_gitflow_state)
 	@git flow hotfix finish --no-fetch || ( \
@@ -369,4 +377,80 @@ require_gitflow_next:
 .PHONY: help show-version check-upstream sha256 test release \
 	minor_release patch_release major_release hotfix custom_release \
 	feature_finish release_finish hotfix_finish \
-	bump_formula_url require_gitflow_next
+	bump_formula_url require_gitflow_next \
+	setup setup_siblings distribution_sync distribution_verify
+
+# ---------------------------------------------------------------------------
+# Distribution.env hardlink chain (Jidoka 自働化 primitive)
+# ---------------------------------------------------------------------------
+# distribution.env is the canonical source of truth for distribution facts
+# (image, server tag, volume, install command, CLI version). It is hardlinked
+# from this repo into WEB-AI--Sage-is-AI-UI and WEB-Sage.Education-docs. An
+# edit in any one propagates to the other two immediately.
+#
+# Hardlinks don't survive a fresh `git clone` — re-run `make distribution_sync`
+# from any sibling after cloning to re-establish the chain.
+#
+# `release_finish` and `hotfix_finish` depend on `distribution_verify` so a
+# release halts if the chain has drifted.
+
+SIBLING_HOMEBREW ?= .
+SIBLING_AI_UI    ?= ../WEB-AI--Sage-is-AI-UI
+SIBLING_DOCS     ?= ../WEB-Sage.Education-docs
+DIST_SOURCE      := $(SIBLING_HOMEBREW)/distribution.env
+
+## setup_siblings — establish the distribution.env hardlink chain across siblings.
+##
+## Verifies all three repos are checked out side-by-side. If a sibling is
+## missing, prints the exact `git clone` command and exits non-zero. If
+## all three are present, calls distribution_sync to (re)establish the
+## hardlinks. Idempotent — safe to re-run.
+setup_siblings:
+	@chmod +x tools/setup_siblings.sh
+	@tools/setup_siblings.sh
+
+## setup — fresh-machine bootstrap. Currently equivalent to setup_siblings;
+## reserved for additional homebrew-apps setup steps (lint config, etc.).
+setup: setup_siblings
+	@echo ""
+	@echo "=== Setup complete ==="
+
+distribution_sync:
+	@test -f $(DIST_SOURCE) || { \
+		echo "ERROR: $(DIST_SOURCE) not found. This repo holds the canonical file."; \
+		exit 1; \
+	}
+	@test -d $(SIBLING_AI_UI) || { \
+		echo "ERROR: $(SIBLING_AI_UI) not found."; \
+		echo "       Run 'make setup_siblings' first."; \
+		exit 1; \
+	}
+	@test -d $(SIBLING_DOCS) || { \
+		echo "ERROR: $(SIBLING_DOCS) not found."; \
+		echo "       Run 'make setup_siblings' first."; \
+		exit 1; \
+	}
+	@ln -f $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env
+	@ln -f $(DIST_SOURCE) $(SIBLING_DOCS)/distribution.env
+	@$(MAKE) distribution_verify
+
+distribution_verify:
+	@for f in $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env $(SIBLING_DOCS)/distribution.env; do \
+		test -e "$$f" || { echo "FAIL: $$f missing — run 'make setup_siblings'"; exit 1; }; \
+		links=$$(stat -f "%l" "$$f" 2>/dev/null || stat -c "%h" "$$f"); \
+		if [ "$$links" != "3" ]; then \
+			echo "FAIL: $$f has $$links links, expected 3"; \
+			echo "  Run 'make distribution_sync' to re-establish the chain."; \
+			exit 1; \
+		fi; \
+	done
+	@echo "OK: distribution.env hardlink chain intact (3 links)."
+	@server_tag=$$(grep '^SERVER_TAG=' $(DIST_SOURCE) | cut -d= -f2); \
+	image_reg=$$(grep '^IMAGE=' $(DIST_SOURCE) | cut -d= -f2); \
+	echo "Checking GHCR: $$image_reg:$$server_tag ..."; \
+	if ! docker manifest inspect "$$image_reg:$$server_tag" >/dev/null 2>&1; then \
+		echo "FAIL: $$image_reg:$$server_tag not found on GHCR."; \
+		echo "  Release AI-UI first: make release_and_push_GHCR (in WEB-AI--Sage-is-AI-UI)"; \
+		exit 1; \
+	fi; \
+	echo "OK: $$image_reg:$$server_tag verified on GHCR."
