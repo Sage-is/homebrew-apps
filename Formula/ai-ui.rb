@@ -2,7 +2,7 @@ class AiUi < Formula
   desc "One-command local deployment of Sage AI UI via Docker"
   homepage "https://github.com/Sage-is/AI-UI"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/v1.0.4.tar.gz"
-  sha256 "2bd190c35c97191df01dbf26aaab0fc90d7b4a589f1f6b7ce3f78df57e2627f9"
+  sha256 "69da3959ae37d910fddd49f46c8ca6622f8490e743dd08f3f3d2677434550e03"
   license "MIT"
 
   depends_on "docker"
