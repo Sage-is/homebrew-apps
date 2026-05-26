@@ -1,6 +1,6 @@
 cask "local-whisper" do
-  version "1.0.0"
-  sha256 :no_check  # populated by Startr-Cloud/local-whisper:scripts/release_all.sh
+  version "1.1.0"
+  sha256 "30ec3fe2353e06b497130d8028d198a517dd80bd188f4823e246c1f81d3db309"
 
   url "https://github.com/opencoca/local-whisper/releases/download/v#{version}/LocalWhisper-#{version}.dmg"
   name "LocalWhisper"
