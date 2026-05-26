@@ -196,6 +196,7 @@ release:
 # After this, you only need `make release_finish`.
 
 minor_release: require_gitflow_next
+	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
 	@$(HELPERS) && \
 	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2+1".0"}') && \
 	git flow release start $$NEW_VER && \
@@ -208,6 +209,7 @@ minor_release: require_gitflow_next
 	echo "Next: make release_finish"
 
 patch_release: require_gitflow_next
+	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
 	@$(HELPERS) && \
 	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2"."$$3+1}') && \
 	git flow release start $$NEW_VER && \
@@ -220,6 +222,7 @@ patch_release: require_gitflow_next
 	echo "Next: make release_finish"
 
 major_release: require_gitflow_next
+	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
 	@$(HELPERS) && \
 	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1+1".0.0"}') && \
 	MAJOR=$$(echo $$NEW_VER | awk -F'.' '{print $$1}') && \
@@ -234,6 +237,7 @@ major_release: require_gitflow_next
 	echo "Next: make release_finish"
 
 hotfix: require_gitflow_next
+	@-$(MAKE) check_upstream  # advisory only; hotfix_finish is the real gate
 	@$(HELPERS) && \
 	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{if (NF < 4) print $$1"."$$2"."$$3".1"; else print $$1"."$$2"."$$3"."$$4+1}') && \
 	git flow hotfix start $$NEW_VER && \
@@ -374,7 +378,7 @@ require_gitflow_next:
 		exit 1; \
 	fi
 
-.PHONY: help show-version check-upstream sha256 test release \
+.PHONY: help show-version check-upstream check_upstream sha256 test release \
 	minor_release patch_release major_release hotfix custom_release \
 	feature_finish release_finish hotfix_finish \
 	bump_formula_url require_gitflow_next \
@@ -434,7 +438,7 @@ distribution_sync:
 	@ln -f $(DIST_SOURCE) $(SIBLING_DOCS)/distribution.env
 	@$(MAKE) distribution_verify
 
-distribution_verify:
+distribution_verify: check_upstream
 	@for f in $(DIST_SOURCE) $(SIBLING_AI_UI)/distribution.env $(SIBLING_DOCS)/distribution.env; do \
 		test -e "$$f" || { echo "FAIL: $$f missing — run 'make setup_siblings'"; exit 1; }; \
 		links=$$(stat -f "%l" "$$f" 2>/dev/null || stat -c "%h" "$$f"); \
@@ -454,3 +458,34 @@ distribution_verify:
 		exit 1; \
 	fi; \
 	echo "OK: $$image_reg:$$server_tag verified on GHCR."
+
+## check_upstream — compare local SERVER_TAG against AI-UI's latest GitHub release.
+##
+## Exits 0 when in sync, 1 when SERVER_TAG is ahead of upstream (would ship a
+## CLI pinned to a server that doesn't exist), 2 when SERVER_TAG lags behind.
+## WARN_LAG=1 allows the lag case (intentional LTS lane).
+##
+## No `gh` / `jq` dep — pure curl + sed + sort -V. Rate limit: 60 req/hour
+## per IP unauthenticated; fine for manual + release-gate usage.
+##
+## Note: distinct from the legacy `check-upstream` (hyphen) target above,
+## which lists upstream tags informationally and compares against IMAGE_TAG
+## (the CLI version, not the server tag).
+check_upstream:
+	@upstream=$$(curl -fsSL "https://api.github.com/repos/Sage-is/AI-UI/tags?per_page=100" 2>/dev/null \
+	             | grep -E '"name"' \
+	             | sed -E 's/.*"v?([^"]+)".*/\1/' \
+	             | sort -V | tail -1); \
+	[ -n "$$upstream" ] || { echo "ERROR: could not fetch AI-UI tags from GitHub"; exit 1; }; \
+	current=$$(grep ^SERVER_TAG= $(DIST_SOURCE) | cut -d= -f2); \
+	if [ "$$current" = "$$upstream" ]; then \
+	  echo "OK: SERVER_TAG=$$current matches AI-UI latest"; \
+	elif printf '%s\n%s\n' "$$upstream" "$$current" | sort -V -C; then \
+	  echo "ERROR: SERVER_TAG=$$current is ahead of AI-UI latest ($$upstream)"; \
+	  echo "       Cannot ship a CLI pinned to a server that doesn't exist yet."; \
+	  exit 1; \
+	else \
+	  echo "WARN: SERVER_TAG=$$current lags AI-UI latest ($$upstream)"; \
+	  echo "      Run AI-UI '_pin_server_tag' to bump, or set WARN_LAG=1 to allow lag."; \
+	  [ "$$WARN_LAG" = "1" ] || exit 2; \
+	fi
