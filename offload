@@ -57,11 +57,15 @@
 #                   (dest is authoritative; source is gone)
 #     sweep       — find subdirs matching internal patterns and delete
 #                   (no destination; data is rebuildable from source code)
+#     purge       — delete the entire source dir, recreate empty. For
+#                   caches and rebuild-on-demand support files (iOS
+#                   DeviceSupport, ~/.cache, ~/.npm, Homebrew cache,
+#                   simulator runtimes/caches). Apps re-populate.
 #     native-ui   — printed instructions only; the tool never auto-mutates
 #                   media libraries (Photos, Music.app, iMovie) because
 #                   those apps have safer native "Choose Library" UIs
 #
-#   Categories: app | home | cold | merge | dev | sweep | protected | vm | media-lib
+#   Categories: app | home | cold | merge | dev | cache | sweep | protected | vm | media-lib
 #
 # OPTIONS
 #   --target-home <path>   work on a different user's home (Admin mode).
@@ -201,7 +205,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 # ----------------------------------------------------------------------------
 # Defaults
@@ -242,6 +246,15 @@ DEFAULT_OFFLOAD_TARGETS=(
 
   # --- Build-cruft sweep (delete in place; rebuildable from source) ------
   "BuildCruft|sweep|<TH>/Documents/Projects/GitHub|(in-place delete)|sweep|no|-"
+
+  # --- Purge: delete the source dir, recreate empty. For caches and    --
+  # --- rebuild-on-demand support files. Apps re-populate as needed.    --
+  "iOS-DeviceSupport|cache|<TH>/Library/Developer/Xcode/iOS DeviceSupport|(in-place purge)|purge|no|-"
+  "XcodeDerivedData|cache|<TH>/Library/Developer/Xcode/DerivedData|(in-place purge)|purge|no|-"
+  "XcodeArchives|cache|<TH>/Library/Developer/Xcode/Archives|(in-place purge)|purge|no|-"
+  "XdgCache|cache|<TH>/.cache|(in-place purge)|purge|no|-"
+  "NpmCache|cache|<TH>/.npm|(in-place purge)|purge|no|-"
+  "HomebrewCache|cache|<TH>/Library/Caches/Homebrew|(in-place purge)|purge|no|-"
 
   # --- Protected (Admin account + FDA on Terminal) -----------------------
   "Messages|protected|<TH>/Library/Messages|HOT/MovedProtected/<U>/Messages|symlink|yes|-"
@@ -503,7 +516,17 @@ strategy_native_ui() {
   local _src="$1" _dst="$2" label="$3"
   log "=== $label (strategy=native-ui) ==="
   log "  This target is moved through the owning app's native UI."
-  log "  See 'offload media-libraries' for the procedure."
+  log "  See 'offload relocations' for the procedure."
+}
+
+strategy_purge() {
+  local src="$1" _dst="$2" label="$3"
+  log "=== $label (strategy=purge) ==="
+  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
+  log "  Source size: $(du -sh "$src" 2>/dev/null | awk '{print $1}')"
+  do_run "rm -rf \"$src\""
+  do_run "mkdir -p \"$src\""
+  log "  DONE: $src purged (recreated empty)"
 }
 
 move_one() {
@@ -524,6 +547,7 @@ move_one() {
     archive)   require_drive OFFLOAD_COLD; strategy_archive "$src" "$dest" "$label" ;;
     merge)     require_drive OFFLOAD_HOT;  strategy_merge   "$src" "$dest" "$label" ;;
     sweep)                                 strategy_sweep   "$src" "$dest" "$label" ;;
+    purge)                                 strategy_purge   "$src" "$dest" "$label" ;;
     native-ui)                             strategy_native_ui "$src" "$dest" "$label" ;;
     *) die "unknown strategy '$strat' for $label" ;;
   esac
@@ -578,6 +602,13 @@ row_bytes() (
       find "$src" "${find_args[@]}" 2>/dev/null \
         | xargs -I{} du -sk "{}" 2>/dev/null \
         | awk '{sum += $1} END {print sum*1024+0}'
+      ;;
+    purge)
+      if [[ -d "$src" && -r "$src" && -x "$src" ]]; then
+        du -sk "$src" 2>/dev/null | awk '{print $1*1024+0}'
+      else
+        echo 0
+      fi
       ;;
     *) echo 0 ;;
   esac
@@ -653,6 +684,17 @@ row_state() (
       if [[ -L "$src" ]]; then echo "symlinked (via native UI)"
       elif [[ -e "$src" ]];  then echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
       else                        echo "absent"
+      fi
+      ;;
+    purge)
+      if [[ ! -d "$src" ]]; then
+        echo "absent"
+      elif [[ ! -r "$src" || ! -x "$src" ]]; then
+        echo "unreadable"
+      elif [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then
+        echo "purged (empty)"
+      else
+        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
       fi
       ;;
     *) echo "unknown" ;;

@@ -60,7 +60,7 @@ Guarded launch. Refuses with a macOS dialog if the app's symlinked
 data directory points to an unmounted volume.
 .It Cm move Ar Label-or-category Op Fl -apply
 Offload one entry by label, or every entry in a category. Categories:
-.Cm app , home , cold , merge , dev , sweep , protected , vm , media-lib .
+.Cm app , home , cold , merge , dev , cache , sweep , protected , vm , media-lib .
 Default is dry-run; supply
 .Fl -apply
 to mutate.
@@ -124,13 +124,18 @@ into existing dest, rm source. Dest is authoritative; source is gone.
 subdirs matching internal patterns
 .Pq node_modules , .venv , target , build , dist , __pycache__ , .next
 and delete. No destination; data is rebuildable from source.
+.It Cm purge
+Delete the source directory entirely, then recreate it empty. For
+caches and rebuild-on-demand support files
+.Pq iOS DeviceSupport , ~/.cache , ~/.npm , Homebrew cache .
+Apps re-populate the dir as needed.
 .It Cm native-ui
 Printed instructions only. The tool never auto-mutates media
 libraries.
 .El
 .Pp
 Categories:
-.Cm app , home , cold , merge , dev , sweep , protected , vm , media-lib .
+.Cm app , home , cold , merge , dev , cache , sweep , protected , vm , media-lib .
 .Sh OPTIONS
 .Bl -tag -width 22n
 .It Fl -target-home Ar path
