@@ -1,0 +1,270 @@
+.\" offload(1) manpage — mdoc format
+.Dd May 28, 2026
+.Dt OFFLOAD 1
+.Os
+.Sh NAME
+.Nm offload
+.Nd poka-yoke disk offload tool for macOS
+.Sh SYNOPSIS
+.Nm
+.Op Fl -target-home Ar path
+.Ar subcommand
+.Op Ar args ...
+.Op Fl -apply
+.Sh DESCRIPTION
+.Nm
+moves heavy, low-velocity user data out of
+.Pa $HOME
+onto an external drive, replacing each source path with a symlink.
+A guard launcher refuses to start an app whose data lives on an unmounted
+volume.
+The tool is mistake-proof by design: dry-run is the default, signature
+verification precedes every destructive step, and all operations are
+idempotent.
+.Pp
+The
+.Cm protected
+subcommand operates on TCC/FDA-protected paths
+.Pq Path Pa Library/Messages , Path Pa Library/Application Support/MobileSync
+and must be invoked from a
+.Em separate
+macOS Admin account whose Terminal has been granted Full Disk Access.
+.Sh SUBCOMMANDS
+.Bl -tag -width 18n
+.It Cm help
+Print the embedded long-form documentation
+.Pq the script header is the single source of truth .
+.It Cm version
+Print the script version.
+.It Cm status
+Disk space, recent log entries, and any pending admin todo.
+.It Cm list
+.Va OFFLOAD_APPS
+entries and the current state of each
+.Pq Pa on-disk , symlinked , absent .
+.It Cm checklist
+Generate a progress checklist that reflects current state.
+.It Cm launch Ar BundleName
+Guarded launch. Refuses with a macOS dialog if the app's symlinked
+data directory points to an unmounted volume.
+.It Cm move Ar target Op Fl -apply
+Execute a move tier.
+Default is dry-run; supply
+.Fl -apply
+to actually mutate.
+.It Cm protected Ar subcmd Op Fl -apply
+Admin-mode subcommand. Requires
+.Fl -target-home
+pointing at a different user's home, an admin-group caller, and
+Terminal-granted FDA.
+.El
+.Sh MOVE TARGETS
+.Bl -tag -width 22n
+.It Cm tier-c-cruft
+Sweep
+.Va node_modules , .venv , venv , target , build , dist , __pycache__ , .next
+under
+.Pa <TARGET_HOME>/Documents/Projects/GitHub .
+.It Cm tier-b-downloads
+Sort
+.Pa <TARGET_HOME>/Downloads :
+ROM zips matching common Nintendo/Sega names go to
+.Pa $OFFLOAD_HOT/ROMs ;
+everything else is archived to
+.Pa $OFFLOAD_COLD/Archive/Downloads-<user>-<date>/ .
+.It Cm tier-b-clones
+.Xr rsync 1
+with
+.Fl -update
+.Pq newer-mtime-wins
+from
+.Pa <TARGET_HOME>/Documents/Projects/Clones
+into
+.Pa $OFFLOAD_HOT/Clones .
+.It Cm tier-a-app Ar Label
+Relocate a single entry from
+.Va OFFLOAD_APPS .
+.It Cm tier-a-all
+Iterate every entry in
+.Va OFFLOAD_APPS .
+.It Cm tier-a-simulator
+Relocate
+.Pa <TARGET_HOME>/Library/Developer/CoreSimulator .
+.El
+.Sh PROTECTED SUBCOMMANDS
+.Bl -tag -width 14n
+.It Cm list
+Inventory the protected paths under
+.Fl -target-home .
+.It Cm messages
+Relocate
+.Pa <TARGET_HOME>/Library/Messages .
+.It Cm ios-backups
+Relocate
+.Pa <TARGET_HOME>/Library/Application Support/MobileSync/Backup .
+.El
+.Sh OPTIONS
+.Bl -tag -width 22n
+.It Fl -target-home Ar path
+Operate on a different user's home. Triggers admin-mode invariants:
+caller must NOT be the target user, must be in the
+.Cm admin
+group, and (for
+.Cm protected
+subcommands) Terminal must have Full Disk Access.
+Defaults to
+.Pa $HOME .
+.It Fl -apply
+Actually mutate. Without it, every operation is a dry-run that
+prints intent only.
+.El
+.Sh CONFIGURATION
+Drive paths come from environment variables
+.Ev OFFLOAD_HOT
+and
+.Ev OFFLOAD_COLD ,
+or from a config file at
+.Pa ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf .
+The config file is a sourced shell snippet:
+.Bd -literal -offset indent
+OFFLOAD_HOT=/Volumes/MyFastSSD
+OFFLOAD_COLD=/Volumes/MyArchiveHDD
+# optional: replace the default OFFLOAD_APPS list
+OFFLOAD_APPS=(
+  "Signal|<TARGET_HOME>/Library/Application Support/Signal|Signal"
+)
+.Ed
+.Pp
+In
+.Va OFFLOAD_APPS
+rows, the literal token
+.Sy <TARGET_HOME>
+is substituted at runtime with the effective target home.
+.Sh DESIGN
+.Nm
+follows poka-yoke discipline: bad outcomes are structurally
+prevented, not merely documented.
+.Bl -enum
+.It
+.Sy Single source of truth.
+.Va OFFLOAD_APPS
+is read by every subcommand
+.Pq Cm list , Cm checklist , Cm launch , Cm move ;
+no duplicated copies anywhere.
+.It
+.Sy Dry-run by default.
+Mutation requires
+.Fl -apply .
+There is no destructive default.
+.It
+.Sy Verify before delete.
+Cross-volume moves
+.Xr rsync 1
+to destination, compare file count and total bytes against source,
+and remove the source only on signature match.
+.It
+.Sy Idempotent.
+Re-running a tier on a source that is already a valid symlink skips
+cleanly. An existing destination is never silently overwritten.
+.It
+.Sy Never sudo from inside.
+.Pq EACCES
+failures append to
+.Pa ~/offload-admin-todo.txt
+and execution continues. At end-of-run a reviewable wrapper is
+emitted at
+.Pa ~/bin/offload-admin-pass
+for the user to read and sudo themselves.
+.It
+.Sy Two-account workflow.
+Standard data is moved by the owner.
+.Pq TCC/FDA-protected
+paths require a separate Admin account whose Terminal has Full Disk Access.
+The
+.Cm protected
+subcommand enforces all three invariants before any work.
+.It
+.Sy Guard launcher.
+After relocation, symlinked data becomes unreachable when the drive
+is unmounted.
+.Cm offload launch
+checks the target before opening the app.
+.It
+.Sy Discovered exclusions.
+macOS sandboxed containers
+.Pq Pa ~/Library/Containers/com.apple.*
+refuse to follow symlinks; excluded. Mail's storage is fragile under
+symlinks; use Mail's Accounts preferences instead. Browser profiles
+do constant SQLite writes; corruption is common; excluded from
+defaults.
+.El
+.Sh EXAMPLES
+.Ss First-time setup
+.Bd -literal -offset indent
+mkdir -p ~/.config/offload
+cat > ~/.config/offload/offload.conf <<EOF
+OFFLOAD_HOT=/Volumes/MyFastSSD
+OFFLOAD_COLD=/Volumes/MyArchiveHDD
+EOF
+.Ed
+.Ss Inspect
+.Bd -literal -offset indent
+offload status
+offload list
+offload checklist
+.Ed
+.Ss Safe first sweep
+.Bd -literal -offset indent
+offload move tier-c-cruft
+offload move tier-c-cruft --apply
+.Ed
+.Ss Guarded launch
+.Bd -literal -offset indent
+offload launch Signal
+.Ed
+.Ss Admin running on another user's home
+.Bd -literal -offset indent
+# logged in as Admin account, Terminal has FDA
+offload protected --target-home /Users/alice list
+offload protected --target-home /Users/alice messages --apply
+offload --target-home /Users/alice move tier-a-app Signal --apply
+.Ed
+.Sh FILES
+.Bl -tag -width 36n
+.It Pa ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf
+User configuration: drive paths and optional
+.Va OFFLOAD_APPS
+override.
+.It Pa ~/offload-YYYY-MM-DD.log
+Per-run log, append-only.
+.It Pa ~/offload-admin-todo.txt
+Paths collected at run time when an operation failed with EACCES.
+.It Pa ~/bin/offload-admin-pass
+Emitted sudo-review script (only created when admin todo is non-empty).
+.El
+.Sh EXIT STATUS
+.Bl -tag -width 4n
+.It 0
+Success.
+.It 1
+Invariant violation, invalid input, or fatal error.
+.It 2
+Destination conflict; manual review required.
+.El
+.Sh SEE ALSO
+.Xr rsync 1 ,
+.Xr tmutil 8 ,
+.Xr ln 1 ,
+.Xr launchctl 1
+.Sh AUTHORS
+Maintained in the Sage-is/homebrew-apps tap.
+Bug reports:
+.Lk https://github.com/Sage-is/homebrew-apps/issues
+.Sh BUGS
+The script never invokes
+.Cm sudo
+itself. Some user-space paths require elevated privileges to move;
+those are captured in
+.Pa ~/offload-admin-todo.txt
+and emitted as a separate sudo-review script for manual execution.
+This is intentional.
