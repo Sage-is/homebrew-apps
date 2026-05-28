@@ -39,11 +39,19 @@ Print the embedded long-form documentation
 Print the script version.
 .It Cm status
 Disk space, summary of all targets, recent log entries, admin todo.
-.It Cm list
+.It Cm list Op Fl -all-users
 Every entry in
 .Va OFFLOAD_TARGETS
-with its category, strategy, admin requirement, and current state
-.Pq on-disk , symlinked , archived , merged , absent .
+with its category, strategy, admin requirement, the bytes that would
+be reclaimed by offloading it, and current state
+.Pq on-disk , symlinked , archived , merged , absent , unreadable .
+A potential-reclaim total is printed at the end. With
+.Fl -all-users
+.Pq list only ,
+iterates every real macOS user account
+.Pq UID >= 500, non-underscore-prefixed
+and prints a section per user plus a grand total. Useful for the
+Admin account auditing which homes still have movable data.
 .It Cm checklist
 Generated progress checklist, live from OFFLOAD_TARGETS. Includes
 exact commands to advance each entry.
@@ -122,12 +130,24 @@ Categories:
 .Sh OPTIONS
 .Bl -tag -width 22n
 .It Fl -target-home Ar path
-Operate on a different user's home. Triggers admin-mode invariants:
+Operate on a different user's home. Triggers admin-mode invariants
+for
+.Cm move
+and
+.Cm protected :
 caller must NOT be the target user, must be in the
 .Cm admin
 group, and (for protected targets) Terminal must have Full Disk Access.
+.Cm list
+honors
+.Fl -target-home
+without admin gating (read-only).
 Defaults to
 .Pa $HOME .
+.It Fl -all-users
+.Cm list
+only. Iterate every real macOS user account and emit per-user
+sections plus a grand-total potential reclaim.
 .It Fl -apply
 Actually mutate. Without it, every operation is a dry-run that
 prints intent only.

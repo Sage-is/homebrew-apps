@@ -65,10 +65,16 @@
 # OPTIONS
 #   --target-home <path>   work on a different user's home (Admin mode).
 #                          Defaults to $HOME. When set to a different user's
-#                          home, admin-mode invariants apply: caller must
-#                          NOT be the target user, must be in the admin
-#                          group, and (for protected targets) the Terminal
-#                          must have Full Disk Access.
+#                          home, admin-mode invariants apply for move/protected:
+#                          caller must NOT be the target user, must be in the
+#                          admin group, and (for protected targets) the
+#                          Terminal must have Full Disk Access. `list` honors
+#                          --target-home without admin gating (read-only).
+#   --all-users            (list only) iterate every real macOS user account
+#                          (UID >= 500, non-underscore-prefixed) and show
+#                          each user's offload state plus a grand-total
+#                          reclaim. Useful for the Admin account auditing
+#                          which homes still have movable data.
 #   --apply                actually mutate. Without it, every move is a
 #                          dry-run that prints intent only.
 #
@@ -189,7 +195,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 # ----------------------------------------------------------------------------
 # Defaults
@@ -273,10 +279,14 @@ fi
 # Runtime state.
 TARGET_HOME="$HOME"
 DRY=1
+LIST_ALL_USERS=0
 DATE_TAG="$(date +%Y-%m-%d)"
 LOG="$HOME/offload-$DATE_TAG.log"
 ADMIN_TODO="$HOME/offload-admin-todo.txt"
 ADMIN_PASS="$HOME/bin/offload-admin-pass"
+
+# Set by cmd_list_one for the --all-users caller to grand-total.
+LAST_TOTAL_BYTES=0
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -514,7 +524,65 @@ move_one() {
 # Per-row state assessment
 # ----------------------------------------------------------------------------
 
-row_state() {
+# Bytes that would be reclaimed by offloading this row.
+# 0 if the row is already done (symlinked/archived/merged) or absent.
+# Subshell + set +o pipefail so EACCES on another user's home returns 0
+# instead of crashing the script.
+row_bytes() (
+  set +o pipefail
+  local src="$1" dest="$2" strat="$3"
+  case "$strat" in
+    symlink|native-ui)
+      # On-disk and not yet a symlink -> reclaim = size of source
+      if [[ -d "$src" && ! -L "$src" ]]; then
+        du -sk "$src" 2>/dev/null | awk '{print $1*1024}'
+      else
+        echo 0
+      fi
+      ;;
+    archive)
+      # Source still has content -> reclaim = its size
+      if [[ -d "$src" ]] && [[ -n "$(ls -A "$src" 2>/dev/null)" ]]; then
+        du -sk "$src" 2>/dev/null | awk '{print $1*1024}'
+      else
+        echo 0
+      fi
+      ;;
+    merge)
+      if [[ -d "$src" ]]; then
+        du -sk "$src" 2>/dev/null | awk '{print $1*1024}'
+      else
+        echo 0
+      fi
+      ;;
+    sweep)
+      # Sum sizes of matching subdirs.
+      [[ -d "$src" ]] || { echo 0; return; }
+      local find_args=("-type" "d" "(")
+      local first=1
+      for n in "${SWEEP_DIRNAMES[@]}"; do
+        [[ $first -eq 0 ]] && find_args+=("-o")
+        find_args+=("-name" "$n")
+        first=0
+      done
+      find_args+=(")" "-prune")
+      find "$src" "${find_args[@]}" 2>/dev/null \
+        | xargs -I{} du -sk "{}" 2>/dev/null \
+        | awk '{sum += $1} END {print sum*1024+0}'
+      ;;
+    *) echo 0 ;;
+  esac
+)
+
+# Real macOS users (UID >= 500, < 10000, non-underscore-prefixed).
+list_real_users() {
+  dscl . -list /Users UniqueID 2>/dev/null \
+    | awk '$2 >= 500 && $2 < 10000 {print $1}' \
+    | grep -v '^_'
+}
+
+row_state() (
+  set +o pipefail
   local src="$1" dest="$2" strat="$3"
   case "$strat" in
     symlink)
@@ -523,26 +591,35 @@ row_state() {
         if [[ -d "$tgt" ]]; then echo "symlinked"
         else                    echo "broken-symlink"
         fi
-      elif [[ -d "$src" ]]; then
+      elif [[ -d "$src" && -r "$src" && -x "$src" ]]; then
         echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
+      elif [[ -d "$src" ]]; then
+        echo "unreadable"
       else
         echo "absent"
       fi
       ;;
     archive)
-      if [[ -d "$src" ]] && [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then
-        echo "archived (source empty)"
-      elif [[ -d "$src" ]]; then
-        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
-      else
+      if [[ ! -d "$src" ]]; then
         echo "absent"
+      elif [[ ! -r "$src" || ! -x "$src" ]]; then
+        echo "unreadable"
+      elif [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then
+        echo "empty (likely already archived)"
+      else
+        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
       fi
       ;;
     merge)
-      if [[ -d "$src" ]]; then
+      # Dest is intentionally shared across users for merge (single
+      # canonical Clones repo). Only report "merged" when the
+      # caller's own source is gone AND the caller actually owns
+      # data merged in. Without a per-user marker we keep this
+      # conservative: source missing => absent.
+      if [[ -d "$src" ]] && [[ -r "$src" && -x "$src" ]]; then
         echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
-      elif [[ -d "$dest" ]]; then
-        echo "merged"
+      elif [[ -d "$src" ]]; then
+        echo "unreadable"
       else
         echo "absent"
       fi
@@ -571,22 +648,54 @@ row_state() {
       ;;
     *) echo "unknown" ;;
   esac
-}
+)
 
 # ----------------------------------------------------------------------------
 # Subcommand: list
 # ----------------------------------------------------------------------------
 
-cmd_list() {
-  printf '%-16s %-10s %-9s %-7s %s\n' LABEL CATEGORY STRATEGY ADMIN STATE
-  printf '%-16s %-10s %-9s %-7s %s\n' ---- -------- -------- ----- -----
-  local prev_cat=""
+cmd_list_one() {
+  printf '%-16s %-10s %-9s %-7s %-10s %s\n' LABEL CATEGORY STRATEGY ADMIN RECLAIM STATE
+  printf '%-16s %-10s %-9s %-7s %-10s %s\n' ---- -------- -------- ----- ------- -----
+  local prev_cat="" total=0
   while IFS='|' read -r label cat src dest strat adm bundle; do
     if [[ "$cat" != "$prev_cat" && -n "$prev_cat" ]]; then echo ""; fi
     prev_cat="$cat"
-    local state; state="$(row_state "$src" "$dest" "$strat")"
-    printf '%-16s %-10s %-9s %-7s %s\n' "$label" "$cat" "$strat" "$adm" "$state"
+    local state bytes
+    state="$(row_state "$src" "$dest" "$strat")"
+    bytes="$(row_bytes "$src" "$dest" "$strat")"
+    total=$((total + bytes))
+    local rec="-"
+    (( bytes > 0 )) && rec="$(human $bytes)"
+    printf '%-16s %-10s %-9s %-7s %-10s %s\n' "$label" "$cat" "$strat" "$adm" "$rec" "$state"
   done < <(iter_targets)
+  echo ""
+  printf 'Potential reclaim from offloading remaining items: %s\n' "$(human $total)"
+  LAST_TOTAL_BYTES=$total
+}
+
+cmd_list() {
+  if [[ "$LIST_ALL_USERS" -eq 1 ]]; then
+    local grand=0
+    local users; users="$(list_real_users)"
+    [[ -n "$users" ]] || die "no real users found (dscl returned nothing)"
+    for u in $users; do
+      local uh="/Users/$u"
+      [[ -d "$uh" ]] || continue
+      TARGET_HOME="$uh"
+      echo "════════════════════════════════════════════════════════"
+      echo "  /Users/$u   (TARGET_HOME=$TARGET_HOME)"
+      echo "════════════════════════════════════════════════════════"
+      cmd_list_one
+      grand=$((grand + LAST_TOTAL_BYTES))
+      echo
+    done
+    echo "═══════════════════════════════════════════════════════════"
+    printf 'GRAND TOTAL potential reclaim across all users: %s\n' "$(human $grand)"
+    echo "═══════════════════════════════════════════════════════════"
+  else
+    cmd_list_one
+  fi
 }
 
 # ----------------------------------------------------------------------------
@@ -826,6 +935,7 @@ main() {
   while (( $# > 0 )); do
     case "$1" in
       --target-home) TARGET_HOME="$2"; shift 2 ;;
+      --all-users)   LIST_ALL_USERS=1; shift ;;
       *)             args+=("$1"); shift ;;
     esac
   done

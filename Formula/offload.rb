@@ -1,9 +1,9 @@
 class Offload < Formula
   desc "Poka-yoke disk-offload tool for macOS — symlink user data to externals safely"
   homepage "https://github.com/Sage-is/homebrew-apps"
-  url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/offload-v0.2.0.tar.gz"
-  version "0.2.0"
-  sha256 "c61a3257129c7429224c3c49faebeca3cd168fd124c929d0edce31f8595a4e75"
+  url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/offload-v0.2.1.tar.gz"
+  version "0.2.1"
+  sha256 "REPLACE_AFTER_TAG"
   license "MIT"
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
