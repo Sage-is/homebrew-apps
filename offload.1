@@ -64,11 +64,15 @@ Offload one entry by label, or every entry in a category. Categories:
 Default is dry-run; supply
 .Fl -apply
 to mutate.
-.It Cm media-libraries
-Print native-UI relocation steps for Photos, Music.app, iMovie, and
-Final Cut. We never auto-move these because they cache library paths
-internally and the apps' own "Choose Library" UIs handle the
-transition cleanly.
+.It Cm relocations Pq alias: Cm media-libraries
+Print native-UI relocation steps for everything in
+.Va OFFLOAD_TARGETS
+with strategy
+.Cm native-ui :
+Docker disk image, Photos Library, Music.app library, iMovie / Final
+Cut libraries. We never auto-move these because the apps cache
+absolute paths internally and the native UIs handle the transition
+cleanly. Docker is typically the biggest single win.
 .It Cm protected Ar Label Op Fl -apply
 Move a target flagged
 .Va admin?=yes .

@@ -29,8 +29,9 @@
 #   launch <App>        guarded launch (refuses if symlink target unmounted)
 #   move <Label> [--apply]                       offload one entry by label
 #   move <category> [--apply]                    offload every entry in a category
-#   media-libraries                              print native-UI relocation steps
-#                                                for Photos / Music.app / iMovie
+#   relocations (alias: media-libraries)         print native-UI relocation
+#                                                steps — Docker, Photos,
+#                                                Music.app, iMovie
 #   protected <Label> [--apply]                  alias for `move <Label>` that
 #                                                requires --target-home + FDA
 #
@@ -60,7 +61,7 @@
 #                   media libraries (Photos, Music.app, iMovie) because
 #                   those apps have safer native "Choose Library" UIs
 #
-#   Categories: app | home | cold | merge | dev | sweep | protected | media-lib
+#   Categories: app | home | cold | merge | dev | sweep | protected | vm | media-lib
 #
 # OPTIONS
 #   --target-home <path>   work on a different user's home (Admin mode).
@@ -200,7 +201,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.2"
+VERSION="0.3.0"
 
 # ----------------------------------------------------------------------------
 # Defaults
@@ -245,6 +246,9 @@ DEFAULT_OFFLOAD_TARGETS=(
   # --- Protected (Admin account + FDA on Terminal) -----------------------
   "Messages|protected|<TH>/Library/Messages|HOT/MovedProtected/<U>/Messages|symlink|yes|-"
   "iOS-Backups|protected|<TH>/Library/Application Support/MobileSync/Backup|HOT/MovedProtected/<U>/iOS-Backups|symlink|yes|-"
+
+  # --- VM disk image (Docker Desktop manages relocation in its own UI) ---
+  "Docker|vm|<TH>/Library/Containers/com.docker.docker|HOT/Docker|native-ui|no|-"
 
   # --- Media libraries (native UI; tool never auto-moves these) ----------
   "Photos-Library|media-lib|<TH>/Pictures/Photos Library.photoslibrary|HOT/Photos Library.photoslibrary|native-ui|no|-"
@@ -822,15 +826,26 @@ FOOTER
 # Subcommand: media-libraries
 # ----------------------------------------------------------------------------
 
-cmd_media_libraries() {
+cmd_relocations() {
   cat <<EOS
-=== Native-UI media library relocation ===
-Apple's Photos, Music, iMovie, and Final Cut have their own
-"Choose Library" UIs that handle relocation correctly. Use these
-instead of symlinking, because the apps cache library paths
-internally and symlinks can desync.
+=== Native-UI relocations (the script never auto-moves these) ===
+Some apps cache the absolute path to their data internally. A
+symlink works most of the time, but the native UIs handle the
+transition cleanly including index rebuilds and metadata fixups.
+Use these for: Docker, Photos, Music, iMovie, Final Cut.
 
 Suggested destinations (HOT drive: ${OFFLOAD_HOT:-<not configured>}):
+
+Docker disk image (typically the biggest single win)
+  1. Quit any running containers.
+  2. Docker Desktop > Settings > Resources > Advanced > Disk image location.
+  3. Change to ${OFFLOAD_HOT:-<HOT>}/Docker/
+  4. Apply & Restart. Docker copies the image to the new location
+     and keeps the old until you confirm.
+  5. After it boots cleanly: 'docker ps' should work and
+     'docker run --rm hello-world' should succeed.
+  6. The original ~/Library/Containers/com.docker.docker can then be
+     deleted from Docker's UI prompt (or manually after verification).
 
 Photos Library
   1. Quit Photos.
@@ -852,13 +867,11 @@ iMovie / Final Cut Pro Library
   2. Move ~/Movies/iMovie\ Library.imovielibrary to ${OFFLOAD_HOT:-<HOT>}/
   3. Double-click the moved .imovielibrary bundle to relaunch from new location.
   4. (Final Cut: File > Open Library… > select the moved .fcpbundle.)
-
-Why we don't auto-move these:
-  These apps cache library paths in their preferences. A symlink works
-  most of the time but is unsupported, and the native UIs handle the
-  transition cleanly including index rebuilds and metadata fixups.
 EOS
 }
+
+# Backward compatibility — 'media-libraries' was the v0.2.x name.
+cmd_media_libraries() { cmd_relocations; }
 
 # ----------------------------------------------------------------------------
 # Reporting
@@ -960,7 +973,7 @@ main() {
     status)                    cmd_status ;;
     list)                      cmd_list ;;
     checklist)                 cmd_checklist ;;
-    media-libraries|media)     cmd_media_libraries ;;
+    relocations|media-libraries|media) cmd_relocations ;;
     launch)                    cmd_launch "$@" ;;
     move)                      cmd_move "$@" ;;
     protected)                 cmd_protected "$@" ;;
