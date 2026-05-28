@@ -205,7 +205,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 # ----------------------------------------------------------------------------
 # Defaults
@@ -234,6 +234,22 @@ DEFAULT_OFFLOAD_TARGETS=(
   # --- Home subdirectories (move contents, leave $HOME pointer alone) ----
   "Movies|home|<TH>/Movies|HOT/MovedHome/<U>/Movies|symlink|no|-"
   "Music|home|<TH>/Music|HOT/MovedHome/<U>/Music|symlink|no|-"
+  "Pictures|home|<TH>/Pictures|HOT/MovedHome/<U>/Pictures|symlink|no|-"
+  "Desktop|home|<TH>/Desktop|HOT/MovedHome/<U>/Desktop|symlink|no|-"
+
+  # --- Hidden home dirs (toolchains and editor data; rebuilds if drive
+  # --- gone). All symlink strategy; safe-mount story: tools fail to
+  # --- launch cleanly when the dock is unplugged, no data loss. ----------
+  "LocalShare|home|<TH>/.local|HOT/MovedHome/<U>/.local|symlink|no|-"
+  "Bun|home|<TH>/.bun|HOT/MovedHome/<U>/.bun|symlink|no|-"
+  "Pyenv|home|<TH>/.pyenv|HOT/MovedHome/<U>/.pyenv|symlink|no|-"
+  "VSCodeUser|home|<TH>/.vscode|HOT/MovedHome/<U>/.vscode|symlink|no|-"
+  "VSCodeInsidersUser|home|<TH>/.vscode-insiders|HOT/MovedHome/<U>/.vscode-insiders|symlink|no|-"
+  "CursorUser|home|<TH>/.cursor|HOT/MovedHome/<U>/.cursor|symlink|no|-"
+
+  # --- Spitfire Audio sound libraries (often gigabytes; if the user has
+  # --- Spitfire installed). Harmless absent for everyone else. -----------
+  "Spitfire|home|<TH>/Spitfire|HOT/MovedHome/<U>/Spitfire|symlink|no|-"
 
   # --- Cold archive (no symlink — fresh empty source) --------------------
   "Downloads|cold|<TH>/Downloads|COLD/Archive/Downloads-<U>-<DATE>|archive|no|-"
