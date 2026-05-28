@@ -74,7 +74,12 @@
 #                          (UID >= 500, non-underscore-prefixed) and show
 #                          each user's offload state plus a grand-total
 #                          reclaim. Useful for the Admin account auditing
-#                          which homes still have movable data.
+#                          which homes still have movable data. To see
+#                          actual sizes for other users (not "unreadable"),
+#                          run under sudo:
+#                            sudo offload list --all-users
+#                          List is read-only; running it under sudo does
+#                          not violate the "never sudo from inside" rule.
 #   --apply                actually mutate. Without it, every move is a
 #                          dry-run that prints intent only.
 #
@@ -195,7 +200,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 
 # ----------------------------------------------------------------------------
 # Defaults
@@ -657,7 +662,7 @@ row_state() (
 cmd_list_one() {
   printf '%-16s %-10s %-9s %-7s %-10s %s\n' LABEL CATEGORY STRATEGY ADMIN RECLAIM STATE
   printf '%-16s %-10s %-9s %-7s %-10s %s\n' ---- -------- -------- ----- ------- -----
-  local prev_cat="" total=0
+  local prev_cat="" total=0 unreadable=0
   while IFS='|' read -r label cat src dest strat adm bundle; do
     if [[ "$cat" != "$prev_cat" && -n "$prev_cat" ]]; then echo ""; fi
     prev_cat="$cat"
@@ -665,12 +670,19 @@ cmd_list_one() {
     state="$(row_state "$src" "$dest" "$strat")"
     bytes="$(row_bytes "$src" "$dest" "$strat")"
     total=$((total + bytes))
+    case "$state" in unreadable*) unreadable=$((unreadable + 1)) ;; esac
     local rec="-"
     (( bytes > 0 )) && rec="$(human $bytes)"
     printf '%-16s %-10s %-9s %-7s %-10s %s\n' "$label" "$cat" "$strat" "$adm" "$rec" "$state"
   done < <(iter_targets)
   echo ""
   printf 'Potential reclaim from offloading remaining items: %s\n' "$(human $total)"
+  if (( unreadable > 0 )) && [[ "$TARGET_HOME" != "$HOME" ]]; then
+    echo ""
+    echo "Note: $unreadable row(s) marked 'unreadable' — POSIX permissions block"
+    echo "      this account from reading $TARGET_HOME. For a full audit:"
+    echo "        sudo offload --target-home $TARGET_HOME list"
+  fi
   LAST_TOTAL_BYTES=$total
 }
 
