@@ -3,7 +3,7 @@ class Offload < Formula
   homepage "https://github.com/Sage-is/homebrew-apps"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/offload-v0.1.0.tar.gz"
   version "0.1.0"
-  sha256 "REPLACE_AFTER_TAG"
+  sha256 "9305c969bc57fb66db3a22ab4881390a6a97ee546b5b0080506e42c63f175fbb"
   license "MIT"
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
