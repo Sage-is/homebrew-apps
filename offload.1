@@ -13,22 +13,23 @@
 .Op Fl -apply
 .Sh DESCRIPTION
 .Nm
-moves heavy, low-velocity user data out of
+moves heavy, low-velocity data out of
 .Pa $HOME
-onto an external drive, replacing each source path with a symlink.
-A guard launcher refuses to start an app whose data lives on an unmounted
-volume.
-The tool is mistake-proof by design: dry-run is the default, signature
+onto an external drive. The home folder itself stays internal — we
+move the
+.Em contents
+of specific paths inside
+.Pa $HOME
+and replace each with a symlink, or for archive targets leave a fresh
+empty directory. This is the supported pattern: iCloud, FileVault,
+login, and macOS updates remain untouched.
+.Pp
+A guard launcher refuses to start an app whose data lives on an
+unmounted volume.
+.Nm
+is mistake-proof by design: dry-run is the default, signature
 verification precedes every destructive step, and all operations are
 idempotent.
-.Pp
-The
-.Cm protected
-subcommand operates on TCC/FDA-protected paths
-.Pq Path Pa Library/Messages , Path Pa Library/Application Support/MobileSync
-and must be invoked from a
-.Em separate
-macOS Admin account whose Terminal has been granted Full Disk Access.
 .Sh SUBCOMMANDS
 .Bl -tag -width 18n
 .It Cm help
@@ -37,81 +38,94 @@ Print the embedded long-form documentation
 .It Cm version
 Print the script version.
 .It Cm status
-Disk space, recent log entries, and any pending admin todo.
+Disk space, summary of all targets, recent log entries, admin todo.
 .It Cm list
-.Va OFFLOAD_APPS
-entries and the current state of each
-.Pq Pa on-disk , symlinked , absent .
+Every entry in
+.Va OFFLOAD_TARGETS
+with its category, strategy, admin requirement, and current state
+.Pq on-disk , symlinked , archived , merged , absent .
 .It Cm checklist
-Generate a progress checklist that reflects current state.
+Generated progress checklist, live from OFFLOAD_TARGETS. Includes
+exact commands to advance each entry.
 .It Cm launch Ar BundleName
 Guarded launch. Refuses with a macOS dialog if the app's symlinked
 data directory points to an unmounted volume.
-.It Cm move Ar target Op Fl -apply
-Execute a move tier.
+.It Cm move Ar Label-or-category Op Fl -apply
+Offload one entry by label, or every entry in a category. Categories:
+.Cm app , home , cold , merge , dev , sweep , protected , media-lib .
 Default is dry-run; supply
 .Fl -apply
-to actually mutate.
-.It Cm protected Ar subcmd Op Fl -apply
-Admin-mode subcommand. Requires
+to mutate.
+.It Cm media-libraries
+Print native-UI relocation steps for Photos, Music.app, iMovie, and
+Final Cut. We never auto-move these because they cache library paths
+internally and the apps' own "Choose Library" UIs handle the
+transition cleanly.
+.It Cm protected Ar Label Op Fl -apply
+Move a target flagged
+.Va admin?=yes .
+Requires
 .Fl -target-home
-pointing at a different user's home, an admin-group caller, and
-Terminal-granted FDA.
+pointing at a different user's home, admin-group caller, and FDA.
 .El
-.Sh MOVE TARGETS
-.Bl -tag -width 22n
-.It Cm tier-c-cruft
-Sweep
-.Va node_modules , .venv , venv , target , build , dist , __pycache__ , .next
-under
-.Pa <TARGET_HOME>/Documents/Projects/GitHub .
-.It Cm tier-b-downloads
-Sort
-.Pa <TARGET_HOME>/Downloads :
-ROM zips matching common Nintendo/Sega names go to
-.Pa $OFFLOAD_HOT/ROMs ;
-everything else is archived to
-.Pa $OFFLOAD_COLD/Archive/Downloads-<user>-<date>/ .
-.It Cm tier-b-clones
-.Xr rsync 1
-with
-.Fl -update
-.Pq newer-mtime-wins
-from
-.Pa <TARGET_HOME>/Documents/Projects/Clones
-into
-.Pa $OFFLOAD_HOT/Clones .
-.It Cm tier-a-app Ar Label
-Relocate a single entry from
-.Va OFFLOAD_APPS .
-.It Cm tier-a-all
-Iterate every entry in
-.Va OFFLOAD_APPS .
-.It Cm tier-a-simulator
-Relocate
-.Pa <TARGET_HOME>/Library/Developer/CoreSimulator .
+.Sh DATA MODEL
+Every relocatable thing is a row in
+.Va OFFLOAD_TARGETS .
+Every subcommand reads from this list; there is no parallel
+hardcoded knowledge. Schema is pipe-delimited:
+.Bd -literal -offset indent
+label | category | source | dest | strategy | admin? | bundle
+.Ed
+.Pp
+Tokens expanded at runtime:
+.Bl -tag -width 12n
+.It Sy <TH>
+.Pa $TARGET_HOME
+.Pq current user's $HOME by default .
+.It Sy <U>
+basename of
+.Pa $TARGET_HOME .
+.It Sy <DATE>
+YYYY-MM-DD.
+.It Sy HOT/
+Prefix —
+.Ev $OFFLOAD_HOT/ .
+.It Sy COLD/
+Prefix —
+.Ev $OFFLOAD_COLD/ .
 .El
-.Sh PROTECTED SUBCOMMANDS
+.Pp
+Strategies:
 .Bl -tag -width 14n
-.It Cm list
-Inventory the protected paths under
-.Fl -target-home .
-.It Cm messages
-Relocate
-.Pa <TARGET_HOME>/Library/Messages .
-.It Cm ios-backups
-Relocate
-.Pa <TARGET_HOME>/Library/Application Support/MobileSync/Backup .
+.It Cm symlink
+rsync to dest, verify file count and bytes, rm source, ln -s dest source.
+.It Cm archive
+rsync to dest, rm source, recreate empty source. No symlink — fresh
+empty target for new arrivals
+.Pq Pa ~/Downloads .
+.It Cm merge
+rsync
+.Fl -update
+into existing dest, rm source. Dest is authoritative; source is gone.
+.It Cm sweep
+.Xr find 1
+subdirs matching internal patterns
+.Pq node_modules , .venv , target , build , dist , __pycache__ , .next
+and delete. No destination; data is rebuildable from source.
+.It Cm native-ui
+Printed instructions only. The tool never auto-mutates media
+libraries.
 .El
+.Pp
+Categories:
+.Cm app , home , cold , merge , dev , sweep , protected , media-lib .
 .Sh OPTIONS
 .Bl -tag -width 22n
 .It Fl -target-home Ar path
 Operate on a different user's home. Triggers admin-mode invariants:
 caller must NOT be the target user, must be in the
 .Cm admin
-group, and (for
-.Cm protected
-subcommands) Terminal must have Full Disk Access.
+group, and (for protected targets) Terminal must have Full Disk Access.
 Defaults to
 .Pa $HOME .
 .It Fl -apply
@@ -129,17 +143,17 @@ The config file is a sourced shell snippet:
 .Bd -literal -offset indent
 OFFLOAD_HOT=/Volumes/MyFastSSD
 OFFLOAD_COLD=/Volumes/MyArchiveHDD
-# optional: replace the default OFFLOAD_APPS list
-OFFLOAD_APPS=(
-  "Signal|<TARGET_HOME>/Library/Application Support/Signal|Signal"
+# optional: extend or replace OFFLOAD_TARGETS
+OFFLOAD_TARGETS+=(
+  "MyCustom|app|<TH>/Library/Application Support/Custom|HOT/MovedAppData/<U>/Custom|symlink|no|MyCustom"
 )
 .Ed
 .Pp
-In
+For backward compatibility with v0.1.x, configs that still declare
 .Va OFFLOAD_APPS
-rows, the literal token
-.Sy <TARGET_HOME>
-is substituted at runtime with the effective target home.
+get auto-converted into
+.Va OFFLOAD_TARGETS
+rows for any labels not already present.
 .Sh DESIGN
 .Nm
 follows poka-yoke discipline: bad outcomes are structurally
@@ -147,56 +161,60 @@ prevented, not merely documented.
 .Bl -enum
 .It
 .Sy Single source of truth.
-.Va OFFLOAD_APPS
-is read by every subcommand
-.Pq Cm list , Cm checklist , Cm launch , Cm move ;
-no duplicated copies anywhere.
+.Va OFFLOAD_TARGETS
+is read by every subcommand. No duplicated copies.
 .It
 .Sy Dry-run by default.
 Mutation requires
 .Fl -apply .
-There is no destructive default.
 .It
 .Sy Verify before delete.
-Cross-volume moves
-.Xr rsync 1
-to destination, compare file count and total bytes against source,
-and remove the source only on signature match.
+Cross-volume moves rsync to destination, compare file count + total
+bytes, remove source only on signature match.
 .It
 .Sy Idempotent.
-Re-running a tier on a source that is already a valid symlink skips
-cleanly. An existing destination is never silently overwritten.
+Re-running on an already-symlinked source skips. Existing
+destinations are never silently overwritten.
 .It
 .Sy Never sudo from inside.
-.Pq EACCES
-failures append to
+EACCES paths append to
 .Pa ~/offload-admin-todo.txt
-and execution continues. At end-of-run a reviewable wrapper is
-emitted at
-.Pa ~/bin/offload-admin-pass
-for the user to read and sudo themselves.
+and a reviewable wrapper is emitted at
+.Pa ~/bin/offload-admin-pass .
 .It
 .Sy Two-account workflow.
-Standard data is moved by the owner.
-.Pq TCC/FDA-protected
-paths require a separate Admin account whose Terminal has Full Disk Access.
-The
-.Cm protected
-subcommand enforces all three invariants before any work.
+Targets flagged
+.Va admin?=yes
+require a separate Admin account whose Terminal has Full Disk Access.
 .It
 .Sy Guard launcher.
-After relocation, symlinked data becomes unreachable when the drive
-is unmounted.
 .Cm offload launch
-checks the target before opening the app.
+checks the symlink target before opening the app.
+.El
+.Ss DOES NOT
+.Bl -bullet
 .It
-.Sy Discovered exclusions.
-macOS sandboxed containers
-.Pq Pa ~/Library/Containers/com.apple.*
-refuse to follow symlinks; excluded. Mail's storage is fragile under
-symlinks; use Mail's Accounts preferences instead. Browser profiles
-do constant SQLite writes; corruption is common; excluded from
-defaults.
+Relocate
+.Pa $HOME
+via
+.Cm dscl . -change NFSHomeDirectory .
+That breaks iCloud Drive, confuses FileVault, and has been broken by
+multiple macOS updates. We move
+.Em contents ,
+not the pointer.
+.It
+Symlink Apple sandbox containers
+.Pq Pa ~/Library/Containers/com.apple.* .
+The sandbox refuses to follow.
+.It
+Symlink browser profiles
+.Pq Sy Chrome , Firefox , Brave , Zen .
+Constant SQLite writes cause corruption.
+.It
+Auto-move media libraries (Photos / Music / iMovie / Final Cut).
+Use
+.Cm offload media-libraries
+for the native-UI steps.
 .El
 .Sh EXAMPLES
 .Ss First-time setup
@@ -207,7 +225,7 @@ OFFLOAD_HOT=/Volumes/MyFastSSD
 OFFLOAD_COLD=/Volumes/MyArchiveHDD
 EOF
 .Ed
-.Ss Inspect
+.Ss Inspect everything
 .Bd -literal -offset indent
 offload status
 offload list
@@ -215,26 +233,35 @@ offload checklist
 .Ed
 .Ss Safe first sweep
 .Bd -literal -offset indent
-offload move tier-c-cruft
-offload move tier-c-cruft --apply
+offload move BuildCruft
+offload move BuildCruft --apply
+.Ed
+.Ss Move one app or an entire category
+.Bd -literal -offset indent
+offload move Signal --apply
+offload move app    --apply
+offload move home   --apply
 .Ed
 .Ss Guarded launch
 .Bd -literal -offset indent
 offload launch Signal
 .Ed
+.Ss Media libraries (native UI; not scripted)
+.Bd -literal -offset indent
+offload media-libraries
+.Ed
 .Ss Admin running on another user's home
 .Bd -literal -offset indent
 # logged in as Admin account, Terminal has FDA
-offload protected --target-home /Users/alice list
-offload protected --target-home /Users/alice messages --apply
-offload --target-home /Users/alice move tier-a-app Signal --apply
+offload protected --target-home /Users/alice Messages --apply
+offload --target-home /Users/alice move Signal --apply
 .Ed
 .Sh FILES
 .Bl -tag -width 36n
 .It Pa ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf
-User configuration: drive paths and optional
-.Va OFFLOAD_APPS
-override.
+User configuration: drive paths and
+.Va OFFLOAD_TARGETS
+overrides/extensions.
 .It Pa ~/offload-YYYY-MM-DD.log
 Per-run log, append-only.
 .It Pa ~/offload-admin-todo.txt

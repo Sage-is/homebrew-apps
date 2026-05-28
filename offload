@@ -9,133 +9,171 @@
 #
 # DESCRIPTION
 #   offload moves heavy, low-velocity data out of $HOME onto an
-#   external drive, replacing the source path with a symlink. A
-#   guard launcher refuses to start an app whose data lives on an
-#   unmounted volume. The tool is mistake-proof by design: dry-run
-#   is the default, signature verification precedes every
-#   destructive step, and all operations are idempotent.
+#   external drive. The home folder itself stays internal — we move
+#   the *contents* of specific paths inside $HOME and replace each
+#   with a symlink (or, for archive targets, leave a fresh empty
+#   directory). This is the supported pattern: iCloud, FileVault,
+#   login, and macOS updates remain untouched.
+#
+#   A guard launcher refuses to start an app whose data lives on an
+#   unmounted volume. Dry-run is the default; --apply must be
+#   explicit. Cross-volume moves verify (file count + bytes) before
+#   deleting source. Re-running is idempotent.
 #
 # SUBCOMMANDS
-#   help            print this text (the script header is the source of truth)
-#   status          disk free + symlink state + recent log
-#   list            OFFLOAD_APPS entries and their current state
-#   checklist       generated progress checklist
-#   launch <App>    guarded launch (refuses if target unmounted)
-#   move <target> [args...] [--apply]
-#   protected <subcmd> [args...] [--apply]
+#   help                print this text (script header is single source of truth)
+#   version             print the script version
+#   status              disk free + recent log + admin todo
+#   list                every entry in OFFLOAD_TARGETS with its current state
+#   checklist           generated progress checklist (live from OFFLOAD_TARGETS)
+#   launch <App>        guarded launch (refuses if symlink target unmounted)
+#   move <Label> [--apply]                       offload one entry by label
+#   move <category> [--apply]                    offload every entry in a category
+#   media-libraries                              print native-UI relocation steps
+#                                                for Photos / Music.app / iMovie
+#   protected <Label> [--apply]                  alias for `move <Label>` that
+#                                                requires --target-home + FDA
 #
-# MOVE TARGETS
-#   tier-c-cruft         build cruft under <TARGET_HOME>/Documents/Projects/GitHub
-#   tier-b-downloads     <TARGET_HOME>/Downloads sort
-#   tier-b-clones        <TARGET_HOME>/Documents/Projects/Clones rsync-merge into HOT
-#   tier-a-app <Label>   one entry from OFFLOAD_APPS
-#   tier-a-all           every entry in OFFLOAD_APPS, in order
-#   tier-a-simulator     <TARGET_HOME>/Library/Developer/CoreSimulator
+# DATA MODEL — OFFLOAD_TARGETS
+#   Every relocatable thing is a row in OFFLOAD_TARGETS. Every
+#   subcommand reads from this list; there is no parallel hardcoded
+#   knowledge. Schema (pipe-delimited):
 #
-# PROTECTED SUBCOMMANDS (require running from an account that:
-#   (a) is NOT the target user, (b) is in the admin group,
-#   (c) has Full Disk Access granted to its Terminal)
-#   list           inventory protected paths under <TARGET_HOME>
-#   messages       move <TARGET_HOME>/Library/Messages
-#   ios-backups    move <TARGET_HOME>/Library/Application Support/MobileSync/Backup
+#     label | category | source | dest | strategy | admin? | bundle
+#
+#   Tokens expanded at runtime:
+#     <TH>    -> $TARGET_HOME       (current user's $HOME by default)
+#     <U>     -> $(basename "$TARGET_HOME")
+#     <DATE>  -> YYYY-MM-DD
+#     HOT/    -> $OFFLOAD_HOT/
+#     COLD/   -> $OFFLOAD_COLD/
+#
+#   Strategies:
+#     symlink     — rsync to dest, verify, rm source, ln -s dest source
+#     archive     — rsync to dest, rm source, recreate empty source dir
+#                   (no symlink; fresh empty target for new arrivals)
+#     merge       — rsync --update into existing dest, rm source
+#                   (dest is authoritative; source is gone)
+#     sweep       — find subdirs matching internal patterns and delete
+#                   (no destination; data is rebuildable from source code)
+#     native-ui   — printed instructions only; the tool never auto-mutates
+#                   media libraries (Photos, Music.app, iMovie) because
+#                   those apps have safer native "Choose Library" UIs
+#
+#   Categories: app | home | cold | merge | dev | sweep | protected | media-lib
 #
 # OPTIONS
-#   --target-home <path>   operate on a different user's home (Admin mode
-#                          invariants apply). Defaults to $HOME.
-#   --apply                actually mutate. Without it, every operation
-#                          is a dry-run that prints intent only.
+#   --target-home <path>   work on a different user's home (Admin mode).
+#                          Defaults to $HOME. When set to a different user's
+#                          home, admin-mode invariants apply: caller must
+#                          NOT be the target user, must be in the admin
+#                          group, and (for protected targets) the Terminal
+#                          must have Full Disk Access.
+#   --apply                actually mutate. Without it, every move is a
+#                          dry-run that prints intent only.
 #
 # CONFIGURATION
 #   Drive paths come from environment variables OFFLOAD_HOT and
 #   OFFLOAD_COLD, or from a config file at
-#   ${XDG_CONFIG_HOME:-$HOME/.config}/offload/offload.conf.
-#   The config file is a sourced shell snippet, e.g.:
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/offload/offload.conf .
+#   The config file is a sourced shell snippet:
 #
 #     OFFLOAD_HOT=/Volumes/MyFastSSD
 #     OFFLOAD_COLD=/Volumes/MyArchiveHDD
-#     # optional: replace the default OFFLOAD_APPS list
-#     OFFLOAD_APPS=(
-#       "Signal|<TARGET_HOME>/Library/Application Support/Signal|Signal"
+#     # optional: extend or replace OFFLOAD_TARGETS
+#     OFFLOAD_TARGETS+=(
+#       "MyCustomApp|app|<TH>/Library/Application Support/Custom|HOT/MovedAppData/<U>/Custom|symlink|no|MyCustomApp"
 #     )
 #
-#   In OFFLOAD_APPS rows, the literal token <TARGET_HOME> is
-#   substituted at runtime with the effective target home.
-#
 # DESIGN — Poka-Yoke Discipline
-#   The tool follows poka-yoke: bad outcomes are not merely documented,
-#   they are structurally prevented.
+#   1. Single source of truth. OFFLOAD_TARGETS is the only list.
+#      Every subcommand (list, checklist, launch, move, protected,
+#      media-libraries) reads from it. No duplicated knowledge.
 #
-#   1. Single source of truth. OFFLOAD_APPS is the only authoritative
-#      declaration of what we move. Every subcommand reads from the
-#      same array. There are no companion scripts with a copy of this
-#      list; no chance for drift.
-#
-#   2. Dry-run by default. Mutation requires the explicit --apply flag.
-#      There is no destructive default and no "yes-to-all" alias.
+#   2. Dry-run by default. Mutation requires --apply. There is no
+#      destructive default and no "yes-to-all" alias.
 #
 #   3. Verify before delete. Cross-volume moves rsync to destination,
-#      then compare file count + total bytes against source. Source
-#      is removed only on signature match.
+#      compare file count + total bytes against source, remove
+#      source only on signature match.
 #
-#   4. Idempotent. Re-running a tier on an already-symlinked source
-#      skips with an "already done" message. The script never
-#      clobbers an existing destination silently.
+#   4. Idempotent. Re-running on an already-symlinked source skips.
+#      An existing destination is never silently overwritten.
 #
-#   5. Never sudo from inside the script. On EACCES, the failing
-#      command is appended to ~/offload-admin-todo.txt and execution
-#      continues. At end-of-run, a reviewable sudo-wrapper is
-#      emitted at ~/bin/offload-admin-pass for the user to read
-#      line-by-line and run themselves.
+#   5. Never sudo from inside. EACCES failures append to
+#      ~/offload-admin-todo.txt; a reviewable sudo-wrapper is
+#      emitted at ~/bin/offload-admin-pass for manual execution.
 #
-#   6. Two-account workflow. Standard data is moved by the owner.
-#      TCC/FDA-protected paths require a SEPARATE macOS Admin account
-#      whose Terminal has Full Disk Access. The 'protected'
-#      subcommand refuses to run as the target user, requires admin
-#      group membership, and probes FDA before any work.
+#   6. Two-account workflow. Protected targets require a separate
+#      macOS Admin account whose Terminal has Full Disk Access.
+#      Admin-mode is selected via --target-home pointing at a
+#      different user's home.
 #
-#   7. Guard launcher. After symlink-based relocation, the data
-#      becomes unreachable when the external drive is unmounted.
-#      'offload launch <App>' checks the target before opening and
-#      shows a macOS dialog instead of letting the app misbehave.
+#   7. Guard launcher. 'offload launch' checks the symlink target
+#      before opening the app.
 #
-#   8. Discovered constraints, encoded as exclusions:
-#      - macOS sandboxed containers (~/Library/Containers/com.apple.*)
-#        refuse to follow symlinks; excluded.
-#      - Mail's storage is fragile under symlinks; use Mail's
-#        Accounts → Mailbox Behaviors relocation instead.
-#      - Browser profiles (Chrome/Firefox/Brave/Zen) do constant
-#        SQLite writes; corruption common; excluded from defaults.
+#   DOES NOT
+#   The tool deliberately does NOT do any of these things:
+#
+#   - Relocate $HOME via `dscl . -change NFSHomeDirectory ...`.
+#     That changes the home-folder pointer in Directory Services
+#     and breaks iCloud Drive (which refuses to sync if $HOME is
+#     not on internal APFS), confuses FileVault login, and has been
+#     broken by macOS updates repeatedly. We move *contents*, not
+#     the pointer.
+#
+#   - Symlink Apple sandbox containers (~/Library/Containers/com.apple.*).
+#     The sandbox kit resolves the real path and refuses if it is
+#     outside the container. Mail, Messages.app's Container (not
+#     the archive), Notes, etc. are excluded.
+#
+#   - Symlink browser profiles. Chrome, Firefox, Brave, and Zen
+#     do constant SQLite writes; corruption under symlinks is
+#     common.
+#
+#   - Move media libraries (Photos / Music.app / iMovie / Final Cut)
+#     via symlinks. Those apps have safer native "Choose Library"
+#     UIs. Use 'offload media-libraries' for the steps.
 #
 # EXAMPLES
 #   First-time setup:
 #     mkdir -p ~/.config/offload
-#     cat > ~/.config/offload/offload.conf <<EOF
+#     cat > ~/.config/offload/offload.conf <<'EOF'
 #     OFFLOAD_HOT=/Volumes/MyFastSSD
 #     OFFLOAD_COLD=/Volumes/MyArchiveHDD
 #     EOF
 #
 #   Inspect:
 #     offload status
-#     offload list
-#     offload checklist
+#     offload list           # everything offload knows about
+#     offload checklist      # live progress checklist
 #
-#   Safe first sweep (build cruft, no symlinks, fully reversible by rebuild):
-#     offload move tier-c-cruft
-#     offload move tier-c-cruft --apply
+#   Safe first sweep (build cruft, fully reversible by rebuild):
+#     offload move BuildCruft
+#     offload move BuildCruft --apply
 #
-#   Guarded app launch (replaces clicking the dock icon):
+#   Move one specific app:
+#     offload move Signal --apply
+#
+#   Move every entry in a category:
+#     offload move app --apply        # all Application Support entries
+#     offload move home --apply       # ~/Movies + ~/Music
+#
+#   Guarded launch:
 #     offload launch Signal
 #
-#   Admin pass (logged in as a separate Admin account, Terminal has FDA):
-#     offload protected --target-home /Users/alice list
-#     offload protected --target-home /Users/alice messages --apply
-#     offload --target-home /Users/alice move tier-a-app Signal --apply
+#   Media libraries (manual, native UI):
+#     offload media-libraries
+#
+#   Admin running on another user's home (Admin account, FDA on Terminal):
+#     offload protected --target-home /Users/alice Messages --apply
+#     offload --target-home /Users/alice move Signal --apply
 #
 # FILES
-#   ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf  user config
-#   ~/offload-YYYY-MM-DD.log                            per-run log
-#   ~/offload-admin-todo.txt                            EACCES paths collected
-#   ~/bin/offload-admin-pass                            emitted sudo-review script
+#   ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf   user config
+#   ~/offload-YYYY-MM-DD.log                             per-run log
+#   ~/offload-admin-todo.txt                             EACCES paths
+#   ~/bin/offload-admin-pass                             emitted sudo-review script
 #
 # EXIT STATUS
 #   0   success
@@ -146,47 +184,95 @@
 #   rsync(1), tmutil(8), ln(1), launchctl(1)
 #
 # AUTHOR
-#   Sage-is homebrew-apps tap. Issues:
+#   Sage-is/homebrew-apps tap. Issues:
 #   https://github.com/Sage-is/homebrew-apps/issues
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # ----------------------------------------------------------------------------
-# Defaults — override via config file or env vars
+# Defaults
 # ----------------------------------------------------------------------------
 
 OFFLOAD_CONF="${OFFLOAD_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/offload/offload.conf}"
 
-# Built-in default OFFLOAD_APPS. Overridden if config file declares its own.
-DEFAULT_OFFLOAD_APPS=(
-  "Signal|<TARGET_HOME>/Library/Application Support/Signal|Signal"
-  "Obsidian|<TARGET_HOME>/Library/Application Support/obsidian|Obsidian"
-  "Steam|<TARGET_HOME>/Library/Application Support/Steam|Steam"
-  "Keybase|<TARGET_HOME>/Library/Application Support/Keybase|Keybase"
-  "Minecraft|<TARGET_HOME>/Library/Application Support/minecraft|Minecraft"
-  "VSCode|<TARGET_HOME>/Library/Application Support/Code|Visual Studio Code"
-  "Epic|<TARGET_HOME>/Library/Application Support/Epic|Epic Games Launcher"
-  "Cursor|<TARGET_HOME>/Library/Application Support/Cursor|Cursor"
-)
-
 OFFLOAD_HOT="${OFFLOAD_HOT:-}"
 OFFLOAD_COLD="${OFFLOAD_COLD:-}"
-OFFLOAD_APPS=()   # populated from config or defaults below
 
-# Source user config if it exists (silent on missing — defaults take over).
+# Built-in default OFFLOAD_TARGETS.
+# Schema: label|category|source|dest|strategy|admin?|bundle
+# Tokens: <TH>=$TARGET_HOME, <U>=target user, <DATE>=YYYY-MM-DD
+#         HOT/ and COLD/ prefix the destination with $OFFLOAD_HOT / $OFFLOAD_COLD
+DEFAULT_OFFLOAD_TARGETS=(
+  # --- Application Support symlinks --------------------------------------
+  "Signal|app|<TH>/Library/Application Support/Signal|HOT/MovedAppData/<U>/Signal|symlink|no|Signal"
+  "Obsidian|app|<TH>/Library/Application Support/obsidian|HOT/MovedAppData/<U>/Obsidian|symlink|no|Obsidian"
+  "Steam|app|<TH>/Library/Application Support/Steam|HOT/MovedAppData/<U>/Steam|symlink|no|Steam"
+  "Keybase|app|<TH>/Library/Application Support/Keybase|HOT/MovedAppData/<U>/Keybase|symlink|no|Keybase"
+  "Minecraft|app|<TH>/Library/Application Support/minecraft|HOT/MovedAppData/<U>/Minecraft|symlink|no|Minecraft"
+  "VSCode|app|<TH>/Library/Application Support/Code|HOT/MovedAppData/<U>/VSCode|symlink|no|Visual Studio Code"
+  "Epic|app|<TH>/Library/Application Support/Epic|HOT/MovedAppData/<U>/Epic|symlink|no|Epic Games Launcher"
+  "Cursor|app|<TH>/Library/Application Support/Cursor|HOT/MovedAppData/<U>/Cursor|symlink|no|Cursor"
+
+  # --- Home subdirectories (move contents, leave $HOME pointer alone) ----
+  "Movies|home|<TH>/Movies|HOT/MovedHome/<U>/Movies|symlink|no|-"
+  "Music|home|<TH>/Music|HOT/MovedHome/<U>/Music|symlink|no|-"
+
+  # --- Cold archive (no symlink — fresh empty source) --------------------
+  "Downloads|cold|<TH>/Downloads|COLD/Archive/Downloads-<U>-<DATE>|archive|no|-"
+
+  # --- Active merge (rsync --update; source removed; use dest directly) --
+  "Clones|merge|<TH>/Documents/Projects/Clones|HOT/Clones|merge|no|-"
+
+  # --- Developer caches ---------------------------------------------------
+  "CoreSimulator|dev|<TH>/Library/Developer/CoreSimulator|HOT/MovedAppData/<U>/CoreSimulator|symlink|no|-"
+
+  # --- Build-cruft sweep (delete in place; rebuildable from source) ------
+  "BuildCruft|sweep|<TH>/Documents/Projects/GitHub|(in-place delete)|sweep|no|-"
+
+  # --- Protected (Admin account + FDA on Terminal) -----------------------
+  "Messages|protected|<TH>/Library/Messages|HOT/MovedProtected/<U>/Messages|symlink|yes|-"
+  "iOS-Backups|protected|<TH>/Library/Application Support/MobileSync/Backup|HOT/MovedProtected/<U>/iOS-Backups|symlink|yes|-"
+
+  # --- Media libraries (native UI; tool never auto-moves these) ----------
+  "Photos-Library|media-lib|<TH>/Pictures/Photos Library.photoslibrary|HOT/Photos Library.photoslibrary|native-ui|no|-"
+  "Music-Library|media-lib|<TH>/Music/Music/Media|HOT/Music Media|native-ui|no|-"
+  "iMovie-Library|media-lib|<TH>/Movies/iMovie Library.imovielibrary|HOT/iMovie Library.imovielibrary|native-ui|no|-"
+)
+
+# Build-cruft find patterns (used by sweep strategy)
+SWEEP_DIRNAMES=(node_modules .venv venv target build dist __pycache__ .next)
+
+OFFLOAD_TARGETS=()
+
+# Source user config if it exists.
 if [[ -f "$OFFLOAD_CONF" ]]; then
   # shellcheck disable=SC1090
   source "$OFFLOAD_CONF"
 fi
 
-# Fall back to defaults if config didn't set them.
-[[ ${#OFFLOAD_APPS[@]} -eq 0 ]] && OFFLOAD_APPS=("${DEFAULT_OFFLOAD_APPS[@]}")
+# Fall back to defaults if config didn't populate.
+if [[ ${#OFFLOAD_TARGETS[@]} -eq 0 ]]; then
+  OFFLOAD_TARGETS=("${DEFAULT_OFFLOAD_TARGETS[@]}")
+fi
 
-# Runtime state set by argv parsing.
-TARGET_HOME="$HOME"           # may be overridden by --target-home
-DRY=1                          # default; --apply flips to 0
+# Legacy compatibility: if config still uses OFFLOAD_APPS (v0.1.x schema)
+# AND nothing in the current OFFLOAD_TARGETS covers a label, append it.
+if declare -p OFFLOAD_APPS &>/dev/null; then
+  for row in "${OFFLOAD_APPS[@]}"; do
+    IFS='|' read -r label src bundle <<<"$row"
+    found=0
+    for t in "${OFFLOAD_TARGETS[@]}"; do
+      [[ "${t%%|*}" == "$label" ]] && { found=1; break; }
+    done
+    [[ $found -eq 0 ]] && OFFLOAD_TARGETS+=("$label|app|$src|HOT/MovedAppData/<U>/$label|symlink|no|$bundle")
+  done
+fi
+
+# Runtime state.
+TARGET_HOME="$HOME"
+DRY=1
 DATE_TAG="$(date +%Y-%m-%d)"
 LOG="$HOME/offload-$DATE_TAG.log"
 ADMIN_TODO="$HOME/offload-admin-todo.txt"
@@ -201,16 +287,26 @@ warn() { printf '[%s] WARN: %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2
 die()  { printf '[%s] FATAL: %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2; exit 1; }
 mode() { [[ $DRY -eq 1 ]] && echo DRY-RUN || echo APPLY; }
 
-# Resolve <TARGET_HOME> placeholder in a string.
-expand_target_home() { echo "${1//<TARGET_HOME>/$TARGET_HOME}"; }
+target_user() { basename "$TARGET_HOME"; }
 
-# Iterate OFFLOAD_APPS, yielding (label, src, bundle) with placeholder expanded.
-# Usage:  while IFS='|' read -r label src bundle; do ...; done < <(iter_apps)
-iter_apps() {
-  for row in "${OFFLOAD_APPS[@]}"; do
-    IFS='|' read -r label src bundle <<<"$row"
-    src="$(expand_target_home "$src")"
-    printf '%s|%s|%s\n' "$label" "$src" "$bundle"
+# Expand <TH>, <U>, <DATE>, HOT/, COLD/ tokens in a path.
+expand_tokens() {
+  local s="$1" u; u="$(target_user)"
+  s="${s//<TH>/$TARGET_HOME}"
+  s="${s//<U>/$u}"
+  s="${s//<DATE>/$DATE_TAG}"
+  if [[ "$s" == HOT/* ]];  then s="${OFFLOAD_HOT}/${s#HOT/}"; fi
+  if [[ "$s" == COLD/* ]]; then s="${OFFLOAD_COLD}/${s#COLD/}"; fi
+  echo "$s"
+}
+
+# Iterate OFFLOAD_TARGETS, yielding fully-expanded rows.
+iter_targets() {
+  for row in "${OFFLOAD_TARGETS[@]}"; do
+    IFS='|' read -r label cat src dest strat adm bundle <<<"$row"
+    src="$(expand_tokens "$src")"
+    dest="$(expand_tokens "$dest")"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$label" "$cat" "$src" "$dest" "$strat" "$adm" "$bundle"
   done
 }
 
@@ -225,6 +321,8 @@ human()      { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
 
 require_free() {
   local p="$1" need="$2"
+  # Walk up to the nearest existing ancestor — df can only query existing paths.
+  while [[ ! -d "$p" ]]; do p="$(dirname "$p")"; [[ "$p" == "/" ]] && break; done
   local avail; avail="$(free_bytes "$p")"
   (( avail >= need )) || die "Not enough free on $p: have $(human $avail), need $(human $need)"
   log "  OK: $p has $(human $avail) free (need $(human $need))"
@@ -258,21 +356,15 @@ tree_signature() {
   echo "files=$f bytes=$b"
 }
 
-target_user() { basename "$TARGET_HOME"; }
-
-# Admin-mode invariants — fire whenever TARGET_HOME != caller's $HOME.
 assert_admin_invariants() {
-  [[ "$TARGET_HOME" == "$HOME" ]] && return 0  # local mode; no checks
+  [[ "$TARGET_HOME" == "$HOME" ]] && return 0
   local tu; tu="$(target_user)"
   [[ "$USER" != "$tu" ]] \
-    || die "Refusing to operate on $TARGET_HOME as user '$USER' — Admin mode requires a separate account."
+    || die "Refusing to operate on $TARGET_HOME as '$USER' — Admin mode requires a separate account."
   id -Gn "$USER" | tr ' ' '\n' | grep -qx admin \
     || die "Current account '$USER' is not in the admin group."
 }
 
-# FDA probe — only for the 'protected' subcommand path that reads
-# system-protected paths. Tries to stat ~target/Library/Messages and
-# fails with a System-Settings pointer if it returns EPERM.
 assert_fda_granted() {
   local probe="$TARGET_HOME/Library/Messages"
   if [[ -d "$probe" ]]; then
@@ -284,11 +376,13 @@ assert_fda_granted() {
   fi
 }
 
-# Cross-volume move: rsync, verify signature, replace source with symlink.
-# Always partitions destinations under $target_user to avoid cross-user collision.
-offload_dir_symlink() {
+# ----------------------------------------------------------------------------
+# Strategy implementations
+# ----------------------------------------------------------------------------
+
+strategy_symlink() {
   local src="$1" dst="$2" label="$3"
-  log "=== $label ==="
+  log "=== $label (strategy=symlink) ==="
   if [[ -L "$src" ]]; then
     [[ "$(readlink "$src")" == "$dst" ]] \
       && { log "  SKIP: $src already symlinked to $dst"; return 0; } \
@@ -310,11 +404,344 @@ offload_dir_symlink() {
     [[ "$s" == "$d" ]] || die "Signature mismatch — source preserved"
     do_run "rm -rf \"$src\""
     do_run "ln -s \"$dst\" \"$src\""
-    # If we're Admin moving somma's data, chown destination to target user.
     [[ "$TARGET_HOME" != "$HOME" ]] && do_run "chown -R \"$(target_user)\" \"$dst\""
     log "  DONE: $src -> $dst"
   fi
 }
+
+strategy_archive() {
+  local src="$1" dst="$2" label="$3"
+  log "=== $label (strategy=archive) ==="
+  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
+  if [[ "$label" == "Downloads" && -n "$OFFLOAD_HOT" && -d "$OFFLOAD_HOT" ]]; then
+    local roms_dst="$OFFLOAD_HOT/ROMs"
+    local roms=()
+    while IFS= read -r f; do roms+=("$f"); done < <(
+      find "$src" -maxdepth 1 -type f -name '*.zip' \
+        \( -iname '*Mario*' -o -iname '*Zelda*' -o -iname '*Pokemon*' \
+           -o -iname '*Sonic*' -o -iname '*Metroid*' -o -iname '*Kirby*' \
+           -o -iname '*GameCube*' -o -iname '*Nintendo*' \) 2>/dev/null
+    )
+    if (( ${#roms[@]} > 0 )); then
+      log "  Pre-filter: ${#roms[@]} ROM zip(s) -> $roms_dst"
+      do_run "mkdir -p \"$roms_dst\""
+      for f in "${roms[@]}"; do
+        local base; base="$(basename "$f")"
+        [[ -e "$roms_dst/$base" ]] && { warn "    SKIP duplicate: $base"; continue; }
+        do_run "mv -n \"$f\" \"$roms_dst/\""
+      done
+    fi
+  fi
+  do_run "mkdir -p \"$dst\""
+  do_run "rsync -a --remove-source-files \"$src/\" \"$dst/\""
+  do_run "find \"$src\" -type d -empty -delete"
+  do_run "mkdir -p \"$src\""
+  log "  DONE: $src archived to $dst (source recreated empty)"
+}
+
+strategy_merge() {
+  local src="$1" dst="$2" label="$3"
+  log "=== $label (strategy=merge --update) ==="
+  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
+  [[ -d "$dst" ]] || die "$dst must already exist (merge target)"
+  do_run "rsync -av --update \"$src/\" \"$dst/\""
+  if [[ $DRY -eq 0 ]]; then
+    local sc dc
+    sc="$(find "$src" -type f | wc -l | tr -d ' ')"
+    dc="$(find "$dst" -type f | wc -l | tr -d ' ')"
+    (( dc >= sc )) || die "Dest has $dc files, src had $sc — incomplete"
+    do_run "rm -rf \"$src\""
+    log "  DONE: $src merged into $dst (source removed)"
+  fi
+}
+
+strategy_sweep() {
+  local src="$1" _dst="$2" label="$3"
+  log "=== $label (strategy=sweep) ==="
+  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
+  manual_step "Confirm no active builds running (npm run dev, cargo watch, etc.)"
+
+  local find_args=("-type" "d" "(")
+  local first=1
+  for n in "${SWEEP_DIRNAMES[@]}"; do
+    [[ $first -eq 0 ]] && find_args+=("-o")
+    find_args+=("-name" "$n")
+    first=0
+  done
+  find_args+=(")" "-prune")
+
+  local total_kb=0
+  while IFS= read -r d; do
+    local kb; kb="$(du -sk "$d" 2>/dev/null | awk '{print $1}')"
+    total_kb=$((total_kb + kb))
+    log "  $(printf '%10s KB  %s' "$kb" "$d")"
+    do_run "rm -rf \"$d\""
+  done < <(find "$src" "${find_args[@]}" 2>/dev/null)
+  log "  Total: $(human $((total_kb * 1024)))"
+}
+
+strategy_native_ui() {
+  local _src="$1" _dst="$2" label="$3"
+  log "=== $label (strategy=native-ui) ==="
+  log "  This target is moved through the owning app's native UI."
+  log "  See 'offload media-libraries' for the procedure."
+}
+
+move_one() {
+  local row="$1"
+  IFS='|' read -r label cat src dest strat adm bundle <<<"$row"
+
+  if [[ "$adm" == "yes" && "$TARGET_HOME" == "$HOME" ]]; then
+    warn "  SKIP: $label requires Admin mode. Re-run with --target-home <path> from a separate Admin account whose Terminal has Full Disk Access."
+    return 0
+  fi
+  if [[ "$adm" == "yes" ]]; then
+    assert_admin_invariants
+    assert_fda_granted
+  fi
+
+  case "$strat" in
+    symlink)   require_drive OFFLOAD_HOT;  strategy_symlink "$src" "$dest" "$label" ;;
+    archive)   require_drive OFFLOAD_COLD; strategy_archive "$src" "$dest" "$label" ;;
+    merge)     require_drive OFFLOAD_HOT;  strategy_merge   "$src" "$dest" "$label" ;;
+    sweep)                                 strategy_sweep   "$src" "$dest" "$label" ;;
+    native-ui)                             strategy_native_ui "$src" "$dest" "$label" ;;
+    *) die "unknown strategy '$strat' for $label" ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Per-row state assessment
+# ----------------------------------------------------------------------------
+
+row_state() {
+  local src="$1" dest="$2" strat="$3"
+  case "$strat" in
+    symlink)
+      if [[ -L "$src" ]]; then
+        local tgt; tgt="$(readlink "$src")"
+        if [[ -d "$tgt" ]]; then echo "symlinked"
+        else                    echo "broken-symlink"
+        fi
+      elif [[ -d "$src" ]]; then
+        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
+      else
+        echo "absent"
+      fi
+      ;;
+    archive)
+      if [[ -d "$src" ]] && [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then
+        echo "archived (source empty)"
+      elif [[ -d "$src" ]]; then
+        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
+      else
+        echo "absent"
+      fi
+      ;;
+    merge)
+      if [[ -d "$src" ]]; then
+        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
+      elif [[ -d "$dest" ]]; then
+        echo "merged"
+      else
+        echo "absent"
+      fi
+      ;;
+    sweep)
+      if [[ -d "$src" ]]; then
+        local find_args=("-type" "d" "(")
+        local first=1
+        for n in "${SWEEP_DIRNAMES[@]}"; do
+          [[ $first -eq 0 ]] && find_args+=("-o")
+          find_args+=("-name" "$n")
+          first=0
+        done
+        find_args+=(")" "-prune")
+        local count; count="$(find "$src" "${find_args[@]}" 2>/dev/null | wc -l | tr -d ' ')"
+        echo "$count cruft dirs"
+      else
+        echo "absent"
+      fi
+      ;;
+    native-ui)
+      if [[ -L "$src" ]]; then echo "symlinked (via native UI)"
+      elif [[ -e "$src" ]];  then echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
+      else                        echo "absent"
+      fi
+      ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Subcommand: list
+# ----------------------------------------------------------------------------
+
+cmd_list() {
+  printf '%-16s %-10s %-9s %-7s %s\n' LABEL CATEGORY STRATEGY ADMIN STATE
+  printf '%-16s %-10s %-9s %-7s %s\n' ---- -------- -------- ----- -----
+  local prev_cat=""
+  while IFS='|' read -r label cat src dest strat adm bundle; do
+    if [[ "$cat" != "$prev_cat" && -n "$prev_cat" ]]; then echo ""; fi
+    prev_cat="$cat"
+    local state; state="$(row_state "$src" "$dest" "$strat")"
+    printf '%-16s %-10s %-9s %-7s %s\n' "$label" "$cat" "$strat" "$adm" "$state"
+  done < <(iter_targets)
+}
+
+# ----------------------------------------------------------------------------
+# Subcommand: launch
+# ----------------------------------------------------------------------------
+
+cmd_launch() {
+  local bundle="${1:?usage: offload launch <BundleName>}"
+  local src=""
+  while IFS='|' read -r label cat r_src dest strat adm r_bundle; do
+    if [[ "$bundle" == "$r_bundle" || "$bundle" == "$label" ]]; then
+      src="$r_src"; break
+    fi
+  done < <(iter_targets)
+  if [[ -n "$src" && -L "$src" ]]; then
+    local tgt; tgt="$(readlink "$src")"
+    if [[ ! -d "$tgt" ]]; then
+      osascript -e "display dialog \"Cannot launch $bundle: its data lives at\n\n$tgt\n\nThat volume is not mounted. Plug in the drive and try again.\" buttons {\"OK\"} default button \"OK\" with icon stop" >/dev/null
+      exit 1
+    fi
+  fi
+  exec open -a "$bundle"
+}
+
+# ----------------------------------------------------------------------------
+# Subcommand: status
+# ----------------------------------------------------------------------------
+
+cmd_status() {
+  echo "=== offload v$VERSION  TARGET_HOME=$TARGET_HOME ==="
+  echo "Config: $OFFLOAD_CONF $([[ -f "$OFFLOAD_CONF" ]] && echo '(loaded)' || echo '(not found — using defaults)')"
+  echo
+  echo "=== Disk space ==="
+  local paths=(/)
+  [[ -n "$OFFLOAD_HOT"  && -d "$OFFLOAD_HOT"  ]] && paths+=("$OFFLOAD_HOT")
+  [[ -n "$OFFLOAD_COLD" && -d "$OFFLOAD_COLD" ]] && paths+=("$OFFLOAD_COLD")
+  df -h "${paths[@]}" 2>/dev/null
+  echo
+  echo "=== Targets summary ==="
+  local total=0 symlinked=0 on_disk=0 absent=0 admin_required=0
+  while IFS='|' read -r label cat src dest strat adm bundle; do
+    total=$((total + 1))
+    local s; s="$(row_state "$src" "$dest" "$strat")"
+    case "$s" in
+      symlinked*)            symlinked=$((symlinked + 1)) ;;
+      on-disk*)              on_disk=$((on_disk + 1)) ;;
+      absent)                absent=$((absent + 1)) ;;
+    esac
+    [[ "$adm" == "yes" ]] && admin_required=$((admin_required + 1))
+  done < <(iter_targets)
+  echo "  total: $total | on-disk: $on_disk | symlinked: $symlinked | absent: $absent | admin-only: $admin_required"
+  echo
+  echo "=== Recent log ==="
+  if [[ -f "$LOG" ]]; then tail -n 15 "$LOG"; else echo "(no log yet)"; fi
+  echo
+  echo "=== Admin todo ==="
+  if [[ -s "$ADMIN_TODO" ]]; then cat "$ADMIN_TODO"; else echo "(empty)"; fi
+}
+
+# ----------------------------------------------------------------------------
+# Subcommand: checklist
+# ----------------------------------------------------------------------------
+
+cmd_checklist() {
+  cat <<HEADER
+# Offload checklist (live — generated by \`offload checklist\`)
+# Target home: $TARGET_HOME
+# HOT  drive:  ${OFFLOAD_HOT:-<not configured>}
+# COLD drive:  ${OFFLOAD_COLD:-<not configured>}
+
+## Pre-flight
+- [ ] HOT mounted (\`ls "$OFFLOAD_HOT"\` works)
+- [ ] COLD mounted (\`ls "$OFFLOAD_COLD"\` works)
+- [ ] No active builds running
+- [ ] Time Machine has a recent backup
+
+## Targets (live state)
+HEADER
+  local prev_cat=""
+  while IFS='|' read -r label cat src dest strat adm bundle; do
+    if [[ "$cat" != "$prev_cat" ]]; then
+      echo ""
+      echo "### $cat"
+      prev_cat="$cat"
+    fi
+    local s; s="$(row_state "$src" "$dest" "$strat")"
+    local mark="[ ]"
+    case "$s" in
+      symlinked*|merged|archived*) mark="[x]" ;;
+    esac
+    printf -- '- %s %-16s %-9s %s\n' "$mark" "$label" "$strat" "$s"
+    if [[ "$adm" == "yes" ]]; then
+      printf -- '      Admin only: offload protected --target-home %s %s --apply\n' "$TARGET_HOME" "$label"
+    elif [[ "$strat" == "native-ui" ]]; then
+      printf -- '      See: offload media-libraries\n'
+    else
+      printf -- '      offload move %s --apply' "$label"
+      [[ -n "$bundle" && "$bundle" != "-" ]] && printf -- '  &&  offload launch "%s"' "$bundle"
+      printf -- '\n'
+    fi
+  done < <(iter_targets)
+
+  cat <<'FOOTER'
+
+## Final
+- [ ] Boot drive has comfortable headroom (offload status)
+- [ ] If ~/offload-admin-todo.txt non-empty: review then `sudo bash ~/bin/offload-admin-pass`
+FOOTER
+}
+
+# ----------------------------------------------------------------------------
+# Subcommand: media-libraries
+# ----------------------------------------------------------------------------
+
+cmd_media_libraries() {
+  cat <<EOS
+=== Native-UI media library relocation ===
+Apple's Photos, Music, iMovie, and Final Cut have their own
+"Choose Library" UIs that handle relocation correctly. Use these
+instead of symlinking, because the apps cache library paths
+internally and symlinks can desync.
+
+Suggested destinations (HOT drive: ${OFFLOAD_HOT:-<not configured>}):
+
+Photos Library
+  1. Quit Photos.
+  2. Move ~/Pictures/Photos\ Library.photoslibrary to ${OFFLOAD_HOT:-<HOT>}/
+  3. Hold Option (⌥) while launching Photos.
+  4. Click "Other Library..." and pick the moved bundle.
+  5. Photos > Settings > General > Use as System Photo Library.
+
+Music.app Library
+  1. Quit Music.
+  2. Music > Settings > Files > Music Media folder location > Change…
+  3. Point at ${OFFLOAD_HOT:-<HOT>}/Music\ Media (creates folder).
+  4. File > Library > Organize Library… > Consolidate files.
+  5. Move ~/Music/Music/Music\ Library.musiclibrary to the new location
+     via File > Library > Choose Library… if you also want metadata external.
+
+iMovie / Final Cut Pro Library
+  1. Quit iMovie / Final Cut.
+  2. Move ~/Movies/iMovie\ Library.imovielibrary to ${OFFLOAD_HOT:-<HOT>}/
+  3. Double-click the moved .imovielibrary bundle to relaunch from new location.
+  4. (Final Cut: File > Open Library… > select the moved .fcpbundle.)
+
+Why we don't auto-move these:
+  These apps cache library paths in their preferences. A symlink works
+  most of the time but is unsupported, and the native UIs handle the
+  transition cleanly including index rebuilds and metadata fixups.
+EOS
+}
+
+# ----------------------------------------------------------------------------
+# Reporting
+# ----------------------------------------------------------------------------
 
 report_space() {
   log "--- Space ($(mode)) ---"
@@ -340,324 +767,53 @@ emit_admin_pass() {
 }
 
 # ----------------------------------------------------------------------------
-# Move tier functions
-# ----------------------------------------------------------------------------
-
-move_tier_c_cruft() {
-  local root="$TARGET_HOME/Documents/Projects/GitHub"
-  log "=== Tier C: build-cruft sweep under $root ==="
-  [[ -d "$root" ]] || { log "  SKIP: $root missing"; return 0; }
-  manual_step "Confirm no active builds running (npm run dev, cargo watch, etc.)"
-  local total_kb=0
-  while IFS= read -r d; do
-    local kb; kb="$(du -sk "$d" 2>/dev/null | awk '{print $1}')"
-    total_kb=$((total_kb + kb))
-    log "  $(printf '%10s KB  %s' "$kb" "$d")"
-    do_run "rm -rf \"$d\""
-  done < <(find "$root" -type d \
-    \( -name node_modules -o -name .venv -o -name venv \
-       -o -name target -o -name build -o -name dist \
-       -o -name __pycache__ -o -name .next \) -prune 2>/dev/null)
-  log "  Total: $(human $((total_kb * 1024)))"
-}
-
-move_tier_b_downloads() {
-  require_drive OFFLOAD_HOT
-  require_drive OFFLOAD_COLD
-  local archive="$OFFLOAD_COLD/Archive/Downloads-$(target_user)-$DATE_TAG"
-  local roms_dst="$OFFLOAD_HOT/ROMs"
-  local src="$TARGET_HOME/Downloads"
-  log "=== Tier B1: Downloads sort + archive ==="
-  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
-
-  local roms=()
-  while IFS= read -r f; do roms+=("$f"); done < <(
-    find "$src" -maxdepth 1 -type f -name '*.zip' \
-      \( -iname '*Mario*' -o -iname '*Zelda*' -o -iname '*Pokemon*' \
-         -o -iname '*Sonic*' -o -iname '*Metroid*' -o -iname '*Kirby*' \
-         -o -iname '*GameCube*' -o -iname '*Nintendo*' \) 2>/dev/null
-  )
-  if (( ${#roms[@]} > 0 )); then
-    do_run "mkdir -p \"$roms_dst\""
-    for f in "${roms[@]}"; do
-      local base; base="$(basename "$f")"
-      [[ -e "$roms_dst/$base" ]] && { warn "  SKIP duplicate: $base"; continue; }
-      do_run "mv -n \"$f\" \"$roms_dst/\""
-    done
-  fi
-  do_run "mkdir -p \"$archive\""
-  do_run "rsync -a --remove-source-files \"$src/\" \"$archive/\""
-  do_run "find \"$src\" -type d -empty -delete"
-  do_run "mkdir -p \"$src\""
-}
-
-move_tier_b_clones() {
-  require_drive OFFLOAD_HOT
-  local src="$TARGET_HOME/Documents/Projects/Clones"
-  local dst="$OFFLOAD_HOT/Clones"
-  log "=== Tier B2: Clones rsync-merge (--update; newer mtime wins) ==="
-  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
-  [[ -d "$dst" ]] || die "$dst must already exist (this is a merge into a known location)"
-  do_run "rsync -av --update \"$src/\" \"$dst/\""
-  if [[ $DRY -eq 0 ]]; then
-    local sc dc
-    sc="$(find "$src" -type f | wc -l | tr -d ' ')"
-    dc="$(find "$dst" -type f | wc -l | tr -d ' ')"
-    (( dc >= sc )) || die "Dest has $dc files, src had $sc — incomplete"
-    do_run "rm -rf \"$src\""
-  fi
-}
-
-move_tier_a_app() {
-  local want="$1"
-  require_drive OFFLOAD_HOT
-  local tu; tu="$(target_user)"
-  while IFS='|' read -r label src bundle; do
-    if [[ "$label" == "$want" ]]; then
-      manual_step "Quit $bundle completely"
-      offload_dir_symlink "$src" "$OFFLOAD_HOT/MovedAppData/$tu/$label" "Tier A: $label"
-      manual_step "Relaunch via 'offload launch $bundle' and verify data"
-      return 0
-    fi
-  done < <(iter_apps)
-  die "Unknown app: $want — see 'offload list'"
-}
-
-move_tier_a_all() {
-  while IFS='|' read -r label _ _; do move_tier_a_app "$label"; done < <(iter_apps)
-}
-
-move_tier_a_simulator() {
-  require_drive OFFLOAD_HOT
-  local tu; tu="$(target_user)"
-  manual_step "Quit Xcode and all iOS Simulators"
-  offload_dir_symlink \
-    "$TARGET_HOME/Library/Developer/CoreSimulator" \
-    "$OFFLOAD_HOT/MovedAppData/$tu/CoreSimulator" \
-    "Tier A: CoreSimulator"
-}
-
-# ----------------------------------------------------------------------------
-# Subcommand: launch
-# ----------------------------------------------------------------------------
-
-cmd_launch() {
-  local bundle="${1:?usage: offload launch <BundleName>}"
-  local src=""
-  while IFS='|' read -r label r_src r_bundle; do
-    if [[ "$bundle" == "$r_bundle" || "$bundle" == "$label" ]]; then
-      src="$r_src"; break
-    fi
-  done < <(iter_apps)
-  if [[ -n "$src" && -L "$src" ]]; then
-    local tgt; tgt="$(readlink "$src")"
-    if [[ ! -d "$tgt" ]]; then
-      osascript -e "display dialog \"Cannot launch $bundle: its data lives at\n\n$tgt\n\nThat volume is not mounted. Plug in the drive and try again.\" buttons {\"OK\"} default button \"OK\" with icon stop" >/dev/null
-      exit 1
-    fi
-  fi
-  exec open -a "$bundle"
-}
-
-# ----------------------------------------------------------------------------
-# Subcommand: list
-# ----------------------------------------------------------------------------
-
-cmd_list() {
-  printf '%-12s %-40s %s\n' LABEL BUNDLE STATE
-  printf '%-12s %-40s %s\n' "------" "----------------------------------------" "-----"
-  while IFS='|' read -r label src bundle; do
-    local state
-    if [[ -L "$src" ]]; then
-      local tgt; tgt="$(readlink "$src")"
-      if [[ -d "$tgt" ]]; then state="symlinked -> $tgt"
-      else                    state="symlinked BUT TARGET MISSING ($tgt)"
-      fi
-    elif [[ -d "$src" ]]; then
-      state="on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
-    else
-      state="absent"
-    fi
-    printf '%-12s %-40s %s\n' "$label" "$bundle" "$state"
-  done < <(iter_apps)
-}
-
-# ----------------------------------------------------------------------------
-# Subcommand: status
-# ----------------------------------------------------------------------------
-
-cmd_status() {
-  echo "=== offload v$VERSION  TARGET_HOME=$TARGET_HOME ==="
-  echo "Config: $OFFLOAD_CONF $([[ -f "$OFFLOAD_CONF" ]] && echo '(loaded)' || echo '(not found — using defaults)')"
-  echo
-  echo "=== Disk space ==="
-  local paths=(/)
-  [[ -n "$OFFLOAD_HOT"  && -d "$OFFLOAD_HOT"  ]] && paths+=("$OFFLOAD_HOT")
-  [[ -n "$OFFLOAD_COLD" && -d "$OFFLOAD_COLD" ]] && paths+=("$OFFLOAD_COLD")
-  df -h "${paths[@]}" 2>/dev/null
-  echo
-  echo "=== Recent log ==="
-  if [[ -f "$LOG" ]]; then tail -n 20 "$LOG"; else echo "(no log yet)"; fi
-  echo
-  echo "=== Admin todo ==="
-  if [[ -s "$ADMIN_TODO" ]]; then cat "$ADMIN_TODO"; else echo "(empty)"; fi
-}
-
-# ----------------------------------------------------------------------------
-# Subcommand: checklist
-# ----------------------------------------------------------------------------
-
-cmd_checklist() {
-  cat <<HEADER
-# Offload checklist (live — generated by \`offload checklist\`)
-# Target home: $TARGET_HOME
-# HOT  drive:  ${OFFLOAD_HOT:-<not configured>}
-# COLD drive:  ${OFFLOAD_COLD:-<not configured>}
-
-## Pre-flight
-- [ ] HOT mounted (\`ls "$OFFLOAD_HOT"\` works)
-- [ ] COLD mounted (\`ls "$OFFLOAD_COLD"\` works)
-- [ ] No active builds running
-- [ ] Time Machine has a recent backup
-
-## Order (safest first)
-- [ ] \`offload move tier-c-cruft\`              (dry-run, then --apply)
-- [ ] \`offload move tier-b-downloads\`
-- [ ] \`offload move tier-b-clones\`
-- [ ] Docker — MANUAL via Docker Desktop UI: Settings -> Resources ->
-      Advanced -> Disk image location -> \$OFFLOAD_HOT/Docker/
-- [ ] Steam — MANUAL: uninstall games in Steam UI (or use native external library)
-
-## Tier A (one at a time)
-HEADER
-
-  while IFS='|' read -r label src bundle; do
-    local mark="[ ]"
-    if [[ -L "$src" ]]; then mark="[x]"; fi
-    printf -- '- %s %-12s\n' "$mark" "$label"
-    printf -- '      offload move tier-a-app %s --apply  &&  offload launch "%s"\n' "$label" "$bundle"
-  done < <(iter_apps)
-
-  cat <<'FOOTER'
-- [ ] CoreSimulator: `offload move tier-a-simulator --apply`
-
-## Protected pass (Admin user, FDA on Terminal, runs from a SEPARATE account)
-- [ ] Admin: System Settings -> Privacy & Security -> Full Disk Access -> add Terminal
-- [ ] Admin: ensure offload is installed for this account too
-- [ ] Admin: offload protected --target-home <target> list
-- [ ] Admin: offload protected --target-home <target> messages --apply
-- [ ] Owner: open Messages, verify chat history loads
-- [ ] Admin: offload protected --target-home <target> ios-backups --apply
-
-## Final
-- [ ] Boot drive has comfortable headroom (offload status)
-- [ ] If ~/offload-admin-todo.txt non-empty: review then `sudo bash ~/bin/offload-admin-pass`
-FOOTER
-}
-
-# ----------------------------------------------------------------------------
-# Subcommand: move
+# Subcommand: move <Label-or-category>
 # ----------------------------------------------------------------------------
 
 cmd_move() {
-  local target="${1:?usage: offload move <target> [args] [--apply]}"; shift || true
-  local arg=""
+  local needle="${1:?usage: offload move <Label-or-category> [--apply]}"; shift || true
   for a in "$@"; do
-    case "$a" in
-      --apply) DRY=0 ;;
-      *)       arg="$a" ;;
-    esac
+    case "$a" in --apply) DRY=0 ;; esac
   done
 
   assert_admin_invariants
 
   log "============================================="
-  log "offload v$VERSION move  target=$target  mode=$(mode)  arg=$arg  TARGET_HOME=$TARGET_HOME"
+  log "offload v$VERSION move  needle=$needle  mode=$(mode)  TARGET_HOME=$TARGET_HOME"
   log "============================================="
   report_space
-  case "$target" in
-    tier-c-cruft)     move_tier_c_cruft ;;
-    tier-b-downloads) move_tier_b_downloads ;;
-    tier-b-clones)    move_tier_b_clones ;;
-    tier-a-app)       [[ -n "$arg" ]] || die "usage: offload move tier-a-app <Label> [--apply]"; move_tier_a_app "$arg" ;;
-    tier-a-all)       move_tier_a_all ;;
-    tier-a-simulator) move_tier_a_simulator ;;
-    *) die "unknown move target: $target (see 'offload help')" ;;
-  esac
+
+  local matched=0
+  while IFS='|' read -r label cat src dest strat adm bundle; do
+    if [[ "$needle" == "$label" || "$needle" == "$cat" ]]; then
+      move_one "$label|$cat|$src|$dest|$strat|$adm|$bundle"
+      matched=$((matched + 1))
+    fi
+  done < <(iter_targets)
+
+  [[ $matched -gt 0 ]] || die "no targets matched '$needle' — see 'offload list'"
+
   report_space
   emit_admin_pass
   log "Done. Log: $LOG"
 }
 
 # ----------------------------------------------------------------------------
-# Subcommand: protected
+# Subcommand: protected (move with admin gating reinforced)
 # ----------------------------------------------------------------------------
-
-protected_list() {
-  log "=== Protected-path inventory under $TARGET_HOME ==="
-  for p in \
-    "$TARGET_HOME/Library/Messages" \
-    "$TARGET_HOME/Library/Application Support/MobileSync/Backup" \
-    "$TARGET_HOME/Library/Mail" \
-    "$TARGET_HOME/Library/Calendars" \
-    "$TARGET_HOME/Library/Reminders" \
-    "$TARGET_HOME/Library/HomeKit" \
-  ; do
-    if [[ -d "$p" ]]; then
-      log "  $(du -sh "$p" 2>/dev/null | awk '{print $1}')\t$p"
-    fi
-  done
-  log "Note: Mail is fragile under symlinks — use Mail's Accounts preferences."
-  log "Note: ~/Library/Containers/com.apple.* CANNOT be symlinked (sandbox)."
-}
-
-protected_messages() {
-  local tu; tu="$(target_user)"
-  offload_dir_symlink \
-    "$TARGET_HOME/Library/Messages" \
-    "$OFFLOAD_HOT/MovedProtected/$tu/Messages" \
-    "Messages archive"
-}
-
-protected_ios_backups() {
-  local tu; tu="$(target_user)"
-  offload_dir_symlink \
-    "$TARGET_HOME/Library/Application Support/MobileSync/Backup" \
-    "$OFFLOAD_HOT/MovedProtected/$tu/iOS-Backups" \
-    "iOS device backups"
-}
 
 cmd_protected() {
-  local sub="${1:?usage: offload protected --target-home <path> <list|messages|ios-backups> [--apply]}"; shift || true
-  for a in "$@"; do
-    case "$a" in --apply) DRY=0 ;; esac
-  done
-
+  local needle="${1:?usage: offload protected --target-home <path> <Label> [--apply]}"; shift || true
   [[ "$TARGET_HOME" != "$HOME" ]] \
     || die "'protected' requires --target-home pointing at a DIFFERENT user's home."
-  assert_admin_invariants
-  assert_fda_granted
-  require_drive OFFLOAD_HOT
-
-  log "============================================="
-  log "offload v$VERSION protected  sub=$sub  mode=$(mode)  TARGET_HOME=$TARGET_HOME  USER=$USER"
-  log "============================================="
-
-  case "$sub" in
-    list)        protected_list ;;
-    messages)    protected_messages ;;
-    ios-backups) protected_ios_backups ;;
-    *) die "unknown protected subcmd: $sub" ;;
-  esac
-  log "Done."
+  cmd_move "$needle" "$@"
 }
 
 # ----------------------------------------------------------------------------
-# help — extracted directly from the script header (no duplication).
+# help — extracted from header (no duplication)
 # ----------------------------------------------------------------------------
 
 cmd_help() {
-  # Print every leading comment line (the documentation block above).
   awk 'NR>1 && /^#($| )/ {sub(/^# ?/, ""); print; next} NR>1 && !/^#/ {exit}' "$0"
 }
 
@@ -666,7 +822,6 @@ cmd_help() {
 # ----------------------------------------------------------------------------
 
 main() {
-  # Consume the top-level --target-home flag wherever it appears.
   local args=()
   while (( $# > 0 )); do
     case "$1" in
@@ -678,14 +833,15 @@ main() {
 
   local sub="${1:-help}"; shift || true
   case "$sub" in
-    help|-h|--help) cmd_help ;;
-    version|-V|--version) echo "offload v$VERSION" ;;
-    status)         cmd_status ;;
-    list)           cmd_list ;;
-    checklist)      cmd_checklist ;;
-    launch)         cmd_launch "$@" ;;
-    move)           cmd_move "$@" ;;
-    protected)      cmd_protected "$@" ;;
+    help|-h|--help)            cmd_help ;;
+    version|-V|--version)      echo "offload v$VERSION" ;;
+    status)                    cmd_status ;;
+    list)                      cmd_list ;;
+    checklist)                 cmd_checklist ;;
+    media-libraries|media)     cmd_media_libraries ;;
+    launch)                    cmd_launch "$@" ;;
+    move)                      cmd_move "$@" ;;
+    protected)                 cmd_protected "$@" ;;
     *) die "unknown subcommand: $sub (try 'offload help')" ;;
   esac
 }
