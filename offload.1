@@ -147,7 +147,25 @@ Defaults to
 .It Fl -all-users
 .Cm list
 only. Iterate every real macOS user account and emit per-user
-sections plus a grand-total potential reclaim.
+sections plus a grand-total potential reclaim. POSIX permissions on
+.Pa /Users/<other>/Library
+.Pq mode 700
+block one user from reading another's contents; rows the caller
+cannot read are marked
+.Sy unreadable
+with no reclaim figure, and a hint at the bottom of the output
+suggests:
+.Bd -literal -offset indent
+sudo offload --target-home /Users/<other> list
+.Ed
+.Pp
+Running
+.Cm list
+under
+.Cm sudo
+is supported and safe; it is read-only and does not violate the
+"never sudo from inside" invariant
+.Pq the script itself never invokes sudo .
 .It Fl -apply
 Actually mutate. Without it, every operation is a dry-run that
 prints intent only.
