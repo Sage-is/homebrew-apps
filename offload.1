@@ -39,6 +39,37 @@ Print the embedded long-form documentation
 Print the script version.
 .It Cm status
 Disk space, summary of all targets, recent log entries, admin todo.
+.It Cm drives Op Fl -benchmark
+Scan
+.Pa /Volumes/*
+mount points, classify each as
+.Sy HOT
+.Pq external SSD ,
+.Sy COLD
+.Pq external spinner or HFS+ ,
+.Sy EXCLUDED
+.Pq Time Machine destination, internal, read-only ,
+or
+.Sy UNKNOWN .
+Heuristics use
+.Xr diskutil 8
+fields
+.Pq Solid State, Protocol, File System Personality, Device Location
+and
+.Xr tmutil 8
+.Pq destinationinfo .
+Prints a table plus a "Detected:" footer with the lines to add to
+.Pa ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf
+so the user can persist the result manually
+.Pq the command never writes the config file itself .
+With
+.Fl -benchmark ,
+adds a SPEED column measured by a 1 GB
+.Xr dd 1
+read against each non-EXCLUDED drive
+.Pq about 10s per drive .
+The measurement is page-cache-aware on macOS — trust the relative
+ordering between drives, not absolute MB/s figures.
 .It Cm list Op Fl -all-users
 Every entry in
 .Va OFFLOAD_TARGETS
@@ -153,6 +184,15 @@ honors
 without admin gating (read-only).
 Defaults to
 .Pa $HOME .
+.It Fl -benchmark
+.Cm drives
+only. Run a 1 GB
+.Xr dd 1
+read against each non-EXCLUDED drive and report rough MB/s. Cache-
+aware on macOS; useful for comparing drives, not absolute capacity.
+Adds about 10 seconds per drive. Probe files
+.Pq Pa .offload-benchmark-probe-1g
+are left on each drive for reproducible re-runs.
 .It Fl -all-users
 .Cm list
 only. Iterate every real macOS user account and emit per-user
@@ -328,8 +368,17 @@ Destination conflict; manual review required.
 .Sh SEE ALSO
 .Xr rsync 1 ,
 .Xr tmutil 8 ,
+.Xr diskutil 8 ,
+.Xr dd 1 ,
 .Xr ln 1 ,
 .Xr launchctl 1
+.Pp
+For cross-drive deduplication, consider installing
+.Xr jdupes 1
+.Pq Cm brew install jdupes .
+Future versions of
+.Nm
+may integrate it directly; for now it is a separate tool.
 .Sh AUTHORS
 Maintained in the Sage-is/homebrew-apps tap.
 Bug reports:

@@ -26,6 +26,12 @@
 #   status              disk free + recent log + admin todo
 #   list                every entry in OFFLOAD_TARGETS with its current state
 #   checklist           generated progress checklist (live from OFFLOAD_TARGETS)
+#   drives [--benchmark]  scan /Volumes/*, classify HOT/COLD/EXCLUDED by
+#                       heuristics from `diskutil info`, print a table plus
+#                       a "Detected:" footer. Read-only: never auto-writes
+#                       ~/.config/offload/offload.conf — user copies the
+#                       suggested lines themselves. --benchmark adds a
+#                       timed dd-read speed column (~10s per drive).
 #   launch <App>        guarded launch (refuses if symlink target unmounted)
 #   move <Label> [--apply]                       offload one entry by label
 #   move <category> [--apply]                    offload every entry in a category
@@ -85,6 +91,9 @@
 #                            sudo offload list --all-users
 #                          List is read-only; running it under sudo does
 #                          not violate the "never sudo from inside" rule.
+#   --benchmark            (drives only) measure read throughput per drive
+#                          via a 100 MB timed dd read. ~5-10s/drive.
+#                          Opt-in; no I/O without this flag.
 #   --apply                actually mutate. Without it, every move is a
 #                          dry-run that prints intent only.
 #
@@ -205,7 +214,7 @@
 
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 
 # ----------------------------------------------------------------------------
 # Defaults
@@ -318,6 +327,7 @@ fi
 TARGET_HOME="$HOME"
 DRY=1
 LIST_ALL_USERS=0
+BENCHMARK=0
 DATE_TAG="$(date +%Y-%m-%d)"
 LOG="$HOME/offload-$DATE_TAG.log"
 ADMIN_TODO="$HOME/offload-admin-todo.txt"
@@ -1002,6 +1012,212 @@ cmd_protected() {
 }
 
 # ----------------------------------------------------------------------------
+# Subcommand: drives — auto-detect external drives, classify HOT/COLD
+# ----------------------------------------------------------------------------
+
+# Returns 0 if the mount-point houses a Time Machine backup.
+# Detection is filesystem-evidence + tmutil, not name-based: a drive
+# accidentally named "TM" or "backup" is NOT excluded; only macOS-
+# recognized TM destinations or backup directories are.
+is_time_machine() {
+  local mp="$1"
+  # Old-style.
+  [[ -d "$mp/Backups.backupdb" ]] && return 0
+  # APFS-era .timemachine snapshot directory.
+  [[ -d "$mp/.com.apple.TimeMachine.snapshots" ]] && return 0
+  # Modern TM creates this guard dir at the destination root.
+  [[ -d "$mp/.com.apple.TimeMachine.IOCheck" ]] && return 0
+  # tmutil is the canonical source of truth for "this is a TM destination".
+  if command -v tmutil >/dev/null 2>&1; then
+    tmutil destinationinfo 2>/dev/null \
+      | awk -F': *' '$1 ~ /^Mount Point/ {print $2}' \
+      | grep -qxF "$mp" && return 0
+  fi
+  return 1
+}
+
+# Read a single field from `diskutil info <mount>` output.
+# Field names are matched verbatim against diskutil's "Field Name:" prefix.
+# Subshell + `set +e` so a non-zero diskutil exit (invalid path, missing
+# attribute) cleanly yields empty output instead of crashing the script.
+diskutil_field() (
+  set +e
+  set +o pipefail
+  local mp="$1" field="$2"
+  diskutil info "$mp" 2>/dev/null \
+    | awk -F: -v f="$field" 'index($0, f":") {sub(/^[ \t]+/, "", $2); print $2; exit}'
+)
+
+# Optional throughput benchmark. Times reading 100 MB sequentially.
+# Only runs when --benchmark is set; otherwise this helper is unused.
+benchmark_read() (
+  set +e
+  set +o pipefail
+  local mp="$1"
+  # macOS BSD `dd` has no cache-bypass (no GNU iflag=direct), and `purge`
+  # needs sudo. We use a 1 GB probe so the macOS page cache can't fully
+  # hold it — first read hits disk for most of the file, subsequent reads
+  # are increasingly cache-warm. Reported speeds are rough; the *relative*
+  # ordering of drives is the meaningful signal, not absolute MB/s.
+  local probe="$mp/.offload-benchmark-probe-1g"
+  if [[ ! -f "$probe" ]]; then
+    if ! dd if=/dev/zero of="$probe" bs=1M count=1024 2>/dev/null; then
+      echo "n/a (write failed)"
+      return 0
+    fi
+  fi
+  local out bps
+  out=$(dd if="$probe" of=/dev/null bs=1M count=1024 2>&1 | tail -1)
+  bps=$(echo "$out" | sed -nE 's/.*\(([0-9]+) bytes\/sec\).*/\1/p')
+  if [[ -n "$bps" && "$bps" -gt 0 ]]; then
+    printf '%d MB/s' "$((bps / 1000000))"
+  else
+    echo "n/a"
+  fi
+)
+
+# Classify a single mount. Outputs "ROLE|REASON" on stdout.
+# ROLE in {HOT, COLD, EXCLUDED, UNKNOWN}.
+detect_role() {
+  local mp="$1"
+
+  if is_time_machine "$mp"; then
+    echo "EXCLUDED|Time Machine backup present"
+    return 0
+  fi
+
+  # Read-only check via mount(8) flags.
+  if mount | grep -F " on $mp " | grep -q "read-only"; then
+    echo "EXCLUDED|read-only mount"
+    return 0
+  fi
+
+  local solid loc fs
+  solid="$(diskutil_field "$mp" "Solid State")"
+  loc="$(diskutil_field "$mp" "Device Location")"
+  fs="$(diskutil_field "$mp" "File System Personality")"
+
+  # Only consider externals for HOT/COLD; internals are the boot drive.
+  if [[ "$loc" != "External" ]]; then
+    echo "EXCLUDED|internal drive (not an offload target)"
+    return 0
+  fi
+
+  if [[ "$solid" == "Yes" ]]; then
+    echo "HOT|External SSD + $fs"
+    return 0
+  fi
+
+  if [[ "$solid" == "No" || "$solid" == "Info not available" ]]; then
+    if [[ "$fs" == *HFS+* ]]; then
+      echo "COLD|HFS+ + spinner + external"
+    else
+      echo "COLD|spinner + external"
+    fi
+    return 0
+  fi
+
+  echo "UNKNOWN|no Solid State info from diskutil"
+}
+
+cmd_drives() {
+  local hdr_extra=""
+  (( BENCHMARK == 1 )) && hdr_extra="  SPEED"
+
+  printf '%-28s %-7s %-6s %-5s %-7s %-9s%s  %s\n' \
+    DRIVE FS SOLID PROT FREE ROLE "$hdr_extra" REASON
+  printf '%-28s %-7s %-6s %-5s %-7s %-9s%s  %s\n' \
+    ---- -- ----- ---- ---- ---- "${hdr_extra:+      }" ------
+
+  local detected_hot="" detected_cold=""
+
+  # Pre-compute the mount table so we can skip pseudo-entries like
+  # /Volumes/com.apple.TimeMachine.localsnapshots (a magic directory that
+  # is not a mount point and makes `diskutil info` return non-zero).
+  local mount_table; mount_table="$(mount)"
+
+  for mp in /Volumes/*; do
+    [[ -d "$mp" ]] || continue
+    # Only inspect real mount points.
+    grep -qF " on $mp " <<<"$mount_table" || continue
+
+    local name fs solid proto free role reason speed=""
+    name="$(basename "$mp")"
+    fs="$(diskutil_field "$mp" "File System Personality")"
+    solid="$(diskutil_field "$mp" "Solid State")"
+    proto="$(diskutil_field "$mp" "Protocol")"
+    free="$(df -h "$mp" 2>/dev/null | awk 'NR==2 {print $4}')"
+
+    IFS='|' read -r role reason < <(detect_role "$mp")
+
+    # Truncate to keep the table aligned.
+    [[ ${#name}  -gt 26 ]] && name="${name:0:25}…"
+    case "$fs" in
+      *APFS*) fs="APFS" ;;
+      *HFS+*|*"HFS Plus"*) fs="HFS+" ;;
+    esac
+    case "$solid" in Yes) solid="yes" ;; No) solid="no" ;; *) solid="-" ;; esac
+    case "$proto" in USB) proto="USB" ;; Thunderbolt) proto="TB" ;; *) proto="${proto:0:5}" ;; esac
+
+    if (( BENCHMARK == 1 )); then
+      if [[ "$role" == "EXCLUDED" ]]; then
+        speed="  -"
+      else
+        speed="  $(benchmark_read "$mp")"
+      fi
+    fi
+
+    printf '%-28s %-7s %-6s %-5s %-7s %-9s%s  %s\n' \
+      "$name" "$fs" "$solid" "$proto" "${free:--}" "$role" "$speed" "$reason"
+
+    # Track the first detected of each role for the "Detected:" footer.
+    [[ -z "$detected_hot"  && "$role" == "HOT"  ]] && detected_hot="$mp"
+    [[ -z "$detected_cold" && "$role" == "COLD" ]] && detected_cold="$mp"
+  done
+
+  echo ""
+  echo "Detected:"
+  echo "  OFFLOAD_HOT=\"${detected_hot:-<none>}\""
+  echo "  OFFLOAD_COLD=\"${detected_cold:-<none>}\""
+  echo ""
+  echo "Current config ($OFFLOAD_CONF):"
+  local cfg_status=""
+  if [[ -f "$OFFLOAD_CONF" ]]; then
+    if [[ -n "$OFFLOAD_HOT" ]]; then
+      cfg_status="$([[ "$OFFLOAD_HOT" == "$detected_hot" ]] && echo '✓ matches' || echo '✗ differs from detection')"
+      echo "  OFFLOAD_HOT=\"$OFFLOAD_HOT\"   $cfg_status"
+    else
+      echo "  OFFLOAD_HOT not set"
+    fi
+    if [[ -n "$OFFLOAD_COLD" ]]; then
+      cfg_status="$([[ "$OFFLOAD_COLD" == "$detected_cold" ]] && echo '✓ matches' || echo '✗ differs from detection')"
+      echo "  OFFLOAD_COLD=\"$OFFLOAD_COLD\"  $cfg_status"
+    else
+      echo "  OFFLOAD_COLD not set"
+    fi
+  else
+    echo "  (config file not found — using built-in defaults)"
+  fi
+  echo ""
+  echo "To persist detection, append to $OFFLOAD_CONF:"
+  [[ -n "$detected_hot"  ]] && echo "  echo 'OFFLOAD_HOT=\"$detected_hot\"' >> $OFFLOAD_CONF"
+  [[ -n "$detected_cold" ]] && echo "  echo 'OFFLOAD_COLD=\"$detected_cold\"' >> $OFFLOAD_CONF"
+  echo ""
+  if (( BENCHMARK == 1 )); then
+    echo ""
+    echo "SPEED column is a rough 1 GB read against each drive. macOS lacks"
+    echo "a userspace cache-bypass, so absolute MB/s can be inflated by the"
+    echo "page cache — trust the *relative* ordering of drives, not absolute"
+    echo "numbers. Probe files (.offload-benchmark-probe-1g) are left on each"
+    echo "drive so a second run is reproducible; delete them when you're done."
+  fi
+
+  echo ""
+  echo "Note: for cross-drive deduplication, consider installing jdupes:"
+  echo "  brew install jdupes"
+}
+
+# ----------------------------------------------------------------------------
 # help — extracted from header (no duplication)
 # ----------------------------------------------------------------------------
 
@@ -1019,6 +1235,7 @@ main() {
     case "$1" in
       --target-home) TARGET_HOME="$2"; shift 2 ;;
       --all-users)   LIST_ALL_USERS=1; shift ;;
+      --benchmark)   BENCHMARK=1; shift ;;
       *)             args+=("$1"); shift ;;
     esac
   done
@@ -1031,6 +1248,7 @@ main() {
     status)                    cmd_status ;;
     list)                      cmd_list ;;
     checklist)                 cmd_checklist ;;
+    drives)                    cmd_drives ;;
     relocations|media-libraries|media) cmd_relocations ;;
     launch)                    cmd_launch "$@" ;;
     move)                      cmd_move "$@" ;;
