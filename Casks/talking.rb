@@ -1,6 +1,6 @@
 cask "talking" do
-  version "1.1.0"
-  sha256 "30ec3fe2353e06b497130d8028d198a517dd80bd188f4823e246c1f81d3db309"
+  version "1.2.0"
+  sha256 "355f0db0c6e0ce02f0f123f0875a80ccfc040365b4164b754fd47e7e246a18f8"
 
   url "https://github.com/opencoca/local-whisper/releases/download/v#{version}/Talking-#{version}.dmg"
   name "Sage.is Talking"
