@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# storyboarder — Sage-is tap launcher for opencoca/MEDIA-Storyboarder.
+# Runs the packaged app from a pinned release tag via uv. The first launch
+# resolves + builds the environment (cached); every launch after is instant.
+# Make any movie a comic. Make any comic a movie.
+set -euo pipefail
+
+LAUNCHER_VERSION="0.1.0"
+# The app release this launcher pins. Bump alongside the formula on each
+# Storyboarder release; override at runtime with STORYBOARDER_REF=...
+APP_REF="${STORYBOARDER_REF:-v2.0.0-alpha.2}"
+APP_SRC="git+https://github.com/opencoca/MEDIA-Storyboarder@${APP_REF}"
+
+usage() {
+  cat <<EOF
+storyboarder — make any movie a comic, any comic a movie
+
+  storyboarder            launch the app (opens your browser)
+  storyboarder start      same as above
+  storyboarder version    launcher + pinned app version
+  storyboarder help       this message
+
+Runs ${APP_REF} via uv (deps cached after the first launch). Needs ffmpeg;
+yt-dlp enables the paste-a-link path. Pin another build: STORYBOARDER_REF=...
+Skip the browser auto-open: STORYBOARDER_NO_BROWSER=1
+EOF
+}
+
+case "${1:-start}" in
+  start|"")             exec uvx --from "$APP_SRC" storyboarder ;;
+  version|-v|--version) echo "storyboarder launcher v${LAUNCHER_VERSION} → app ${APP_REF}" ;;
+  help|-h|--help)       usage ;;
+  *) echo "storyboarder: unknown command '$1'" >&2; usage >&2; exit 1 ;;
+esac
