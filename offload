@@ -297,17 +297,14 @@ DEFAULT_OFFLOAD_TARGETS=(
 # Build-cruft find patterns (used by sweep strategy)
 SWEEP_DIRNAMES=(node_modules .venv venv target build dist __pycache__ .next)
 
-OFFLOAD_TARGETS=()
+# Pre-seed with defaults so a config using OFFLOAD_TARGETS+=(...) extends
+# the built-in list, while OFFLOAD_TARGETS=(...) still fully replaces it.
+OFFLOAD_TARGETS=("${DEFAULT_OFFLOAD_TARGETS[@]}")
 
 # Source user config if it exists.
 if [[ -f "$OFFLOAD_CONF" ]]; then
   # shellcheck disable=SC1090
   source "$OFFLOAD_CONF"
-fi
-
-# Fall back to defaults if config didn't populate.
-if [[ ${#OFFLOAD_TARGETS[@]} -eq 0 ]]; then
-  OFFLOAD_TARGETS=("${DEFAULT_OFFLOAD_TARGETS[@]}")
 fi
 
 # Legacy compatibility: if config still uses OFFLOAD_APPS (v0.1.x schema)
@@ -388,7 +385,11 @@ require_free() {
 
 manual_step() {
   log "  [MANUALLY] $1"
-  [[ $DRY -eq 0 && -t 0 ]] && read -r -p "  Press Enter when done (Ctrl-C to abort): "
+  # Guarded prompt: the if-form returns 0 when skipped (dry-run or no tty);
+  # a bare `[[ ]] && read` returns 1 there and set -e kills the script.
+  if [[ $DRY -eq 0 && -t 0 ]]; then
+    read -r -p "  Press Enter when done (Ctrl-C to abort): "
+  fi
 }
 
 do_run() {
@@ -410,7 +411,10 @@ tree_signature() {
   local p="$1"
   [[ -d "$p" ]] || { echo "files=0 bytes=0"; return; }
   local f; f="$(find "$p" -type f 2>/dev/null | wc -l | tr -d ' ')"
-  local b; b="$(du -sk "$p" 2>/dev/null | awk '{print $1*1024}')"
+  # Sum logical file sizes (stat %z), NOT du allocated blocks: allocation
+  # differs across volumes (sparse files, block slack) even when the copy
+  # is byte-identical, which made verify fail on every cross-volume move.
+  local b; b="$(find "$p" -type f -exec stat -f %z {} + 2>/dev/null | awk '{s+=$1} END {print s+0}')"
   echo "files=$f bytes=$b"
 }
 
