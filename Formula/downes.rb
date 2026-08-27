@@ -17,12 +17,12 @@
 class Downes < Formula
   desc "Course-design studio for teachers, on Sage.is AI-UI mini"
   homepage "https://sage.is/downes"
-  version "0.1.2"
+  version "0.1.3"
   license "AGPL-3.0-or-later"
 
   on_arm do
-    url "https://github.com/Sage-is/AI-Education-Downes/releases/download/v0.1.2/downes-0.1.2-darwin-arm64.tar.gz"
-    sha256 "ebcfff813c3c17d3ae4681e7e8fc582e63d00ba6e8852d2c02573dd07c241844"
+    url "https://github.com/Sage-is/AI-Education-Downes/releases/download/v0.1.3/downes-0.1.3-darwin-arm64.tar.gz"
+    sha256 "664885e80f450efef75c8b23b0d28e1fcafb826c6bf5bf81ced1a99e613f9c1a"
   end
 
   # Intel is not built yet. The Rust toolchain on the release machine has only
@@ -54,34 +54,25 @@ class Downes < Formula
     prefix.install_symlink libexec/"Downes.app"
   end
 
-  # Put a clickable app in ~/Applications, which Finder, Spotlight and
-  # Launchpad all index alongside /Applications — and which needs no sudo.
-  # /Applications itself is root-owned, so a formula cannot write there.
-  #
-  # A symlink is safe here: the app canonicalizes its own executable path
-  # before locating the engine, so it resolves back into libexec rather than
-  # searching beside the symlink. Upgrades follow automatically.
-  def post_install
-    apps = Pathname.new(Dir.home)/"Applications"
-    apps.mkpath
-    link = apps/"Downes.app"
-    link.unlink if link.symlink? || link.exist?
-    link.make_symlink(opt_prefix/"Downes.app")
-  end
-
+  # There is deliberately no post_install placing the app in ~/Applications.
+  # It cannot work: Homebrew replaces HOME with a temp directory it later
+  # deletes, and runs post_install in a sandbox that permits writes only under
+  # the formula prefix. The symlink reports success and creates nothing — a
+  # step that lies is worse than no step. launcher/downes.sh does it instead,
+  # where there is a real HOME and no sandbox, so running `downes` once from a
+  # terminal places the app. The caveat below covers everyone else.
   def caveats
     <<~EOS
-      Downes is installed and ready. You'll find it here:
-
-        ~/Applications/Downes.app
-
-      Or run it from a terminal:
+      Downes is installed. Run it once from a terminal:
 
         downes
 
-      To put it in the main /Applications folder instead (you'll need your password):
+      That also puts a clickable Downes in ~/Applications, which Finder,
+      Spotlight and Launchpad index alongside /Applications.
 
-        sudo ln -sfn #{opt_prefix}/Downes.app /Applications/Downes.app
+      Prefer to place it yourself? No password needed:
+
+        mkdir -p ~/Applications && ln -sfn "#{opt_prefix}/Downes.app" ~/Applications/Downes.app
 
       Your courses live in ~/Downes. Downes works in that one folder.
     EOS
