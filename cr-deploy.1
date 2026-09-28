@@ -1,0 +1,196 @@
+.\" cr-deploy(1) manpage — mdoc format
+.Dd September 27, 2026
+.Dt CR-DEPLOY 1
+.Os
+.Sh NAME
+.Nm cr-deploy
+.Nd deploy to CapRover from the terminal, by digest, and check it worked
+.Sh SYNOPSIS
+.Nm
+.Ar COMMAND
+.Op Ar args ...
+.Sh DESCRIPTION
+.Nm
+drives a CapRover captain from the terminal: it reads the cluster,
+registers apps, deploys images, follows builds, and rolls back.
+.Fl h
+and
+.Fl -help
+print usage and the list of commands.
+.Pp
+It logs in with the
+.Cm caprover
+CLI's saved token at
+.Pa ~/.config/configstore/caprover.json
+and writes a refreshed token back in the same shape. The password is
+asked for in the terminal, used once, and never stored.
+.Pp
+Images deploy by digest only. CapRover can keep serving a stale image
+after a redeploy of the same tag, so a tag is never trusted. An image
+named
+.Sy img-captain--*
+is also accepted: those are the captain's own builds, one tag per
+version, and are never reused.
+.Sh COMMANDS
+.Bl -tag -width 24n
+.It Cm info
+The captain: version, system information, and the cluster summary as
+JSON.
+.It Cm nodes
+The cluster's nodes, one per line: node id, type, IP, state, hostname.
+.It Cm apps Op Ar NAME
+Apps with their node, storage, domains, and image. Secrets are hidden.
+Storage reads
+.Sy volume ,
+.Sy bind ,
+or
+.Sy NONE
+from the app's volumes and its bind mounts. A bind mount is a host
+folder mounted through the dashboard's Service Update Override; it is
+read out of the override's TaskTemplate and survives a full replace.
+With
+.Ar NAME ,
+one app is printed in full: port, instances, forceSsl, websocket
+support, domains, volumes, bind mounts, and hidden env. An app with no
+volume and no bind mount draws a warning that a redeploy starts with an
+empty disk.
+.Fl -json
+emits the same fields as JSON, plus a
+.Sy keeps_data
+flag.
+.It Cm ensure Ar FILE Op Fl -dry-run
+Create or converge one app from an instance file.
+.Fl -dry-run
+prints the diff and stops. A key the file leaves
+out keeps its live value, because the captain's update is a full
+replace: the live definition is posted back with only the named keys
+changed, so overrides such as bind mounts survive. With
+.Ev CLOUDFLARE_API_TOKEN
+set,
+.Nm
+also points the domain's DNS at the captain.
+.Pp
+Instance files are YAML with the keys
+.Sy app ,
+.Sy node
+.Po a node id, or
+.Sq none
+to let Swarm place it
+.Pc ,
+.Sy domain ,
+.Sy https ,
+.Sy port ,
+.Sy instances ,
+.Sy force_ssl ,
+.Sy websocket ,
+.Sy description ,
+.Sy volumes ,
+.Sy env ,
+.Sy env_from_environment ,
+.Sy env_remove ,
+.Sy dns .
+.It Cm deploy Ar FILE Ar TAR Oo Fl -verify Ar URL Oc Oo Fl -expect Ar KEY=VALUE Oc Oo Fl -health Ar URL Oc
+Build a source tarball on the captain. The app name comes from the
+instance file; the tarball is uploaded and built on the captain, and the
+build log is followed to its end.
+.Ev GIT_HASH
+is recorded with the build.
+The
+.Fl -verify , -expect
+and
+.Fl -health
+checks work as for
+.Cm deploy-image .
+.It Cm deploy-image Ar NAME Ar IMAGE@sha256:...
+.Op Fl -verify Ar URL
+.Op Fl -expect Ar KEY=VALUE
+.Op Fl -health Ar URL
+Deploy a pinned image. A tag is refused. With
+.Fl -verify
+and
+.Fl -expect ,
+or
+.Fl -health ,
+the app is polled for up to 300 seconds after the build, and the exit
+status is non-zero if it never answers.
+.Fl -verify
+takes a JSON URL to poll.
+.Fl -expect
+takes the
+.Sy KEY=VALUE
+that URL must answer.
+.Fl -health
+takes a URL that must answer 200.
+.It Cm rollback Ar NAME
+Run the version before the current one again. The newest version older
+than the running one is redeployed by its digest.
+.It Cm logs Ar NAME
+The last build log.
+.It Cm wait Ar NAME
+Follow a running build to its end. Exits non-zero when the build fails.
+.It Cm delete Ar NAME Op Fl -volumes
+Remove an app. It asks first, and the app name must be typed to confirm.
+With
+.Fl -volumes ,
+the app's named volumes are deleted too.
+.El
+.Sh FILES
+.Bl -tag -width 36n
+.It Pa ~/.config/configstore/caprover.json
+The
+.Cm caprover
+CLI's token store. Read for the machine's base URL and token, and
+rewritten with a refreshed token after login. Mode 600.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width 24n
+.It Ev CAPTAIN_NAME
+The CapRover machine to act on. Defaults to
+.Sy captain-01 .
+.Ev CAPROVER_NAME
+is read as well, and takes effect when
+.Ev CAPTAIN_NAME
+is unset.
+.It Ev CAPROVER_URL
+Base URL for a machine that is not in the token store.
+.It Ev CAPROVER_PASSWORD
+The captain password. When unset, it is asked for in the terminal.
+.It Ev CAPROVER_OTP_TOKEN
+The one-time code for a captain with two-factor turned on.
+.It Ev CLOUDFLARE_API_TOKEN
+When set,
+.Cm ensure
+points the domain's record at the captain.
+.It Ev GIT_HASH
+Recorded with a
+.Cm deploy
+build.
+.El
+.Sh EXAMPLES
+.Ss Read the cluster
+.Bd -literal -offset indent
+cr-deploy info
+cr-deploy nodes
+cr-deploy apps
+cr-deploy apps web --json
+.Ed
+.Ss Deploy an app
+.Bd -literal -offset indent
+cr-deploy ensure web.yml --dry-run
+cr-deploy ensure web.yml
+cr-deploy deploy web.yml build.tar
+.Ed
+.Ss Deploy an image and check it
+.Bd -literal -offset indent
+cr-deploy deploy-image web registry.example.com/web@sha256:1f2e... \\
+  --verify https://web.example.com/version --expect version=3.2.0
+cr-deploy deploy-image web registry.example.com/web@sha256:1f2e... \\
+  --health https://web.example.com/healthz
+.Ed
+.Ss Roll back
+.Bd -literal -offset indent
+cr-deploy rollback web
+.Ed
+.Sh SEE ALSO
+.Xr caprover 1 ,
+.Xr docker 1

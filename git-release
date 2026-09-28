@@ -14,6 +14,7 @@
 #
 set -euo pipefail
 
+VERSION="1.0.0"
 INTERACTIVE=false
 TYPE=""
 VER=""
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
 			fi
 			shift 2
 			;;
+		version|--version) echo "git-release v$VERSION"; exit 0 ;;
 		-h|--help)
 			echo "Usage: $0 [-i] <patch|minor|major|hotfix|custom VERSION>"
 			echo ""

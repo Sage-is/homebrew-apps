@@ -4,7 +4,7 @@ cask "todoscope" do
 
   url "https://github.com/Startr/TodoScope/releases/download/v#{version}/TodoScope-v#{version}.dmg"
   name "TodoScope"
-  desc "See every TODO across all your repos — kanban board from TODO.md and inline comments"
+  desc "See every TODO across your repos as a kanban board"
   homepage "https://github.com/Startr/TodoScope"
 
   livecheck do
@@ -30,8 +30,8 @@ cask "todoscope" do
 
   zap trash: [
     "~/.todoscope",
-    "~/Library/WebKit/com.startr.todoscope",
     "~/Library/Caches/com.startr.todoscope",
     "~/Library/Saved Application State/com.startr.todoscope.savedState",
+    "~/Library/WebKit/com.startr.todoscope",
   ]
 end

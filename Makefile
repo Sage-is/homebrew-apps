@@ -24,7 +24,7 @@
 # runs `make distribution_sync` to re-establish.
 -include distribution.env
 
-GIT_TAG     := $(shell git tag --sort=-v:refname | sed 's/^v//' | head -n 1)
+GIT_TAG     := $(shell git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1)
 IMAGE_TAG   := $(if $(GIT_TAG),$(GIT_TAG),0.0.0)
 GIT_BRANCH  := $(shell git rev-parse --abbrev-ref HEAD)
 FORMULA     := Formula/ai-ui.rb
@@ -94,7 +94,7 @@ endef
 # Commit sha256 on master, then sync to develop.
 # Must be called while on master.
 define commit_sha256_and_sync
-	NEW_TAG=$$(git tag --sort=-v:refname | head -1); \
+	NEW_TAG=$$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1); \
 	git add $(FORMULA) $$(ls Formula/ai-ui@*.rb 2>/dev/null) && \
 	git commit -m "Update sha256 for $$NEW_TAG" && \
 	git push origin master && \
@@ -130,7 +130,10 @@ help:
 	@echo "  feature_finish      Finish feature: merge into develop, push"
 	@echo "  release_finish      Finish release: merge, tag, push, sha256"
 	@echo "  hotfix_finish       Finish hotfix: merge, tag, push, sha256"
-	@echo "  test                Run brew audit and test on formula"
+	@echo "  test                brew style, audit and test, plus the tools' unit tests"
+	@echo "  tool_release        Release one formula (TOOL=x VERSION=y; dry run unless APPLY=1)"
+	@echo "  release_tools       Release every formula that is behind (dry run unless APPLY=1)"
+	@echo "  rename_projects     Move renamed projects: repo, remote, folder, memory (APPLY=1)"
 	@echo ""
 
 show-version:
@@ -176,18 +179,29 @@ sha256:
 	@sed -i '' 's/sha256 ".*"/sha256 "$(HASH)"/' $(FORMULA)
 	@echo "Updated $(FORMULA)"
 
+tool_release:  ## Release one formula: TOOL=offload VERSION=0.7.0 (dry run unless APPLY=1)
+	@scripts/tool-release.sh $(if $(APPLY),--apply,--dry-run) $(TOOL) $(VERSION)
+
+release_tools:  ## Release every formula that is behind, then retire old ~/bin copies (dry run unless APPLY=1)
+	@scripts/release-tools.sh $(if $(APPLY),--apply,--dry-run)
+
+rename_projects:  ## Move renamed projects: GitHub repo, remote, folder, Claude memory (dry run unless APPLY=1)
+	@scripts/rename-projects.sh $(if $(APPLY),--apply,--dry-run)
+
 # ---------------------------------------------------------------------------
 # Testing
 # ---------------------------------------------------------------------------
 test:
+	brew style Formula Casks
 	brew audit --formula $(FORMULA)
 	brew test ai-ui
+	cd tests && python3 -m unittest -q
 
 # ---------------------------------------------------------------------------
 # Interactive release (full flow)
 # ---------------------------------------------------------------------------
 release:
-	@scripts/release.sh
+	@./git-release
 
 # ---------------------------------------------------------------------------
 # Release start targets
@@ -198,7 +212,7 @@ release:
 minor_release: require_gitflow_next
 	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
 	@$(HELPERS) && \
-	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2+1".0"}') && \
+	NEW_VER=$$(git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2+1".0"}') && \
 	git flow release start $$NEW_VER && \
 	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
 	bump_version $$NEW_VER && \
@@ -211,7 +225,7 @@ minor_release: require_gitflow_next
 patch_release: require_gitflow_next
 	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
 	@$(HELPERS) && \
-	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2"."$$3+1}') && \
+	NEW_VER=$$(git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2"."$$3+1}') && \
 	git flow release start $$NEW_VER && \
 	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
 	bump_version $$NEW_VER && \
@@ -224,7 +238,7 @@ patch_release: require_gitflow_next
 major_release: require_gitflow_next
 	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
 	@$(HELPERS) && \
-	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1+1".0.0"}') && \
+	NEW_VER=$$(git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1+1".0.0"}') && \
 	MAJOR=$$(echo $$NEW_VER | awk -F'.' '{print $$1}') && \
 	git flow release start $$NEW_VER && \
 	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
@@ -239,7 +253,7 @@ major_release: require_gitflow_next
 hotfix: require_gitflow_next
 	@-$(MAKE) check_upstream  # advisory only; hotfix_finish is the real gate
 	@$(HELPERS) && \
-	NEW_VER=$$(git tag --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{if (NF < 4) print $$1"."$$2"."$$3".1"; else print $$1"."$$2"."$$3"."$$4+1}') && \
+	NEW_VER=$$(git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{if (NF < 4) print $$1"."$$2"."$$3".1"; else print $$1"."$$2"."$$3"."$$4+1}') && \
 	git flow hotfix start $$NEW_VER && \
 	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
 	bump_version $$NEW_VER && \

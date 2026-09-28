@@ -8,9 +8,10 @@ cask "mini" do
   homepage "https://sage.is/mini"
 
   depends_on arch: :arm64
-
   # The bundle is self-contained: engine, sandbox profile and curriculum
   # template all live in Contents/Resources, so the app works wherever it lands.
+  depends_on :macos
+
   app "SAGE.IS mini.app"
   binary "#{appdir}/SAGE.IS mini.app/Contents/Resources/launcher/downes.sh", target: "mini"
 
@@ -24,7 +25,8 @@ cask "mini" do
     Dir.glob("#{appdir}/*.app").each do |bundle|
       base = File.basename(bundle)
       next if base == "SAGE.IS mini.app"
-      FileUtils.rm_rf(bundle) if base.downcase == "sage.is mini.app"
+
+      FileUtils.rm_r(bundle) if base.downcase == "sage.is mini.app"
     end
   end
 
@@ -38,7 +40,7 @@ cask "mini" do
   # need for this block entirely.
   postflight do
     system_command "/usr/bin/xattr",
-                   args: ["-d", "-r", "com.apple.quarantine", "#{appdir}/SAGE.IS mini.app"],
+                   args:         ["-d", "-r", "com.apple.quarantine", "#{appdir}/SAGE.IS mini.app"],
                    must_succeed: false
   end
 

@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""cr-deploy: deploy to CapRover from the terminal, by digest, and check it worked.
+
+    cr-deploy version                     this tool's version
+    cr-deploy info                        the captain
+    cr-deploy nodes                       the cluster's nodes
+    cr-deploy apps [NAME] [--json]        apps: node, storage, domains, image; secrets hidden
+    cr-deploy ensure FILE [--dry-run]     create or converge one app from an instance file
+    cr-deploy deploy FILE TAR             build a source tarball on the captain
+    cr-deploy deploy-image NAME IMAGE@sha256:... [--verify URL --expect KEY=VALUE] [--health URL]
+    cr-deploy rollback NAME               run the version before the current one again
+    cr-deploy logs NAME                   the last build log
+    cr-deploy wait NAME                   follow a running build to its end
+    cr-deploy delete NAME [--volumes]     remove an app (asks first)
+
+It logs in with the `caprover` CLI's saved token (~/.config/configstore/caprover.json)
+and writes a refreshed token back in the same shape. The password is asked for in
+the terminal, used once, and never stored. CAPTAIN_NAME picks the machine.
+
+Images deploy by digest only: CapRover can keep serving a stale image after a
+redeploy of the same tag.
+
+Instance files (YAML): app, node (a node id, or "none" to let Swarm place it),
+domain, https, port, instances, force_ssl, websocket, description, volumes,
+env, env_from_environment, env_remove, dns. A key the file leaves out keeps its
+live value. The captain's update is a full replace, so `ensure` posts the live
+definition with only the named keys changed; overrides such as bind mounts
+survive. With CLOUDFLARE_API_TOKEN set, `ensure` also points the domain's DNS
+at the captain.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import ipaddress
+import json
+import mimetypes
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+VERSION = "0.1.0"
+STORE = Path.home() / ".config" / "configstore" / "caprover.json"
+API = "/api/v2"
+SECRET_KEYS = ("PASSWORD", "SECRET", "KEY", "TOKEN")
+OK = 100
+DEPLOY_STARTED = 101  # a detached upload answers this, not 100
+PARTIAL = 102  # done, with a caveat in the description (e.g. a volume still in use was not deleted)
+TOKEN_BAD = (1106, 1105, 1101)  # corrupted, expired, missing
+
+
+class ApiError(RuntimeError):
+    def __init__(self, status, description):
+        super().__init__(f"CapRover {status}: {description}")
+        self.status = status
+
+
+# --- the login the CLI keeps ---------------------------------------------------
+
+
+def load_store() -> dict:
+    if STORE.exists():
+        return json.loads(STORE.read_text())
+    return {"CapMachines": [], "DeployedDirs": []}
+
+
+def machine(name: str) -> dict:
+    for m in load_store().get("CapMachines", []):
+        if m.get("name") == name:
+            return m
+    url = os.environ.get("CAPROVER_URL")
+    if not url:
+        sys.exit(f"no CapRover machine named {name!r} in {STORE}; run `caprover login` once, or set CAPROVER_URL")
+    return {"name": name, "baseUrl": url.rstrip("/"), "authToken": ""}
+
+
+def save_token(name: str, base_url: str, token: str) -> None:
+    store = load_store()
+    machines = [m for m in store.get("CapMachines", []) if m.get("name") != name]
+    machines.append({"authToken": token, "baseUrl": base_url, "name": name})
+    store["CapMachines"] = machines
+    STORE.parent.mkdir(parents=True, exist_ok=True)
+    STORE.write_text(json.dumps(store, indent=1))
+    STORE.chmod(0o600)
+
+
+class Captain:
+    def __init__(self, name: str):
+        m = machine(name)
+        self.name, self.base, self.token = name, m["baseUrl"], m.get("authToken", "")
+
+    def _request(self, method: str, path: str, data=None, *, raw=None, content_type=None) -> dict:
+        url = self.base + API + path
+        body = raw if raw is not None else (json.dumps(data).encode() if data is not None else None)
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("x-captain-auth", self.token)
+        req.add_header("x-namespace", "captain")
+        req.add_header("Content-Type", content_type or "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                payload = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, e.read().decode()[:300]) from None
+        if payload.get("status") == PARTIAL:
+            print("captain:", payload.get("description", ""), file=sys.stderr)
+        elif payload.get("status") not in (OK, DEPLOY_STARTED):
+            raise ApiError(payload.get("status"), payload.get("description", ""))
+        return payload.get("data") or {}
+
+    def login(self) -> None:
+        password = os.environ.get("CAPROVER_PASSWORD") or getpass.getpass(f"CapRover password for {self.name} ({self.base}): ")
+        body = {"password": password}
+        otp = os.environ.get("CAPROVER_OTP_TOKEN")
+        if otp:
+            body["otpToken"] = otp
+        try:
+            data = self._request("POST", "/login", body)
+        except ApiError as e:
+            if e.status == 1102 or "otp" in str(e).lower():  # two-factor is on
+                body["otpToken"] = input("one-time code: ").strip()
+                data = self._request("POST", "/login", body)
+            else:
+                raise
+        self.token = data["token"]
+        save_token(self.name, self.base, self.token)
+
+    def call(self, method: str, path: str, data=None, **kw) -> dict:
+        try:
+            return self._request(method, path, data, **kw)
+        except ApiError as e:
+            if e.status in TOKEN_BAD:
+                print(f"token for {self.name} is not valid anymore; logging in", file=sys.stderr)
+                self.login()
+                return self._request(method, path, data, **kw)
+            raise
+
+    def get(self, path: str) -> dict:
+        return self.call("GET", path)
+
+    def post(self, path: str, data: dict) -> dict:
+        return self.call("POST", path, data)
+
+    def upload(self, path: str, filename: str, content: bytes, fields: dict | None = None) -> dict:
+        boundary = uuid.uuid4().hex
+        parts = []
+        for k, v in (fields or {}).items():
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"sourceFile\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: {ctype}\r\n\r\n".encode() + content + b"\r\n"
+        )
+        parts.append(f"--{boundary}--\r\n".encode())
+        return self.call("POST", path, raw=b"".join(parts), content_type=f"multipart/form-data; boundary={boundary}")
+
+
+# --- reading ---------------------------------------------------------------------
+
+
+def hide(env_list: list[dict]) -> list[str]:
+    out = []
+    for e in env_list or []:
+        k = e.get("key", "")
+        out.append(f"{k}=<hidden>" if any(s in k.upper() for s in SECRET_KEYS) else f"{k}={e.get('value', '')}")
+    return out
+
+
+def all_apps(cap: Captain) -> list[dict]:
+    return cap.get("/user/apps/appDefinitions").get("appDefinitions", [])
+
+
+def app_definition(cap: Captain, name: str) -> dict | None:
+    return next((a for a in all_apps(cap) if a.get("appName") == name), None)
+
+
+def bind_mounts(app: dict) -> list[dict]:
+    """Host folders mounted through the dashboard's Service Update Override."""
+    import yaml
+
+    override = yaml.safe_load(app.get("serviceUpdateOverride") or "") or {}
+    mounts = override.get("TaskTemplate", {}).get("ContainerSpec", {}).get("Mounts") or []
+    return [{"source": m.get("Source"), "target": m.get("Target")} for m in mounts if m.get("Type") == "bind"]
+
+
+def deployed_image(app: dict) -> str:
+    current = app.get("deployedVersion")
+    return next((v.get("deployedImageName", "") for v in app.get("versions") or [] if v.get("version") == current), "")
+
+
+def summary(app: dict) -> dict:
+    return {
+        "app": app["appName"],
+        "node": app.get("nodeId") or None,
+        "volumes": [{"volume": v.get("volumeName") or v.get("hostPath"), "path": v.get("containerPath")} for v in app.get("volumes") or []],
+        "bind_mounts": bind_mounts(app),
+        "domains": [c.get("publicDomain") for c in app.get("customDomain") or []],
+        "image": deployed_image(app),
+    }
+
+
+def keeps_data(app: dict) -> bool:
+    """True when the app's data outlives its container: a volume or a bind mount."""
+    s = summary(app)
+    return bool(s["volumes"] or s["bind_mounts"])
+
+
+def show_app(a: dict) -> None:
+    s = summary(a)
+    print(f"{s['app']}: node {s['node'] or 'any (Swarm places it)'} | port {a.get('containerHttpPort')} | instances {a.get('instanceCount')} "
+          f"| forceSsl {a.get('forceSsl')} | websocket {a.get('websocketSupport')}")
+    print("  domains:", s["domains"])
+    print("  volumes:", s["volumes"] or "none")
+    print("  bind mounts:", s["bind_mounts"] or "none")
+    if not keeps_data(a):
+        print("  WARNING: no volume and no bind mount; a redeploy starts with an empty disk")
+    print("  env:", hide(a.get("envVars")))
+    print(f"  deployed: version {a.get('deployedVersion')} | {s['image'] or 'unknown image'}")
+
+
+# --- converging one app from an instance file --------------------------------------
+
+MANAGED = ("containerHttpPort", "instanceCount", "forceSsl", "websocketSupport", "nodeId", "description")
+
+
+def load_instance(path: str) -> dict:
+    import yaml
+
+    spec = yaml.safe_load(Path(path).read_text())
+    for key in ("app", "node"):
+        if not spec.get(key):
+            sys.exit(f"{path}: missing {key!r} (node may be \"none\" to let Swarm place the app)")
+    # No domain means the captain's own subdomain, <app>.<root domain>, which
+    # exists on its own and which the API refuses as a "custom" domain.
+    return spec
+
+
+def env_from(spec: dict, live: dict | None = None) -> list[dict]:
+    """Literal values from the file; secrets by name from the environment.
+
+    A secret missing from the shell but already set on the captain is kept as
+    it is, so a re-run from a fresh shell can finish the domain and https steps
+    without every secret exported again. A secret set nowhere stops the run.
+    """
+    env = []
+    for k, v in (spec.get("env") or {}).items():
+        env.append({"key": k, "value": str(v)})
+    on_captain = {e["key"] for e in (live or {}).get("envVars") or []}
+    missing, kept = [], []
+    for k in spec.get("env_from_environment") or []:
+        v = os.environ.get(k)
+        if v is not None:
+            env.append({"key": k, "value": v})
+        elif k in on_captain:
+            kept.append(k)
+        else:
+            missing.append(k)
+    if missing:
+        sys.exit("set these in the environment first (never in a file in the repo): " + ", ".join(missing))
+    if kept:
+        print("  kept from the captain (not in this shell): " + ", ".join(kept))
+    return env
+
+
+def desired(spec: dict, live: dict) -> dict:
+    """The live definition with only the keys the file names replaced."""
+    want = json.loads(json.dumps(live))
+    named = {
+        "port": ("containerHttpPort", int),
+        "instances": ("instanceCount", int),
+        "force_ssl": ("forceSsl", bool),
+        "websocket": ("websocketSupport", bool),
+        "description": ("description", str),
+    }
+    for key, (field, kind) in named.items():
+        if key in spec:
+            want[field] = kind(spec[key])
+    want["nodeId"] = "" if str(spec["node"]).lower() == "none" else spec["node"]
+    if "volumes" in spec:
+        want["volumes"] = [{"volumeName": v["volume"], "containerPath": v["path"]} for v in spec["volumes"] or []]
+    # env: merge, so a value set by hand in the dashboard survives unless the file names it
+    merged = {e["key"]: e["value"] for e in live.get("envVars") or []}
+    for e in env_from(spec, live):
+        merged[e["key"]] = e["value"]
+    for k in spec.get("env_remove") or []:
+        merged.pop(k, None)
+    want["envVars"] = [{"key": k, "value": v} for k, v in merged.items()]
+    return want
+
+
+def diff(live: dict, want: dict) -> list[str]:
+    lines = []
+    for k in (*MANAGED, "volumes"):
+        if live.get(k) != want.get(k):
+            lines.append(f"  {k}: {live.get(k)!r} -> {want.get(k)!r}")
+    before = {e["key"]: e["value"] for e in live.get("envVars") or []}
+    after = {e["key"]: e["value"] for e in want.get("envVars") or []}
+    for k in sorted(set(before) | set(after)):
+        if before.get(k) != after.get(k):
+            shown = "<hidden>" if any(s in k.upper() for s in SECRET_KEYS) else after.get(k)
+            lines.append(f"  env {k}: {'set' if k in after else 'removed'} {shown if k in after else ''}")
+    return lines
+
+
+# --- Cloudflare DNS, optional -----------------------------------------------------
+
+CF_API = "https://api.cloudflare.com/client/v4"
+
+
+def cf_call(token: str, method: str, path: str, data: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        CF_API + path,
+        data=json.dumps(data).encode("utf-8") if data is not None else None,
+        method=method,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        payload = json.loads(e.read().decode("utf-8") or "{}")
+    if not payload.get("success"):
+        errors = "; ".join(f"{x.get('code')} {x.get('message')}" for x in payload.get("errors") or [])
+        raise RuntimeError(f"Cloudflare {method} {path}: {errors or 'failed'}")
+    return payload
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+class DnsRecord:
+    """One Cloudflare record we manage, with the proxy switch the certificate step needs."""
+
+    def __init__(self, token: str, zone_id: str, record: dict, target: str):
+        self.token, self.zone_id, self.record, self.target = token, zone_id, record, target
+
+    def set_proxied(self, proxied: bool) -> None:
+        want = {k: self.record[k] for k in ("type", "name", "content")} | {"proxied": proxied, "ttl": 1}
+        cf_call(self.token, "PATCH", f"/zones/{self.zone_id}/dns_records/{self.record['id']}", want)
+        self.record["proxied"] = proxied
+
+    def wait_direct(self, timeout_s: int = 300) -> bool:
+        """True once the name resolves to the origin, not to Cloudflare's edge."""
+        import socket
+        deadline = time.time() + timeout_s
+        origin = {ai[4][0] for ai in socket.getaddrinfo(self.target, 80, socket.AF_INET)} if not _is_ip(self.target) else {self.target}
+        while time.time() < deadline:
+            try:
+                now = {ai[4][0] for ai in socket.getaddrinfo(self.record["name"], 80, socket.AF_INET)}
+            except OSError:
+                now = set()
+            if now and now <= origin:
+                return True
+            time.sleep(10)
+        return False
+
+
+def dns_ensure(cap: Captain, spec: dict, *, dry_run: bool) -> DnsRecord | None:
+    """The instance's record in Cloudflare: a proxied CNAME to the captain by default.
+
+    The captain's nginx fronts every app from the captain node, whatever node
+    the app is pinned to. A record aimed anywhere else shows as Cloudflare 522
+    and the captain's domain verification fails (1107). Returns the record when
+    a token manages it, so the certificate step can drop the proxy for a minute.
+    """
+    domain, dns = spec.get("domain") or "", spec.get("dns") or {}
+    if not domain or dns.get("manage") is False:
+        return None
+    target = dns.get("target") or urllib.parse.urlsplit(cap.base).hostname
+    rtype = "A" if _is_ip(target) else "CNAME"
+    proxied = bool(dns.get("proxied", True))
+    token = os.environ.get("CLOUDFLARE_API_TOKEN")
+    if not token:
+        print(f"  dns {domain}: no CLOUDFLARE_API_TOKEN in this shell; by hand it is {rtype} {target}, proxied {proxied}")
+        return None
+    labels = domain.split(".")
+    zone = None
+    for i in range(1, len(labels) - 1):  # longest zone name first
+        candidate = ".".join(labels[i:])
+        found = cf_call(token, "GET", f"/zones?name={urllib.parse.quote(candidate)}").get("result") or []
+        if found:
+            zone = found[0]
+            break
+    if zone is None:
+        print(f"  dns {domain}: no Cloudflare zone for it that this token can see; set the record by hand")
+        return None
+    want = {"type": rtype, "name": domain, "content": target, "proxied": proxied, "ttl": 1}
+    records = cf_call(token, "GET", f"/zones/{zone['id']}/dns_records?name={urllib.parse.quote(domain)}").get("result") or []
+    live = records[0] if records else None
+    if live and all(live.get(k) == v for k, v in want.items() if k != "ttl"):
+        print(f"  dns {domain}: {rtype} {target}, proxied {proxied} (as is)")
+        return DnsRecord(token, zone["id"], live, target)
+    was = f"{live['type']} {live['content']}, proxied {live.get('proxied')}" if live else "absent"
+    print(f"  dns {domain}: {was} -> {rtype} {target}, proxied {proxied}" + (" (dry run)" if dry_run else ""))
+    if dry_run:
+        return None
+    if live:
+        cf_call(token, "PATCH", f"/zones/{zone['id']}/dns_records/{live['id']}", want)
+        return DnsRecord(token, zone["id"], live | want, target)
+    created = cf_call(token, "POST", f"/zones/{zone['id']}/dns_records", want).get("result") or {}
+    return DnsRecord(token, zone["id"], created or want, target)
+
+
+def ensure(cap: Captain, spec: dict, *, dry_run: bool) -> None:
+    name, domain = spec["app"], spec.get("domain") or ""
+    live = app_definition(cap, name)
+    if live is None:
+        print(f"{name}: not on the captain; {'would register' if dry_run else 'registering'} (persistent data: yes)")
+        if dry_run:
+            live = {"appName": name, "hasPersistentData": True, "envVars": [], "volumes": [], "customDomain": []}
+        else:
+            cap.post("/user/apps/appDefinitions/register", {"appName": name, "hasPersistentData": True})
+            live = app_definition(cap, name)
+    want = desired(spec, live)
+    # The captain refuses force-SSL until one domain holds a certificate (1108):
+    # on a first pass leave it off, connect the domain, enable https, then turn it on.
+    ssl_ready = any(c.get("hasSsl") for c in live.get("customDomain") or [])
+    force_later = bool(want.get("forceSsl")) and not ssl_ready
+    if force_later:
+        want["forceSsl"] = False
+    changes = diff(live, want)
+    print(f"{name}: {len(changes)} change(s)" + (" (dry run)" if dry_run else ""))
+    for line in changes:
+        print(line)
+    if changes and not dry_run:
+        cap.post("/user/apps/appDefinitions/update", want)
+    record = dns_ensure(cap, spec, dry_run=dry_run)
+    have = {c.get("publicDomain") for c in live.get("customDomain", [])}
+    if domain and domain not in have:
+        print(f"  domain {domain}: {'would connect' if dry_run else 'connecting'}")
+        if not dry_run:
+            cap.post("/user/apps/appDefinitions/customdomain", {"appName": name, "customDomain": domain})
+    if domain and not dry_run and spec.get("https", True):
+        fresh = app_definition(cap, name) or {}
+        for c in fresh.get("customDomain", []):
+            if c.get("publicDomain") == domain and not c.get("hasSsl"):
+                print(f"  https for {domain}: enabling (DNS must already point at the captain)")
+                try:
+                    cap.post("/user/apps/appDefinitions/enablecustomdomainssl", {"appName": name, "customDomain": domain})
+                except ApiError as e:
+                    # A zone that forces https answers the captain's plain-http pre-check with a
+                    # redirect it does not follow (1107). Drop the proxy for the step, put it back.
+                    if e.status == 1107 and record is not None and record.record.get("proxied"):
+                        print("  https pre-check refused through the proxy; DNS-only for the certificate step")
+                        record.set_proxied(False)
+                        try:
+                            if record.wait_direct():
+                                cap.post("/user/apps/appDefinitions/enablecustomdomainssl", {"appName": name, "customDomain": domain})
+                                print(f"  https for {domain}: enabled")
+                            else:
+                                print("  the name still resolves to the proxy after five minutes; certificate step left for a re-run")
+                        except ApiError as e2:
+                            print(f"  https not enabled yet: {e2}")
+                        finally:
+                            record.set_proxied(True)
+                            print("  proxy back on")
+                    else:
+                        print(f"  https not enabled yet: {e}")
+    if force_later:
+        fresh = app_definition(cap, name) or {} if not dry_run else {}
+        if any(c.get("hasSsl") for c in fresh.get("customDomain") or []):
+            print("  forceSsl: enabling, the domain has a certificate now")
+            fresh["forceSsl"] = True
+            cap.post("/user/apps/appDefinitions/update", fresh)
+        else:
+            print("  forceSsl: left off until a domain has a certificate; re-run ensure to finish")
+    if not dry_run:
+        show_app(app_definition(cap, name))
+
+
+# --- deploy, check, roll back -----------------------------------------------------
+
+POLL_S = 3
+# Cloudflare answers 403 to urllib's default User-Agent.
+CHECK_HEADERS = {"User-Agent": "cr-deploy"}
+BUILD_START_TIMEOUT_S = 120
+LIVE_TIMEOUT_S = 300
+
+
+def is_pinned(image: str) -> bool:
+    """A digest, or an image the captain built itself (one tag per version, never reused)."""
+    return "@sha256:" in image or image.startswith("img-captain--")
+
+
+def deployed_version(cap: Captain, name: str) -> int:
+    return int((app_definition(cap, name) or {}).get("deployedVersion") or 0)
+
+
+def deploy(cap: Captain, name: str, tar_path: str, *, git_hash: str = "") -> bool:
+    content = Path(tar_path).read_bytes()
+    before = deployed_version(cap, name)
+    print(f"{name}: uploading {tar_path} ({len(content) // 1024} KB); the captain builds it")
+    cap.upload(f"/user/apps/appData/{name}?detached=1", Path(tar_path).name, content, {"gitHash": git_hash})
+    return wait_build(cap, name, before)
+
+
+def deploy_image(cap: Captain, name: str, image: str) -> bool:
+    if not is_pinned(image):
+        sys.exit(f"{image}: deploy by digest (IMAGE@sha256:...), never by a tag")
+    before = deployed_version(cap, name)
+    print(f"{name}: deploying {image}")
+    definition = json.dumps({"schemaVersion": 2, "imageName": image})
+    cap.post(f"/user/apps/appData/{name}?detached=1", {"captainDefinitionContent": definition, "gitHash": ""})
+    return wait_build(cap, name, before)
+
+
+def wait_build(cap: Captain, name: str, before: int | None = None) -> bool:
+    """Follow the build log until the build ends. True when it succeeded.
+
+    Right after an upload the captain can still say "not building", so a build
+    only counts as over once it was seen running or the deployed version moved.
+    """
+    printed, seen_running, started = 0, before is None, time.time()
+    while True:
+        time.sleep(POLL_S)
+        data = cap.get(f"/user/apps/appData/{name}")
+        logs = data.get("logs") or {}
+        lines, first = logs.get("lines") or [], logs.get("firstLineNumber", 0)
+        for line in lines[max(0, printed - first):]:
+            print("   ", line.rstrip()[:200])
+        printed = first + len(lines)
+        if data.get("isAppBuilding"):
+            seen_running = True
+            continue
+        if not seen_running and deployed_version(cap, name) == before:
+            if time.time() - started > BUILD_START_TIMEOUT_S:
+                print(f"{name}: the build never started")
+                return False
+            continue
+        ok = not data.get("isBuildFailed")
+        print(f"{name}: build {'succeeded' if ok else 'FAILED'}")
+        return ok
+
+
+def answers(url: str, expect: tuple[str, str] | None = None) -> bool:
+    """True when the URL returns 200 and, given (key, value), its JSON has key == value."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=CHECK_HEADERS), timeout=15) as r:
+            return expect is None or str(json.loads(r.read()).get(expect[0])) == expect[1]
+    except (OSError, ValueError):
+        return False
+
+
+def wait_until_live(checks: list[tuple[str, tuple[str, str] | None]]) -> bool:
+    deadline = time.time() + LIVE_TIMEOUT_S
+    while time.time() < deadline:
+        if all(answers(url, expect) for url, expect in checks):
+            return True
+        time.sleep(5)
+    return False
+
+
+def previous_image(app: dict) -> str:
+    """The image of the newest version older than the one running."""
+    current = app.get("deployedVersion") or 0
+    older = [v for v in app.get("versions") or [] if (v.get("version") or 0) < current and v.get("deployedImageName")]
+    return max(older, key=lambda v: v["version"])["deployedImageName"] if older else ""
+
+
+def logs(cap: Captain, name: str) -> None:
+    data = cap.get(f"/user/apps/appData/{name}")
+    for line in (data.get("logs") or {}).get("lines") or []:
+        print(line.rstrip()[:200])
+    print("building:", data.get("isAppBuilding"), "| failed:", data.get("isBuildFailed"))
+
+
+def parse_expect(text: str) -> tuple[str, str]:
+    key, sep, value = text.partition("=")
+    if not sep:
+        raise argparse.ArgumentTypeError("--expect takes KEY=VALUE, e.g. version=3.2.0")
+    return key, value
+
+
+def cli() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cr-deploy", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+    sub.add_parser("version")
+    sub.add_parser("info")
+    sub.add_parser("nodes")
+    apps = sub.add_parser("apps")
+    apps.add_argument("name", nargs="?")
+    apps.add_argument("--json", action="store_true")
+    ensure_ = sub.add_parser("ensure")
+    ensure_.add_argument("file")
+    ensure_.add_argument("--dry-run", action="store_true")
+    deploy_ = sub.add_parser("deploy")
+    deploy_.add_argument("file")
+    deploy_.add_argument("tar")
+    image = sub.add_parser("deploy-image")
+    image.add_argument("name")
+    image.add_argument("image")
+    for p in (deploy_, image):
+        p.add_argument("--verify", metavar="URL", help="a JSON URL to poll after the deploy")
+        p.add_argument("--expect", metavar="KEY=VALUE", type=parse_expect, help="what --verify must answer")
+        p.add_argument("--health", metavar="URL", help="a URL that must answer 200")
+    for name in ("rollback", "logs", "wait"):
+        sub.add_parser(name).add_argument("name")
+    delete = sub.add_parser("delete")
+    delete.add_argument("name")
+    delete.add_argument("--volumes", action="store_true")
+    return parser
+
+
+def show_apps(cap: Captain, name: str | None, as_json: bool) -> None:
+    apps = sorted(all_apps(cap), key=lambda a: a["appName"])
+    if name:
+        apps = [a for a in apps if a["appName"] == name]
+        if not apps:
+            sys.exit(f"no app {name!r}")
+    if as_json:
+        print(json.dumps([summary(a) | {"keeps_data": keeps_data(a)} for a in apps], indent=1))
+    elif name:
+        show_app(apps[0])
+    else:
+        for a in apps:
+            s = summary(a)
+            storage = "volume" if s["volumes"] else "bind" if s["bind_mounts"] else "NONE"
+            print(f"{s['app']:28} node {str(s['node'] or 'any')[:12]:12} storage {storage:6} {s['domains']}")
+
+
+def delete_app(cap: Captain, name: str, with_volumes: bool) -> bool:
+    what = f"{name}{' AND ITS VOLUMES' if with_volumes else ''}"
+    if input(f"delete app {what} on {cap.name}? type the app name to confirm: ").strip() != name:
+        print("not deleted")
+        return False
+    body = {"appName": name}
+    if with_volumes:
+        body["volumes"] = [v["volumeName"] for v in (app_definition(cap, name) or {}).get("volumes", []) if v.get("volumeName")]
+    cap.post("/user/apps/appDefinitions/delete", body)
+    print(f"{name}: deleted")
+    return True
+
+
+def check_live(name: str, verify: str | None, expect, health: str | None) -> bool:
+    """After a deploy: poll --verify (for --expect) and --health until they answer."""
+    checks = [(url, e) for url, e in ((verify, expect), (health, None)) if url]
+    if not checks:
+        return True
+    print(f"{name}: waiting for {', '.join(url for url, _ in checks)}")
+    if wait_until_live(checks):
+        print(f"{name}: live")
+        return True
+    print(f"{name}: NOT live after {LIVE_TIMEOUT_S} s; `cr-deploy rollback {name}` runs the previous version")
+    return False
+
+
+def rollback(cap: Captain, name: str) -> bool:
+    app = app_definition(cap, name)
+    if app is None:
+        sys.exit(f"no app {name!r}")
+    image = previous_image(app)
+    if not image:
+        sys.exit(f"{name}: no earlier version to roll back to")
+    if not is_pinned(image):
+        sys.exit(f"{name}: the previous version ran {image}, a tag, so it cannot be trusted to be the same image.\n"
+                 f"  Deploy its digest instead: cr-deploy deploy-image {name} {image.rsplit(':', 1)[0]}@<digest>\n"
+                 f"  (docker buildx imagetools inspect {image} prints the digest)")
+    print(f"{name}: rolling back from {deployed_image(app) or 'unknown'} to {image}")
+    return deploy_image(cap, name, image)
+
+
+def main(argv: list[str]) -> int:
+    args = cli().parse_args(argv[1:])
+    if args.cmd == "version":
+        print(f"cr-deploy {VERSION}")
+        return 0
+    cap = Captain(os.environ.get("CAPTAIN_NAME") or os.environ.get("CAPROVER_NAME") or "captain-01")
+    if args.cmd == "info":
+        print(json.dumps(cap.get("/user/system/info"), indent=1))
+    elif args.cmd == "nodes":
+        for n in cap.get("/user/system/nodes").get("nodes", []):
+            print(n.get("nodeId"), n.get("type"), n.get("ip"), n.get("state"), n.get("hostname"))
+    elif args.cmd == "apps":
+        show_apps(cap, args.name, args.json)
+    elif args.cmd == "ensure":
+        ensure(cap, load_instance(args.file), dry_run=args.dry_run)
+    elif args.cmd == "deploy":
+        name = load_instance(args.file)["app"]
+        ok = deploy(cap, name, args.tar, git_hash=os.environ.get("GIT_HASH", ""))
+        return 0 if ok and check_live(name, args.verify, args.expect, args.health) else 1
+    elif args.cmd == "deploy-image":
+        ok = deploy_image(cap, args.name, args.image)
+        return 0 if ok and check_live(args.name, args.verify, args.expect, args.health) else 1
+    elif args.cmd == "rollback":
+        return 0 if rollback(cap, args.name) else 1
+    elif args.cmd == "logs":
+        logs(cap, args.name)
+    elif args.cmd == "wait":
+        return 0 if wait_build(cap, args.name) else 1
+    elif args.cmd == "delete":
+        return 0 if delete_app(cap, args.name, args.volumes) else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

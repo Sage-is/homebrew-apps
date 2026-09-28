@@ -1,5 +1,5 @@
 .\" offload(1) manpage — mdoc format
-.Dd May 28, 2026
+.Dd September 26, 2026
 .Dt OFFLOAD 1
 .Os
 .Sh NAME
@@ -110,6 +110,22 @@ Move a target flagged
 Requires
 .Fl -target-home
 pointing at a different user's home, admin-group caller, and FDA.
+.It Cm drain Oo Ar name ... Oc Oo Fl -need Ar GiB Oc Op Fl -apply
+Free space on a full HOT drive. Moves top-level entries of
+.Va OFFLOAD_HOT
+to
+.Pa $OFFLOAD_COLD/Drained/<HOT name>/ ,
+verifies file count and bytes, deletes the source, and leaves a symlink.
+Without names it prints every movable entry by size and suggests the
+fewest moves that reach
+.Fl -need
+(default 30 GiB free);
+.Fl -apply
+requires names. Never offers what offload owns on HOT, Docker Desktop's
+disk image folder, or media libraries. A full host volume makes Docker
+Desktop's sparse
+.Pa Docker.raw
+fail every VM write with an input/output error.
 .El
 .Sh DATA MODEL
 Every relocatable thing is a row in
@@ -332,6 +348,11 @@ offload move home   --apply
 .Ss Guarded launch
 .Bd -literal -offset indent
 offload launch Signal
+.Ed
+.Ss A full HOT drive
+.Bd -literal -offset indent
+offload drain                  # plan: movable entries, sizes
+offload drain ROMs --apply     # move to COLD, symlink back
 .Ed
 .Ss Media libraries (native UI; not scripted)
 .Bd -literal -offset indent

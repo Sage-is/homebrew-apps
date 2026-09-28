@@ -1,5 +1,23 @@
 # Roadmap
 
+## TODO
+
+- [ ] **Release the tap's tools** #critical: one command per step, dry run unless `APPLY=1`
+  - [x] [WE] `make release_tools` / `tool_release` (tag, push, pin sha256, install, test, retire old `~/bin` copies; hard-linked copies left alone); sandbox-proven 2026-09-28
+  - [ ] [MANUALLY] Commit this tap, then `make rename_projects APPLY=1` (see the renames card)
+  - [ ] [MANUALLY] Release ComicReel 2.0.0-alpha.3 from `MEDIA-ComicReel`: the `comicreel` launcher pins it
+  - [ ] [MANUALLY] `make release_tools APPLY=1`: comicreel, cr-deploy, git-release, mdprose, offload
+  - [ ] [MANUALLY] First `v0.1.0` of Sage-is/work-delegation, then `make release_tools APPLY=1` again to pin it
+
+- [ ] **Renames and branding, decided 2026-09-28** #brand: plain tool names, no prefix
+  - [x] [WE] `captain` → `cr-deploy` (an official cask owns `captain`; CapRover's npm CLI ships `caprover-*` commands, including `caprover-deploy`); `captain` alias until cr-deploy 0.2.0
+  - [x] [WE] storyboarder → comicreel: app shown as "Sage.is ComicReel", package `comicreel`, `COMICREEL_*` settings; `storyboarder` command and `STORYBOARDER_*` read for one release; model cache moves on first launch
+  - [x] [WE] local-whisper → Talking: links, notes and the app's Settings link point at `Sage-is/talking`; cask url and homepage too
+  - [ ] [MANUALLY] `make rename_projects APPLY=1`: repos to `Sage-is/comicreel` and `Sage-is/talking`, folders to `MEDIA-ComicReel` and `APP-Talking`, Claude memory carried along
+  - [ ] [MANUALLY] Commit `scripts/release.sh` in the 16 repos that share the `git-release` hard link (it gained `version`); the tap's `git-release` is now in that chain
+  - [ ] Next release after these: drop the `captain`, `storyboarder`, `STORYBOARDER_*` and `STORYBOARDER_REF` aliases
+  - [x] `SAGE.IS mini` keeps its casing
+
 ## v0.2.0 — Current
 
 ### Makefile

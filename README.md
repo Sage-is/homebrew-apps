@@ -1,12 +1,15 @@
 # homebrew-apps
 
-**The Sage Homebrew Tap.** One command to install and run.
+**The Sage Homebrew Tap.** One line to install, one to run.
 
 ```bash
-brew install sage-is/apps/ai-ui
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install ai-ui
+ai-ui start
 ```
 
-That's it. You're running [Sage AI UI](https://github.com/Sage-is/AI-UI) locally.
+That's it. You're running [Sage AI UI](https://github.com/Sage-is/AI-UI) locally on port 8080.
+
+We are not in Homebrew's main catalogue yet. Homebrew 6 asks you to trust third-party taps, hence `brew trust`. Trusting the tap once covers every formula in it.
 
 ## What you get
 
@@ -103,7 +106,7 @@ Run `ai-ui dev --where` to see where your code is saved.
 Need to pin a major version? We support that.
 
 ```bash
-brew install sage-is/apps/ai-ui@1
+brew install ai-ui@1   # after the tap and trust step above
 ```
 
 The main `ai-ui` formula always tracks the latest. Versioned formulas (`ai-ui@1`, `ai-ui@2`, ...) let you lock to a major release — useful when stability matters more than features.
@@ -166,12 +169,121 @@ make distribution_verify     # confirms link count == 3
 
 The CLI's `IMAGE_REGISTRY`, `VOLUME`, and default server tag are sourced from `distribution.env` when running from a development checkout. Brew-installed users get the values baked into the formula at install time.
 
+## cr-deploy
+
+**cr-deploy** deploys to CapRover from the terminal by image digest and checks that the new version answers. If it does not, `cr-deploy rollback` runs the previous one. AI-UI's `make deploy` and Trellis's caprover targets use it.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install cr-deploy
+```
+
+```bash
+cr-deploy apps
+cr-deploy apps sage-startr-cloud
+cr-deploy deploy-image APP ghcr.io/org/image@sha256:... --verify https://HOST/api/config --expect version=1.2.3 --health https://HOST/health
+cr-deploy rollback APP
+```
+
+See `man cr-deploy`. It was called `captain` before its first release; that command still works, with a warning, until cr-deploy 0.2.0.
+
+## offload
+
+**offload** moves heavy data from the Mac to external drives by symlink, safely.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install offload
+```
+
+```bash
+offload status
+offload drain
+```
+
+See `man offload`.
+
+## comicreel
+
+**comicreel** makes any movie a comic, and any comic a movie, in a browser app that runs on your Mac. It was called storyboarder. The app's repository is private for now, so launching needs GitHub access to it.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install comicreel
+```
+
+```bash
+comicreel
+```
+
+## git-release
+
+**git-release** is one-command git-flow release for repos with the standard release Makefile targets.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install git-release
+```
+
+```bash
+git-release patch
+```
+
+## mdprose
+
+**mdprose** is Markdown prose hygiene: unwrap hard-wrapped paragraphs, strip stray whitespace.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install mdprose
+```
+
+```bash
+mdprose report docs/
+mdprose fix README.md
+```
+
+## work-delegation
+
+**work-delegation** hands file edits to cheaper models via delegate-edit and returns a diff to review.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install work-delegation
+```
+
+```bash
+delegate-edit --doctor
+```
+
+## Mac apps
+
+Run the tap and trust line at the top first; then:
+
+**todoscope** shows every TODO across your repos as a kanban board.
+
+```bash
+brew install --cask todoscope
+```
+
+**downes** is a course-design studio for teachers.
+
+```bash
+brew install --cask downes
+```
+
+**mini** is Sage.is AI-UI mini.
+
+```bash
+brew install --cask mini
+```
+
+**talking** is offline two-way voice.
+
+```bash
+brew install --cask talking
+```
+
 ## Two version tracks
 
 This tap ships on its own clock from the server it deploys. Two independent versions:
 
-- **CLI track** — the version of *this CLI script*. Currently **1.1.0**. Bumps only when the `ai-ui` shell wrapper changes. A new server release does NOT force a CLI bump.
-- **Server track** — the version of the container image at `ghcr.io/sage-is/ai-ui`. Currently **2.3.1**. Bumps on every AI-UI release. Independent of this CLI.
+- **CLI track** — the version of *this CLI script*. Currently **1.0.4**. Bumps only when the `ai-ui` shell wrapper changes. A new server release does NOT force a CLI bump.
+- **Server track** — the version of the container image at `ghcr.io/sage-is/ai-ui`. Currently **3.2.0**. Bumps on every AI-UI release. Independent of this CLI.
 
 Users on the brew path read [CHANGELOG.md](CHANGELOG.md) for CLI changes and [AI-UI's CHANGELOG](https://github.com/Sage-is/AI-UI/blob/master/CHANGELOG.md) for server changes.
 
@@ -210,6 +322,8 @@ graph LR
 ```
 
 Release targets automatically update the formula URL, the CLI's VERSION string, and any matching versioned formulas. After tagging, `release_finish` waits for the GitHub archive to become available, computes the sha256, and commits it to both master and develop. Two commands, zero manual steps.
+
+Tools other than ai-ui release with `make tool_release TOOL=x VERSION=y`.
 
 Major releases (`make major_release`) also create a versioned formula — `ai-ui@1`, `ai-ui@2`, etc. — so users can pin.
 

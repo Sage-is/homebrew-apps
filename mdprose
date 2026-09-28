@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+# mdprose — Markdown prose hygiene: report and fix hard-wrapped paragraphs and
+#           stray unicode whitespace, without touching code, tables, or data.
+#
+# Usage:
+#   mdprose report [PATH ...]                Survey markdown, print grouped counts.
+#   mdprose report --files [PATH ...]        Add a per-file table.
+#   mdprose fix [PATH ...] [opts]            Normalize files in place.
+#
+# fix options:
+#   --unwrap / --no-unwrap        Join hard-wrapped paragraph lines (default: on).
+#   --strip-unicode               Replace NBSP/ZWSP/BOM/thin spaces with ' ' (default: off).
+#   --dry-run                     Show what would change; write nothing.
+#   --diff                        Print a unified diff of every change.
+#   --include-data                Also process db_snapshots (excluded by default).
+#
+# Paths default to the current directory. Directories are walked recursively.
+# node_modules and .git are always skipped.
+#
+# Preserved verbatim: fenced code, indented code inside lists, tables, blockquotes,
+# HTML/SVG blocks, YAML front-matter, setext headings, reference-link defs,
+# horizontal rules, and hard line breaks (a line ending in two+ spaces or a backslash).
+
+import argparse
+import difflib
+import re
+import sys
+import unicodedata
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+# --- unicode whitespace we consider "stray" in authored prose -----------------
+STRAY_SPACES = {
+    0x00A0: " ",   # NO-BREAK SPACE
+    0x2000: " ", 0x2001: " ", 0x2002: " ", 0x2003: " ", 0x2004: " ",
+    0x2005: " ", 0x2006: " ", 0x2007: " ", 0x2008: " ", 0x2009: " ", 0x200A: " ",
+    0x202F: " ",   # NARROW NO-BREAK SPACE
+    0x205F: " ",   # MEDIUM MATHEMATICAL SPACE
+    0x3000: " ",   # IDEOGRAPHIC SPACE
+    0x200B: "",    # ZERO WIDTH SPACE
+    0xFEFF: "",    # ZERO WIDTH NO-BREAK SPACE / BOM
+    0x00AD: "",    # SOFT HYPHEN
+}
+
+SKIP_DIRS = {"node_modules", ".git"}
+DATA_MARKER = "db_snapshots"
+
+# --- line classification ------------------------------------------------------
+FENCE = re.compile(r"^\s*(```+|~~~+)")
+LIST_MARKER = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+")
+HEADING = re.compile(r"^\s*#{1,6}\s")
+HR = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+REF_DEF = re.compile(r"^\s*\[[^\]]+\]:\s")
+SETEXT_UNDER = re.compile(r"^\s*(=+|-+)\s*$")
+HARD_BREAK = re.compile(r"( {2,}|\\)$")
+
+
+def classify(line):
+    if line.strip() == "":
+        return "blank"
+    s = line.lstrip()
+    if FENCE.match(line):
+        return "fence"
+    if HEADING.match(line):
+        return "heading"
+    if HR.match(line):
+        return "hr"
+    if s.startswith("|"):
+        return "table"
+    if s.startswith(">"):
+        return "quote"
+    if s.startswith("<"):
+        return "html"
+    if REF_DEF.match(line):
+        return "refdef"
+    if LIST_MARKER.match(line):
+        return "list"
+    return "prose"
+
+
+def iter_blocks(lines):
+    """Yield ('kind', start, end) spans. Code/frontmatter emitted as opaque."""
+    n = len(lines)
+    i = 0
+    # YAML front-matter
+    if n and lines[0].strip() == "---":
+        j = 1
+        while j < n and lines[j].strip() != "---":
+            j += 1
+        if j < n:
+            yield ("opaque", 0, j + 1)
+            i = j + 1
+    while i < n:
+        line = lines[i]
+        m = FENCE.match(line)
+        if m:
+            marker = m.group(1)[0]
+            j = i + 1
+            while j < n and not (FENCE.match(lines[j]) and lines[j].lstrip()[0] == marker):
+                j += 1
+            j = min(j + 1, n)
+            yield ("opaque", i, j)
+            i = j
+            continue
+        if line.strip() == "":
+            yield ("blank", i, i + 1)
+            i += 1
+            continue
+        # accumulate a non-blank run until a blank or fence
+        j = i
+        while j < n and lines[j].strip() != "" and not FENCE.match(lines[j]):
+            j += 1
+        yield ("run", i, j)
+        i = j
+
+
+def split_hard_breaks(lines):
+    """Split a list of lines into sublists at hard line breaks (kept as boundaries)."""
+    groups = [[]]
+    for ln in lines:
+        groups[-1].append(ln)
+        if HARD_BREAK.search(ln):
+            groups.append([])
+    return [g for g in groups if g]
+
+
+def unwrap_run(run):
+    """Return normalized lines for a non-blank run. Merges prose / list-item bodies."""
+    first_kind = classify(run[0])
+
+    # Leave structural runs alone.
+    if first_kind in ("heading", "hr", "table", "quote", "html", "refdef"):
+        return run
+    # setext heading (text then ==== / ----)
+    if len(run) == 2 and SETEXT_UNDER.match(run[1]):
+        return run
+
+    if first_kind == "list":
+        return unwrap_list_run(run)
+
+    # If a later line opens a different block kind, don't swallow it —
+    # merge only the leading prose portion.
+    para = [run[0]]
+    rest = []
+    for k, ln in enumerate(run[1:], 1):
+        ck = classify(ln)
+        if ck in ("prose",):
+            para.append(ln)
+        else:
+            rest = run[k:]
+            break
+    merged = merge_prose(para)
+    if rest:
+        return merged + unwrap_run(rest)
+    return merged
+
+
+def merge_prose(para):
+    out = []
+    for group in split_hard_breaks(para):
+        if len(group) == 1:
+            # nothing to fold — leave verbatim (keeps hard breaks and any
+            # out-of-scope trailing whitespace untouched)
+            out.append(group[0])
+            continue
+        indent = re.match(r"^(\s*)", group[0]).group(1)
+        out.append(indent + " ".join(s.strip() for s in group))
+    return out
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip())
+
+
+def merge_item_head(head_lines, content_col):
+    """Fold a list item's marker line + its own wrapped body into one line.
+    Respects hard breaks; continuation lines after a break sit at the content column."""
+    out = []
+    first = True
+    for g in split_hard_breaks(head_lines):
+        if len(g) == 1:
+            # single line, nothing to fold — verbatim (keeps trailing whitespace)
+            out.append(g[0])
+            first = False
+            continue
+        if first:
+            lead = re.match(r"^(\s*)", g[0]).group(1)
+            out.append(lead + " ".join(s.strip() for s in g))
+            first = False
+        else:
+            out.append(" " * content_col + " ".join(s.strip() for s in g))
+    return out
+
+
+def unwrap_list_run(run):
+    """A run beginning with a list marker. Fold each item's own wrapped body up
+    into its marker line, and recurse into nested lists so their bodies fold too."""
+    out = []
+    i = 0
+    n = len(run)
+    while i < n:
+        line = run[i]
+        m = LIST_MARKER.match(line)
+        if not m:
+            # defensive: a stray non-marker line at this level — pass through
+            out.append(line)
+            i += 1
+            continue
+        marker_indent = len(m.group(1))
+        content_col = len(m.group(0))
+        # Everything indented deeper than the marker belongs to this item.
+        j = i + 1
+        while j < n and indent_of(run[j]) > marker_indent:
+            j += 1
+        body = run[i + 1:j]
+        # The item's own text continuation runs until the first nested list marker.
+        k = 0
+        while k < len(body) and not LIST_MARKER.match(body[k]):
+            k += 1
+        para_cont, nested = body[:k], body[k:]
+        out.extend(merge_item_head([line] + para_cont, content_col))
+        if nested:
+            out.extend(unwrap_list_run(nested))
+        i = j
+    return out
+
+
+def normalize_lines(text, do_unwrap, do_unicode):
+    # unicode pass first (also cleans inside code? no — do it per non-opaque line)
+    trailing_nl = text.endswith("\n")
+    lines = text.split("\n")
+    if trailing_nl:
+        lines = lines[:-1]
+
+    out = []
+    for kind, a, b in iter_blocks(lines):
+        span = lines[a:b]
+        if kind == "opaque":
+            out.extend(span)
+        elif kind == "blank":
+            out.extend(span)
+        else:  # run
+            new = unwrap_run(span) if do_unwrap else span
+            out.extend(new)
+
+    result = "\n".join(out)
+    if trailing_nl:
+        result += "\n"
+
+    if do_unicode:
+        result = strip_unicode_outside_code(result)
+    return result
+
+
+def strip_unicode_outside_code(text):
+    lines = text.split("\n")
+    incode = False
+    fence_char = None
+    for i, line in enumerate(lines):
+        m = FENCE.match(line)
+        if m:
+            c = m.group(1)[0]
+            if not incode:
+                incode, fence_char = True, c
+            elif line.lstrip()[0] == fence_char:
+                incode, fence_char = False, None
+            continue
+        if incode:
+            continue
+        lines[i] = "".join(STRAY_SPACES.get(ord(ch), ch) for ch in line)
+    return "\n".join(lines)
+
+
+# --- surveying ----------------------------------------------------------------
+def survey(text):
+    """Count issues without modifying. Returns dict of metrics."""
+    lines = text.rstrip("\n").split("\n")
+    # wrapped pairs: how many lines would be folded away by unwrap
+    fixed = normalize_lines(text, do_unwrap=True, do_unicode=False)
+    fixed_lines = fixed.rstrip("\n").split("\n")
+    folded = max(0, len(lines) - len(fixed_lines))
+
+    uni = {}
+    for ch in text:
+        cp = ord(ch)
+        if cp in STRAY_SPACES:
+            uni[cp] = uni.get(cp, 0) + 1
+    trailing = sum(1 for l in lines if l != l.rstrip())
+    return {"folded": folded, "unicode": uni, "trailing": trailing, "lines": len(lines)}
+
+
+def find_md(paths):
+    files = []
+    for p in paths:
+        p = Path(p)
+        if p.is_file() and p.suffix.lower() == ".md":
+            files.append(p)
+        elif p.is_dir():
+            for f in sorted(p.rglob("*.md")):
+                if any(part in SKIP_DIRS for part in f.parts):
+                    continue
+                files.append(f)
+    # de-dup, stable
+    seen = set()
+    out = []
+    for f in files:
+        r = f.resolve()
+        if r not in seen:
+            seen.add(r)
+            out.append(f)
+    return out
+
+
+def group_of(path):
+    return "data" if DATA_MARKER in str(path) else "authored"
+
+
+def cmd_report(args):
+    files = find_md(args.paths or ["."])
+    groups = {"authored": [], "data": []}
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        s = survey(text)
+        s["path"] = f
+        groups[group_of(f)].append(s)
+
+    for gname in ("authored", "data"):
+        rows = groups[gname]
+        if not rows:
+            continue
+        folded = sum(r["folded"] for r in rows)
+        trailing = sum(r["trailing"] for r in rows)
+        uni = {}
+        for r in rows:
+            for cp, n in r["unicode"].items():
+                uni[cp] = uni.get(cp, 0) + n
+        dirty = [r for r in rows if r["folded"] or r["unicode"] or r["trailing"]]
+        print(f"\n=== {gname.upper()}  ({len(rows)} files, {len(dirty)} with issues) ===")
+        print(f"  wrapped lines to fold : {folded}")
+        print(f"  trailing-space lines  : {trailing}")
+        if uni:
+            print("  stray unicode spaces  :")
+            for cp, n in sorted(uni.items(), key=lambda x: -x[1]):
+                print(f"      U+{cp:04X} {unicodedata.name(chr(cp),'?'):24} {n}")
+        else:
+            print("  stray unicode spaces  : 0")
+        if args.files:
+            print("  top files:")
+            for r in sorted(dirty, key=lambda r: -(r["folded"] + sum(r["unicode"].values())))[:args.top]:
+                u = sum(r["unicode"].values())
+                print(f"      fold={r['folded']:<4} uni={u:<3} trail={r['trailing']:<3} {r['path']}")
+    print()
+
+
+def cmd_fix(args):
+    files = find_md(args.paths or ["."])
+    changed = 0
+    for f in files:
+        if not args.include_data and group_of(f) == "data":
+            continue
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        new = normalize_lines(text, do_unwrap=args.unwrap, do_unicode=args.strip_unicode)
+        if new == text:
+            continue
+        changed += 1
+        if args.diff or args.dry_run:
+            diff = difflib.unified_diff(
+                text.splitlines(True), new.splitlines(True),
+                fromfile=str(f), tofile=str(f) + " (fixed)",
+            )
+            sys.stdout.writelines(diff)
+        if not args.dry_run:
+            f.write_text(new, encoding="utf-8")
+    verb = "would change" if args.dry_run else "changed"
+    print(f"\n{verb} {changed} file(s).", file=sys.stderr)
+
+
+def cmd_check(args):
+    """Gate mode. Exit 1 if any in-scope file would change under fix; else 0."""
+    files = find_md(args.paths or ["."])
+    offenders = []
+    checked = 0
+    for f in files:
+        if not args.include_data and group_of(f) == "data":
+            continue
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        checked += 1
+        new = normalize_lines(text, do_unwrap=args.unwrap, do_unicode=args.strip_unicode)
+        if new != text:
+            s = survey(text)
+            offenders.append((f, s["folded"], sum(s["unicode"].values())))
+    if offenders:
+        print("mdprose: markdown prose not normalized. Run `mdprose fix` to fold "
+              "hard-wrapped paragraphs.", file=sys.stderr)
+        for f, fold, uni in sorted(offenders, key=lambda o: -(o[1] + o[2])):
+            print(f"  fold={fold:<4} uni={uni:<3} {f}", file=sys.stderr)
+        print(f"\n{len(offenders)} file(s) need normalizing.", file=sys.stderr)
+        sys.exit(1)
+    skipped = len(files) - checked
+    tail = f" ({skipped} data file(s) skipped)" if skipped else ""
+    print(f"mdprose: {checked} file(s) clean{tail}.", file=sys.stderr)
+    sys.exit(0)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mdprose", description="Markdown prose hygiene.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("version", help="Print the version.").set_defaults(func=lambda _: print(f"mdprose {VERSION}"))
+
+    r = sub.add_parser("report", help="Survey markdown; write nothing.")
+    r.add_argument("paths", nargs="*")
+    r.add_argument("--files", action="store_true", help="Show a per-file table.")
+    r.add_argument("--top", type=int, default=20)
+    r.set_defaults(func=cmd_report)
+
+    c = sub.add_parser("check", help="Gate: exit 1 if any file needs normalizing.")
+    c.add_argument("paths", nargs="*")
+    c.add_argument("--unwrap", action="store_true", default=True)
+    c.add_argument("--no-unwrap", dest="unwrap", action="store_false")
+    c.add_argument("--strip-unicode", action="store_true", default=False)
+    c.add_argument("--include-data", action="store_true")
+    c.set_defaults(func=cmd_check)
+
+    x = sub.add_parser("fix", help="Normalize markdown in place.")
+    x.add_argument("paths", nargs="*")
+    x.add_argument("--unwrap", action="store_true", default=True)
+    x.add_argument("--no-unwrap", dest="unwrap", action="store_false")
+    x.add_argument("--strip-unicode", action="store_true", default=False)
+    x.add_argument("--dry-run", action="store_true")
+    x.add_argument("--diff", action="store_true")
+    x.add_argument("--include-data", action="store_true")
+    x.set_defaults(func=cmd_fix)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

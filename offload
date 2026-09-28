@@ -38,6 +38,14 @@
 #   relocations (alias: media-libraries)         print native-UI relocation
 #                                                steps — Docker, Photos,
 #                                                Music.app, iMovie
+#   drain [<name>...] [--need <GiB>] [--apply]   free a full HOT drive: move
+#                                                top-level entries to
+#                                                COLD/Drained/<HOT name>/, verify,
+#                                                leave a symlink. No names = a
+#                                                plan only (default --need 30);
+#                                                --apply requires names. Skips
+#                                                what offload owns, Docker's
+#                                                disk folder, media libraries
 #   protected <Label> [--apply]                  alias for `move <Label>` that
 #                                                requires --target-home + FDA
 #
@@ -187,6 +195,10 @@
 #   Guarded launch:
 #     offload launch Signal
 #
+#   A full HOT drive (Docker reports input/output error):
+#     offload drain                  # plan: what could move, sizes
+#     offload drain ROMs --apply     # move ROMs to COLD, symlink back
+#
 #   Media libraries (manual, native UI):
 #     offload media-libraries
 #
@@ -214,7 +226,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 
 # ----------------------------------------------------------------------------
 # Defaults
@@ -1016,6 +1028,262 @@ cmd_protected() {
 }
 
 # ----------------------------------------------------------------------------
+# Subcommand: drain — make room on a full HOT drive by moving to COLD
+# ----------------------------------------------------------------------------
+# A full HOT drive breaks whatever grows on it: Docker Desktop's sparse
+# Docker.raw turns every VM write into "input/output error" once the host
+# volume is out of space (the 3.2.0 AI-UI release died this way, 2026-09-26).
+#
+# One scan gives every top-level entry a size, a last-touched age, and a
+# status with its reason: cold (safe to suggest), warm (touched recently),
+# live (a sync app, an active git repo, or a file open right now), or skip
+# (owned by offload, Docker's disk, a media library, drained already).
+# Loose files in the drive root are grouped by kind (@loose-archives ...).
+
+DRAIN_WARM_DAYS="${DRAIN_WARM_DAYS:-30}"
+
+# Top-level names on HOT that offload itself owns, plus Docker's disk folder.
+drain_protected() {
+  local rel df settings="$HOME/Library/Group Containers/group.com.docker/settings-store.json"
+  while IFS='|' read -r _ _ _ dest _ _ _; do
+    [[ "$dest" == "$OFFLOAD_HOT"/* ]] || continue
+    rel="${dest#"$OFFLOAD_HOT"/}"; echo "${rel%%/*}"
+  done < <(iter_targets)
+  if [[ -f "$settings" ]]; then
+    df="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("DataFolder") or "")' "$settings" 2>/dev/null || true)"
+    if [[ "$df" == "$OFFLOAD_HOT"/* ]]; then rel="${df#"$OFFLOAD_HOT"/}"; echo "${rel%%/*}"; fi
+  fi
+}
+
+# Scan HOT. Prints, tab-separated:
+#   E <name> <bytes> <days-since-touched> <status> <reason>   one per entry or @group
+#   M <@group> <file>                                        one per group member
+drain_scan() {
+  DRAIN_PROTECTED="$(drain_protected | sort -u)" python3 - "$OFFLOAD_HOT" "$DRAIN_WARM_DAYS" <<'PY'
+import os, subprocess, sys, time
+
+hot, warm_days = sys.argv[1], int(sys.argv[2])
+protected = set(filter(None, os.environ.get("DRAIN_PROTECTED", "").split("\n")))
+now = time.time()
+MEDIA = (".photoslibrary", ".musiclibrary", ".imovielibrary", ".fcpbundle")
+SYNC = {".stfolder": "Syncthing", ".stignore": "Syncthing", ".sync": "Resilio Sync",
+        ".dropbox": "Dropbox", ".dropbox.cache": "Dropbox", ".owncloudsync.log": "Nextcloud",
+        ".SynologyWorkingDirectory": "Synology Drive"}
+KINDS = {"archives": ".7z .zip .rar .tar .gz .tgz .xz .bz2 .iso .dmg .pkg",
+         "videos": ".mp4 .mov .m4v .mkv .avi .webm",
+         "audio": ".mp3 .wav .aif .aiff .flac .m4a .mid .midi",
+         "images": ".jpg .jpeg .png .heic .tif .tiff .gif .psd .raw .dng",
+         "documents": ".pdf .doc .docx .ppt .pptx .key .pages .numbers .xls .xlsx"}
+KIND = {ext: k for k, exts in KINDS.items() for ext in exts.split()}
+
+# Files open right now, by top-level entry: one lsof call for the whole system.
+open_by = {}
+try:
+    out = subprocess.run(["lsof", "-w", "-Fcn"], capture_output=True, text=True, timeout=60).stdout
+    cmd = "?"
+    for line in out.splitlines():
+        if line[:1] == "c": cmd = line[1:]
+        elif line[:1] == "n" and line.startswith("n" + hot + "/"):
+            top = line[len(hot) + 2:].split("/", 1)[0]
+            open_by.setdefault(top, cmd)
+except (OSError, subprocess.SubprocessError):
+    pass
+
+def walk(path):
+    """bytes, newest mtime, live reason ('' if none), for a file or a tree."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0, 0, ""
+    size, newest, live = st.st_blocks * 512, st.st_mtime, ""
+    stack = [(path, 0)] if os.path.isdir(path) and not os.path.islink(path) else []
+    while stack:
+        d, depth = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    s = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                size += s.st_blocks * 512
+                newest = max(newest, s.st_mtime)
+                if not live and depth <= 3:
+                    if e.name in SYNC or (e.name.startswith((".sync_", "._sync_")) and e.name.endswith(".db")):
+                        live = SYNC.get(e.name, "Nextcloud") + " folder"
+                    elif e.name == ".git" and e.is_dir(follow_symlinks=False):
+                        for probe in ("index", "logs/HEAD", "FETCH_HEAD"):
+                            try:
+                                age = (now - os.stat(os.path.join(e.path, probe)).st_mtime) / 86400
+                            except OSError:
+                                continue
+                            if age < warm_days:
+                                live = f"git repo active {int(age)} d ago"
+                                break
+                if e.is_dir(follow_symlinks=False):
+                    stack.append((e.path, depth + 1))
+    return size, newest, live
+
+def row(name, size, newest, status, reason):
+    days = int((now - newest) / 86400) if newest else -1
+    print(f"E\t{name}\t{size}\t{days}\t{status}\t{reason}")
+
+def files(n):
+    return f"{n} file" + ("" if n == 1 else "s")
+
+groups = {}
+for name in sorted(os.listdir(hot)):
+    if name.startswith("."):
+        continue
+    path = os.path.join(hot, name)
+    if os.path.islink(path):
+        row(name, 0, 0, "skip", "drained already: " + os.readlink(path)); continue
+    if name.endswith(MEDIA):
+        row(name, 0, 0, "skip", "media library: use 'offload relocations'"); continue
+    if name in protected:
+        row(name, 0, 0, "skip", "owned by offload or Docker's disk image"); continue
+    if os.path.isfile(path):
+        groups.setdefault("@loose-" + KIND.get(os.path.splitext(name)[1].lower(), "other"), []).append(name)
+        continue
+    size, newest, live = walk(path)
+    days = (now - newest) / 86400
+    if name in open_by:
+        row(name, size, newest, "live", f"open by {open_by[name]}")
+    elif live:
+        row(name, size, newest, "live", live)
+    elif days < warm_days:
+        row(name, size, newest, "warm", f"touched {int(days)} d ago")
+    else:
+        row(name, size, newest, "cold", "")
+
+for group, members in sorted(groups.items()):
+    size = newest = 0
+    opened = [m for m in members if m in open_by]
+    for m in members:
+        s, n, _ = walk(os.path.join(hot, m))
+        size, newest = size + s, max(newest, n)
+        print(f"M\t{group}\t{m}")
+    days = (now - newest) / 86400
+    if opened:
+        row(group, size, newest, "live", f"{opened[0]} open by {open_by[opened[0]]}")
+    elif days < warm_days:
+        row(group, size, newest, "warm", f"{files(len(members))}, newest touched {int(days)} d ago")
+    else:
+        row(group, size, newest, "cold", files(len(members)))
+PY
+}
+
+drain_age() {
+  local d="$1"
+  if   (( d < 0 ));   then echo "-"
+  elif (( d < 14 ));  then echo "${d} d"
+  elif (( d < 90 ));  then echo "$(( d / 7 )) wk"
+  elif (( d < 730 )); then echo "$(( d / 30 )) mo"
+  else echo "$(( d / 365 )) yr"; fi
+}
+
+drain_sig() {
+  if [[ -d "$1" ]]; then tree_signature "$1"; else echo "files=1 bytes=$(stat -f %z "$1")"; fi
+}
+
+drain_one() {
+  local name="$1" src="$OFFLOAD_HOT/$1" dst="$DRAIN_DEST/$1"
+  log "=== drain $name ==="
+  [[ -e "$src" ]] || die "$src does not exist"
+  [[ -e "$dst" || -L "$dst" ]] && die "Destination $dst exists — manual review required"
+  log "  Source sig: $(drain_sig "$src")"
+  do_run "mkdir -p \"$DRAIN_DEST\""
+  if [[ -d "$src" ]]; then do_run "rsync -a \"$src/\" \"$dst/\""; else do_run "rsync -a \"$src\" \"$dst\""; fi
+  if [[ $DRY -eq 0 ]]; then
+    local s d; s="$(drain_sig "$src")"; d="$(drain_sig "$dst")"
+    log "  Verify: src=$s dst=$d"
+    [[ "$s" == "$d" ]] || die "Signature mismatch — source preserved"
+    do_run "rm -rf \"$src\""
+    do_run "ln -s \"$dst\" \"$src\""
+    log "  DONE: $src -> $dst"
+  fi
+}
+
+cmd_drain() {
+  local need_gib=30 names=() name
+  while (( $# > 0 )); do
+    case "$1" in
+      --apply) DRY=0; shift ;;
+      --need)  need_gib="${2:?--need takes a number of GiB}"; shift 2 ;;
+      *)       names+=("$1"); shift ;;
+    esac
+  done
+  [[ "$need_gib" =~ ^[0-9]+$ ]] || die "--need takes a whole number of GiB"
+  (( DRY == 0 && ${#names[@]} == 0 )) && die "drain --apply needs the names to move. Run 'offload drain' for a plan."
+  require_drive OFFLOAD_HOT; require_drive OFFLOAD_COLD
+  DRAIN_DEST="$OFFLOAD_COLD/Drained/$(basename "$OFFLOAD_HOT")"
+
+  log "============================================="
+  log "offload v$VERSION drain  mode=$(mode)  need=${need_gib}GiB free on HOT"
+  log "============================================="
+  report_space
+  log "  Scanning $OFFLOAD_HOT: sizes, ages, sync apps, git repos, open files (big drives take minutes)..."
+  local scan; scan="$(drain_scan)"
+  local rows; rows="$(awk -F'\t' '$1 == "E"' <<<"$scan")"
+
+  # The plan: named entries, or the coldest cold entries until the gap closes.
+  local plan=() total=0 kb bytes days status reason
+  if (( ${#names[@]} )); then
+    for name in "${names[@]}"; do
+      [[ "$name" == */* || "$name" == *[\"\$\`\\]* ]] && die "unsafe name: $name"
+      IFS=$'\t' read -r _ _ bytes days status reason < <(awk -F'\t' -v n="$name" '$2 == n' <<<"$rows")
+      [[ -n "${status:-}" ]] || die "'$name' is not on $OFFLOAD_HOT (see 'offload drain')"
+      [[ "$status" == skip ]] && die "'$name' is not movable: $reason"
+      [[ "$status" == live ]] && die "'$name' is live ($reason). Stop that first, then drain it."
+      [[ "$status" == warm ]] && warn "  $name was $reason; moving it anyway, as named"
+      plan+=("$name"); total=$(( total + bytes )); status=""
+    done
+  else
+    local gap=$(( need_gib * 1073741824 - $(free_bytes "$OFFLOAD_HOT") ))
+    while IFS=$'\t' read -r _ name bytes days status reason; do
+      (( total >= gap )) && break
+      [[ "$name" == *[\"\$\`\\]* ]] && continue
+      plan+=("$name"); total=$(( total + bytes ))
+    done < <(awk -F'\t' '$5 == "cold"' <<<"$rows" | sort -t$'\t' -k4,4nr -k3,3nr)   # coldest first
+  fi
+
+  log "--- $OFFLOAD_HOT (* = in this plan) ---"
+  log "$(printf '    %10s  %-7s %-5s %s' SIZE TOUCHED STATE NAME)"
+  local order
+  for order in cold warm live skip; do
+    while IFS=$'\t' read -r _ name bytes days status reason; do
+      local mark=" " n; for n in "${plan[@]:-}"; do [[ "$n" == "$name" ]] && mark="*"; done
+      log "$(printf '  %s %10s  %-7s %-5s %s%s' "$mark" "$([[ $status == skip ]] && echo - || human "$bytes")" "$(drain_age "$days")" "$status" "$name" "${reason:+  ($reason)}")"
+    done < <(awk -F'\t' -v s="$order" '$5 == s' <<<"$rows" | sort -t$'\t' -k3,3nr)
+  done
+
+  if (( ${#plan[@]} == 0 )); then
+    if (( ${#names[@]} == 0 )); then log "  Nothing to suggest: HOT has ${need_gib}GiB free, or nothing cold is left."; fi
+    return 0
+  fi
+  log "--- Plan: $(human "$total") to $DRAIN_DEST; each entry leaves a symlink ---"
+  require_free "$OFFLOAD_COLD" "$total"
+  if (( ${#names[@]} == 0 )); then
+    log "  A suggestion: coldest first, cold entries only. Then:"
+    log "    offload drain$(printf ' %q' "${plan[@]}") --apply"
+    return 0
+  fi
+  for name in "${plan[@]}"; do
+    if [[ "$name" == @* ]]; then
+      while IFS=$'\t' read -r _ _ member; do drain_one "$member"; done < <(awk -F'\t' -v g="$name" '$1 == "M" && $2 == g' <<<"$scan")
+    else
+      drain_one "$name"
+    fi
+  done
+  report_space
+  [[ $DRY -eq 1 ]] && log "Dry run. Add --apply to move."
+  log "Done. Log: $LOG"
+}
+
+# ----------------------------------------------------------------------------
 # Subcommand: drives — auto-detect external drives, classify HOT/COLD
 # ----------------------------------------------------------------------------
 
@@ -1257,6 +1525,7 @@ main() {
     launch)                    cmd_launch "$@" ;;
     move)                      cmd_move "$@" ;;
     protected)                 cmd_protected "$@" ;;
+    drain)                     cmd_drain "$@" ;;
     *) die "unknown subcommand: $sub (try 'offload help')" ;;
   esac
 }

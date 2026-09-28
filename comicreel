@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# comicreel — Sage-is tap launcher for Sage.is ComicReel (Sage-is/comicreel), called Storyboarder until 2.0.0-alpha.3.
+# Runs the packaged app from a pinned release tag via uv. The first launch
+# resolves + builds the environment (cached); every launch after is instant.
+# Make any movie a comic. Make any comic a movie.
+set -euo pipefail
+
+LAUNCHER_VERSION="0.1.0"
+# The app release this launcher pins. Bump alongside the formula on each app
+# release; override at runtime with COMICREEL_REF=... (STORYBOARDER_REF is read for one release).
+APP_REF="${COMICREEL_REF:-${STORYBOARDER_REF:-v2.0.0-alpha.3}}"
+APP_SRC="git+https://github.com/Sage-is/comicreel@${APP_REF}"
+
+usage() {
+  cat <<EOF
+comicreel — make any movie a comic, any comic a movie
+
+  comicreel            launch the app (opens your browser)
+  comicreel start      same as above
+  comicreel version    launcher + pinned app version
+  comicreel help       this message
+
+Runs ${APP_REF} via uv (deps cached after the first launch). Needs ffmpeg;
+yt-dlp enables the paste-a-link path. Pin another build: COMICREEL_REF=...
+Skip the browser auto-open: COMICREEL_NO_BROWSER=1
+The app's repository is private for now: launching needs GitHub access to it.
+EOF
+}
+
+case "${1:-start}" in
+  start|"")             exec uvx --from "$APP_SRC" comicreel ;;
+  version|-v|--version) echo "comicreel launcher v${LAUNCHER_VERSION} → app ${APP_REF}" ;;
+  help|-h|--help)       usage ;;
+  *) echo "comicreel: unknown command '$1'" >&2; usage >&2; exit 1 ;;
+esac

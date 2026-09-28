@@ -8,8 +8,8 @@ class Offload < Formula
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
 
-  depends_on :macos
   depends_on arch: :arm64
+  depends_on :macos
 
   uses_from_macos "rsync"
 
@@ -55,6 +55,6 @@ class Offload < Formula
     # Version subcommand reports a semver-shaped string.
     assert_match(/^offload v\d+\.\d+\.\d+$/, shell_output("#{bin}/offload version").strip)
     # Manpage installed and readable.
-    assert_predicate man1/"offload.1", :exist?
+    assert_path_exists man1/"offload.1"
   end
 end

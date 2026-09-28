@@ -8,9 +8,10 @@ cask "downes" do
   homepage "https://sage.is/downes"
 
   depends_on arch: :arm64
-
   # The bundle is self-contained: engine, sandbox profile and curriculum
   # template all live in Contents/Resources, so the app works wherever it lands.
+  depends_on :macos
+
   app "Downes.app"
   binary "#{appdir}/Downes.app/Contents/Resources/launcher/downes.sh", target: "downes"
 
@@ -24,15 +25,13 @@ cask "downes" do
   # need for this block entirely.
   postflight do
     system_command "/usr/bin/xattr",
-                   args: ["-d", "-r", "com.apple.quarantine", "#{appdir}/Downes.app"],
+                   args:         ["-d", "-r", "com.apple.quarantine", "#{appdir}/Downes.app"],
                    must_succeed: false
   end
 
   # Courses are the teacher's work and are never removed. Only our own state
   # goes, and only on an explicit `brew uninstall --zap`.
-  zap trash: [
-    "~/Downes/.downes",
-  ]
+  zap trash: "~/Downes/.downes"
 
   caveats do
     "Your courses live in ~/Downes. Downes works in that one folder."
