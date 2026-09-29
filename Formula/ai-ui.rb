@@ -9,9 +9,14 @@ class AiUi < Formula
   depends_on "ollama"
 
   def install
-    # The distribution.env beside the script pins the server version this
-    # release was tested with (its SERVER_TAG); `ai-ui version` shows it.
-    libexec.install "ai-ui", "distribution.env"
+    libexec.install "ai-ui"
+    # From 3.x the CLI's version is the AI-UI version it pins, read from the
+    # distribution.env beside it. A 1.x tarball's copy names an older server.
+    if version.major.to_i >= 3
+      server_tag = File.read("distribution.env", encoding: "UTF-8")[/^SERVER_TAG=(\S+)$/, 1]
+      odie "distribution.env pins AI-UI #{server_tag}, not #{version}" if server_tag != version.to_s
+      libexec.install "distribution.env"
+    end
     bin.write_exec_script libexec/"ai-ui"
   end
 
@@ -45,7 +50,6 @@ class AiUi < Formula
 
   test do
     assert_match "Usage:", shell_output("#{bin}/ai-ui --help")
-    # The pinned server version came from distribution.env, not the `latest` fallback.
-    assert_match(/server \d+\.\d+\.\d+/, shell_output("#{bin}/ai-ui version"))
+    assert_match "(server #{version})", shell_output("#{bin}/ai-ui version") if version.major.to_i >= 3
   end
 end

@@ -118,11 +118,7 @@ help:
 	@echo "  sha256              Compute sha256 for current formula URL"
 	@echo "  show-version        Show current version info"
 	@echo "  check-upstream      Compare local version against upstream AI-UI repo"
-	@echo "  minor_release       Start minor version bump (0.X.0)"
-	@echo "  patch_release       Start patch version bump (0.0.X)"
-	@echo "  major_release       Start major version bump (X.0.0)"
-	@echo "  hotfix              Start hotfix (0.0.0.X)"
-	@echo "  custom_release      Start release with explicit version (VER=X.Y.Z)"
+	@echo "  release_ai_ui       Release the ai-ui CLI as the AI-UI version it pins ($(SERVER_TAG))"
 	@echo "  feature_finish      Finish feature: merge into develop, push"
 	@echo "  release_finish      Finish release: merge, tag, push, sha256"
 	@echo "  hotfix_finish       Finish hotfix: merge, tag, push, sha256"
@@ -205,64 +201,26 @@ release:
 # Each target: calculates next version → creates branch → bumps version → commits.
 # After this, you only need `make release_finish`.
 
-minor_release: require_gitflow_next
-	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
-	@$(HELPERS) && \
-	NEW_VER=$$(git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2+1".0"}') && \
-	git flow release start $$NEW_VER && \
-	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
-	bump_version $$NEW_VER && \
-	git add -A && \
-	git commit -m "Bump version to $$NEW_VER" && \
-	echo "" && \
-	echo "=== Release $$NEW_VER ready ===" && \
-	echo "Next: make release_finish"
+# The ai-ui CLI carries the AI-UI version it pins (SERVER_TAG in distribution.env),
+# so its version is never computed from its own last tag. A CLI-only fix ships as
+# a formula revision (3.2.0_1); AI-UI's own hotfixes use four numbers (3.2.0.1).
+patch_release minor_release major_release hotfix:
+	@echo "ai-ui's version is the AI-UI version it pins ($(SERVER_TAG)). Run: make release_ai_ui"
+	@echo "A CLI-only fix ships as a formula revision; see README, 'One version number'."
+	@exit 1
 
-patch_release: require_gitflow_next
-	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
-	@$(HELPERS) && \
-	NEW_VER=$$(git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1"."$$2"."$$3+1}') && \
-	git flow release start $$NEW_VER && \
-	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
-	bump_version $$NEW_VER && \
-	git add -A && \
-	git commit -m "Bump version to $$NEW_VER" && \
-	echo "" && \
-	echo "=== Release $$NEW_VER ready ===" && \
-	echo "Next: make release_finish"
+release_ai_ui:  ## Release the ai-ui CLI as AI-UI $(SERVER_TAG), the version distribution.env pins
+	@git-release custom $(SERVER_TAG)
 
-major_release: require_gitflow_next
-	@-$(MAKE) check_upstream  # advisory only; release_finish is the real gate
-	@$(HELPERS) && \
-	NEW_VER=$$(git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{print $$1+1".0.0"}') && \
-	MAJOR=$$(echo $$NEW_VER | awk -F'.' '{print $$1}') && \
-	git flow release start $$NEW_VER && \
-	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
-	bump_version $$NEW_VER && \
-	create_versioned_formula $$MAJOR && \
-	git add -A && \
-	git commit -m "Bump version to $$NEW_VER (create ai-ui@$$MAJOR)" && \
-	echo "" && \
-	echo "=== Release $$NEW_VER ready ===" && \
-	echo "Next: make release_finish"
-
-hotfix: require_gitflow_next
-	@-$(MAKE) check_upstream  # advisory only; hotfix_finish is the real gate
-	@$(HELPERS) && \
-	NEW_VER=$$(git tag -l 'v[0-9]*' --sort=-v:refname | sed 's/^v//' | head -n 1 | awk -F'.' '{if (NF < 4) print $$1"."$$2"."$$3".1"; else print $$1"."$$2"."$$3"."$$4+1}') && \
-	git flow hotfix start $$NEW_VER && \
-	echo "Bumping formula URL and VERSION to v$$NEW_VER..." && \
-	bump_version $$NEW_VER && \
-	git add -A && \
-	git commit -m "Bump version to $$NEW_VER" && \
-	echo "" && \
-	echo "=== Hotfix $$NEW_VER ready ===" && \
-	echo "Next: fix the issue, commit, then make hotfix_finish"
+require_server_version:
+	@[ "$(VER)" = "$(SERVER_TAG)" ] || { \
+		echo "ERROR: the ai-ui CLI's version is the AI-UI version it pins ($(SERVER_TAG)), not $(VER)."; \
+		echo "       Run: make release_ai_ui"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Custom release (arbitrary version jump, e.g. make custom_release VER=2.1.0)
 # ---------------------------------------------------------------------------
-custom_release: require_gitflow_next
+custom_release: require_gitflow_next require_server_version
 	@if [ -z "$(VER)" ]; then echo "Usage: make custom_release VER=2.1.0"; exit 1; fi
 	@$(HELPERS) && \
 	MAJOR=$$(echo $(VER) | awk -F'.' '{print $$1}') && \

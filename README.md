@@ -106,10 +106,10 @@ Run `ai-ui dev --where` to see where your code is saved.
 Need to pin a major version? We support that.
 
 ```bash
-brew install ai-ui@1   # after the tap and trust step above
+brew install ai-ui@3   # after the tap and trust step above: stays on AI-UI 3.x
 ```
 
-The main `ai-ui` formula always tracks the latest. Versioned formulas (`ai-ui@1`, `ai-ui@2`, ...) let you lock to a major release — useful when stability matters more than features.
+The main `ai-ui` formula follows each AI-UI release. A versioned formula (`ai-ui@3`, `ai-ui@4`, ...) locks to one AI-UI major version; the first release of a new major creates the formula for the old one. `ai-ui@1` is the last CLI from before the numbers were synced: it stays at 1.0.4 and pulls the newest server.
 
 For the *why* behind the two-file pattern (and the poka-yoke that keeps the v1 freeze from breaking when v2 ships), see [docs/versioned-formulas.md](docs/versioned-formulas.md).
 
@@ -165,7 +165,7 @@ make distribution_verify     # refuse while a copy differs or the pinned server 
 
 `release_finish` depends on `distribution_verify`, so a release halts on drift. That's the Jidoka (自働化) primitive: the machine stops itself.
 
-The brew formula installs `distribution.env` next to the `ai-ui` script, so a brew install pins the server version its release was tested with. `ai-ui version` shows both, for example `ai-ui 1.0.5 (server 3.2.0)`.
+The brew formula installs `distribution.env` next to the `ai-ui` script, so a brew install pins the server version its release was tested with. `ai-ui version` shows both, for example `ai-ui 3.2.0 (server 3.2.0)`.
 
 ## cr-deploy
 
@@ -276,16 +276,15 @@ brew install --cask mini
 brew install --cask talking
 ```
 
-## Two version tracks
+## One version number
 
-Two versions, released as a pair. `ai-ui version` shows both.
+The `ai-ui` CLI carries the version of the AI-UI server it pins: `brew upgrade ai-ui` to 3.2.0, then `ai-ui update`, puts a machine on AI-UI 3.2.0 and keeps its data. `ai-ui version` shows both numbers; they match.
 
-- **CLI track** — the version of the `ai-ui` script in this tap.
-- **Server track** — the container image `ghcr.io/sage-is/ai-ui`.
+After each AI-UI release (`make ship` there writes the new `SERVER_TAG` into `distribution.env` here), run `make release_ai_ui`: it releases the CLI under that same number. The old `patch_release`, `minor_release`, `major_release` and `hotfix` targets refuse, because they computed the CLI's number from its own last tag.
 
-Each AI-UI release is followed by a CLI patch release that pins it. AI-UI's `make ship` writes the new `SERVER_TAG` into `distribution.env` here; `make release` (patch) in this repo then publishes the CLI. So `brew upgrade ai-ui`, then `ai-ui update`, moves a machine to exactly the tested server and keeps its data. `ai-ui start --tag X.Y.Z` still runs any other version, and `--tag latest` the newest.
+A fix to the CLI alone, between AI-UI releases, ships as a formula revision: bump `revision` in `Formula/ai-ui.rb`, point `url` at a new tag named `v<version>_<revision>` (for example `v3.2.0_1`), and fill `sha256`. Brew shows it as `3.2.0_1`. Four numbers stay AI-UI's: its hotfixes are `3.2.0.1`.
 
-AI-UI's [CHANGELOG](https://github.com/Sage-is/AI-UI/blob/master/CHANGELOG.md) lists what each server release changed.
+`ai-ui start --tag X.Y.Z` still runs any other server version, and `--tag latest` the newest. AI-UI's [CHANGELOG](https://github.com/Sage-is/AI-UI/blob/master/CHANGELOG.md) lists what each release changed.
 
 ## For contributors
 

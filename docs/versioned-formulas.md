@@ -5,6 +5,8 @@ A short lesson, written so anyone on the team can follow it. The goal is **poka-
 > New to this folder? Read [00-start-here.md](00-start-here.md) first.
 > Part of the [poka-yoke master lesson plan](poka-yoke-lessons.md). This page is Lesson 1, written long.
 
+> **Since 2026-09-29 the CLI's version is the AI-UI version it pins** (3.2.0 pins AI-UI 3.2.0; see the README, "One version number"). The lesson below still holds, with AI-UI's major versions: `ai-ui@1` stays frozen at CLI 1.0.4, and the next versioned formula is `ai-ui@3`.
+
 ## Two files, one tool, two install options
 
 In [Formula/](../Formula/) you'll see two recipes:
