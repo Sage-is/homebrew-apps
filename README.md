@@ -27,6 +27,7 @@ Open your browser, you're in. Private, local, yours.
 |---------|-------------|
 | `ai-ui start` | Pull the image and start the UI (port 8080) |
 | `ai-ui start --tag 2.3.1` | Pin a specific server version |
+| `ai-ui start --runtime docker-desktop` | Keep Docker Desktop (or `orbstack`) instead of Colima; remembered |
 | `ai-ui stop` | Stop everything cleanly |
 | `ai-ui update` | Pull the latest image and restart |
 | `ai-ui update --tag 2.3.1` | Switch to a specific server tag and restart |
@@ -39,7 +40,7 @@ Open your browser, you're in. Private, local, yours.
 
 Pass `--port 3000` to `start`, `try`, or `dev` if 8080 is taken.
 
-`--tag X.Y.Z` pins any release that has been published to `ghcr.io/sage-is/ai-ui` — see the [AI-UI releases](https://github.com/Sage-is/AI-UI/releases) page for the full list. Default is `latest`.
+`--tag X.Y.Z` pins any release that has been published to `ghcr.io/sage-is/ai-ui` — see the [AI-UI releases](https://github.com/Sage-is/AI-UI/releases) page for the full list. Default is the server version this CLI pins; `--tag latest` runs the newest.
 
 ### How it flows
 
@@ -54,7 +55,7 @@ graph LR
 
     start --> docker_check{"Docker<br/>running?"}
     docker_check -->|Yes| pull["Pull image"]
-    docker_check -->|No| auto["Auto-start<br/>Desktop / OrbStack / Colima"]
+    docker_check -->|No| auto["Start the chosen runtime<br/>Colima / Docker Desktop / OrbStack"]
     auto --> pull
     pull --> run["Container up<br/>localhost:8080"]
 
@@ -115,20 +116,24 @@ For the *why* behind the two-file pattern (and the poka-yoke that keeps the v1 f
 
 ## Dependencies
 
-- **Docker** — the container runtime (Docker Desktop, OrbStack, or Colima all work)
+- **Colima** and the **Docker** CLI — the container runtime on macOS: no window, no sign-in, no licence screen
 - **Ollama** — for local LLM inference
 
-`ai-ui` auto-detects and starts your Docker provider if it's not already running. On macOS it checks Docker Desktop, OrbStack, and Colima in that order. If nothing's installed, it offers to set up Docker Desktop via Homebrew.
+`ai-ui` starts the runtime when it is not running, and installs nothing at run time. A Mac that already uses Docker Desktop or OrbStack may keep it: the first `ai-ui start` asks which runtime to use when a Mac has more than one, and `--runtime colima|docker-desktop|orbstack` picks one directly. `ai-ui` remembers the choice in `~/.sage-is/runtime`, because each runtime keeps its own `sage-ai-data` volume.
+
+Colima's first start creates a small Linux VM with Apple's own hypervisor and 4 GiB of memory; later starts leave its settings alone. Docker Desktop and OrbStack start hidden in the background once they have run before. Their first start stays in view, because it shows setup screens that need a click; sign-in is optional.
 
 ## Clean slate
 
 Need to reset everything for testing or a fresh start? `nuke-sage` is the Genesis Device.
 
 ```bash
-scripts/nuke-sage ai-ui           # remove just ai-ui
-scripts/nuke-sage --all           # remove all Sage artifacts, keep config vault
-scripts/nuke-sage --genesis       # scorched earth — everything goes
+ai-ui nuke                        # remove just ai-ui
+ai-ui nuke --all                  # remove all Sage artifacts, keep config vault
+ai-ui nuke --genesis              # scorched earth — everything goes
 ```
+
+`ai-ui nuke` runs the copy of `nuke-sage` that the formula installs; in a checkout, run `scripts/nuke-sage` directly.
 
 It scans, shows you exactly what it found, and asks before touching anything.
 
@@ -141,7 +146,7 @@ graph LR
     L0["Layer 0<br/>Containers, Volumes<br/>Images, Networks"]
     L1["Layer 1<br/>Brew Formulas + Tap"]
     L2["Layer 2<br/>~/.sage-is/ ~/.startr/<br/>Config Vaults"]
-    L3["Layer 3<br/>Docker Provider<br/>Ollama"]
+    L3["Layer 3<br/>Docker providers<br/>Ollama"]
 
     genesis_dd["--include-docker-data"] --> L4["Layer 4<br/>~/.docker/ VM data<br/>Everything Docker"]
 
@@ -152,7 +157,7 @@ graph LR
     style L4 fill:#1a1a1a,color:#fff
 ```
 
-`--all` keeps your `~/.sage-is/` vault so clone paths survive — re-setup is instant. `--genesis` erases everything including the Docker provider itself. Add `--dry-run` to preview, `--yes` for CI.
+`--all` keeps your `~/.sage-is/` vault so clone paths survive — re-setup is instant. `--genesis` erases everything, including every Docker provider on the Mac: Colima, Docker Desktop and OrbStack. Add `--dry-run` to preview, `--yes` for CI.
 
 ## The distribution.env contract
 
@@ -284,7 +289,7 @@ The `ai-ui` CLI carries the version of the AI-UI server it pins: `brew upgrade a
 
 After each AI-UI release (`make ship` there writes the new `SERVER_TAG` into `distribution.env` here), run `make release_ai_ui`: it releases the CLI under that same number. The old `patch_release`, `minor_release`, `major_release` and `hotfix` targets refuse, because they computed the CLI's number from its own last tag.
 
-A fix to the CLI alone, between AI-UI releases, ships as a formula revision: bump `revision` in `Formula/ai-ui.rb`, point `url` at a new tag named `v<version>_<revision>` (for example `v3.2.0_1`), and fill `sha256`. Brew shows it as `3.2.0_1`. Four numbers stay AI-UI's: its hotfixes are `3.2.0.1`.
+A fix to the CLI alone, between AI-UI releases, ships as a formula revision: run `make release_ai_ui` again. Once `v3.2.0` exists, it releases `v3.2.0_1`, `v3.2.0_2` and so on. The formula then states `version "3.2.0"` and `revision 1` outright, because Homebrew reads a `v3.2.0_1` tag as version 0.1. Brew and `ai-ui version` show `3.2.0_1`. Four numbers stay AI-UI's: its hotfixes are `3.2.0.1`.
 
 `ai-ui start --tag X.Y.Z` still runs any other server version, and `--tag latest` the newest. AI-UI's [CHANGELOG](https://github.com/Sage-is/AI-UI/blob/master/CHANGELOG.md) lists what each release changed.
 

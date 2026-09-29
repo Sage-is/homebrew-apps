@@ -224,13 +224,13 @@ install_hooks:  ## Run `make check` before every push (points git at tools/git-h
 	@git config core.hooksPath tools/git-hooks
 	@echo "pre-push hook on: tools/git-hooks/pre-push runs make check"
 
-release_ai_ui:  ## Release the ai-ui CLI as AI-UI $(SERVER_TAG), the version distribution.env pins
-	@git-release custom $(SERVER_TAG)
+release_ai_ui:  ## Release the ai-ui CLI as AI-UI $(SERVER_TAG); once that tag exists, as its next revision (3.2.0_1)
+	@$(HELPERS) && git-release custom "$$(next_release $(SERVER_TAG))"
 
 require_server_version:
-	@[ "$(VER)" = "$(SERVER_TAG)" ] || { \
-		echo "ERROR: the ai-ui CLI's version is the AI-UI version it pins ($(SERVER_TAG)), not $(VER)."; \
-		echo "       Run: make release_ai_ui"; exit 1; }
+	@case "$(VER)" in $(SERVER_TAG)|$(SERVER_TAG)_[0-9]*) ;; *) \
+		echo "ERROR: the ai-ui CLI's version is the AI-UI version it pins ($(SERVER_TAG)) or a revision of it, not $(VER)."; \
+		echo "       Run: make release_ai_ui"; exit 1 ;; esac
 
 # ---------------------------------------------------------------------------
 # Custom release (arbitrary version jump, e.g. make custom_release VER=2.1.0)

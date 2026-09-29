@@ -8,8 +8,14 @@ class AiUi < Formula
   depends_on "docker"
   depends_on "ollama"
 
+  on_macos do
+    depends_on "colima"
+  end
+
   def install
     libexec.install "ai-ui"
+    # `ai-ui nuke` runs the nuke-sage beside it, in scripts/.
+    (libexec/"scripts").install "scripts/nuke-sage"
     # From 3.x the CLI's version is the AI-UI version it pins, read from the
     # distribution.env beside it. A 1.x tarball's copy names an older server.
     if version.major.to_i >= 3
@@ -22,8 +28,13 @@ class AiUi < Formula
 
   def caveats
     <<~EOS
-      Start Sage AI UI (pulls and run the official server version release; `ai-ui version` shows the version):
+      Start Sage AI UI at the server version this CLI pins (`ai-ui version` shows it).
+      On a Mac it runs in Colima: no window, no sign-in.
         ai-ui start
+
+      Or keep a runtime this Mac already uses; ai-ui remembers the choice:
+        ai-ui start --runtime docker-desktop
+        ai-ui start --runtime orbstack
 
       Pin a specific server version:
         ai-ui start --tag 2.3.1
@@ -43,13 +54,16 @@ class AiUi < Formula
       Configure LLM backends in the admin UI:
         ai-ui open → Admin > Settings > Connections
 
-      Data lives in the `sage-ai-data` Docker volume (`sage-try-data` for trial).
+      Data lives in the `sage-ai-data` volume of the runtime you use (`sage-try-data` for trial).
       Nothing leaves the volume unless you back it up.
     EOS
   end
 
   test do
-    assert_match "Usage:", shell_output("#{bin}/ai-ui --help")
+    help = shell_output("#{bin}/ai-ui --help")
+    assert_match "Usage:", help
+    assert_match "--runtime NAME", help
+    assert_match "Usage: nuke-sage", shell_output("#{bin}/ai-ui nuke --help")
     assert_match "(server #{version})", shell_output("#{bin}/ai-ui version") if version.major.to_i >= 3
   end
 end

@@ -2,6 +2,15 @@
 
 ## TODO
 
+- [ ] **Colima by default: no Docker Desktop windows on first launch** (ai-ui 3.2.0_1, 2026-09-29) #ux
+  - [x] [WE] `ai-ui` runs Sage in Colima, Docker Desktop or OrbStack; the first start asks when a Mac has more than one; `--runtime NAME` picks directly, remembered in `~/.sage-is/runtime`
+  - [x] [WE] Colima is a formula dependency on macOS, so nothing installs at run time; the post-install message lists the `--runtime` one-liners; 11 runtime tests
+  - [x] [WE] `make release_ai_ui` cuts the next revision (`3.2.0_1`) once `v3.2.0` exists; the formula states `version` and `revision`
+  - [x] [WE] `ai-ui nuke` works from a brew install: the formula ships `nuke-sage`, its flags pass through, and `--genesis` removes every Docker provider
+  - [ ] [MANUALLY] Commit, then `make release_ai_ui` to release 3.2.0_1
+  - [ ] [MANUALLY] Verify on a Mac without Docker (`brew upgrade ai-ui && ai-ui start`: no window) and on a Docker Desktop Mac (the first start asks)
+  - [ ] Docker Desktop teams: an admin install with `install --accept-license --user=<name>` skips its terms and password screens
+
 - [ ] **Release the tap's tools** #critical: one command per step, dry run unless `APPLY=1`
   - [x] [WE] `make release_tools` / `tool_release` (tag, push, pin sha256, install, test, retire old `~/bin` copies; hard-linked copies left alone); sandbox-proven 2026-09-28
   - [x] [MANUALLY] Stray `release/1.0.5` branch deleted; the formula guard is on `develop` (6035334)
