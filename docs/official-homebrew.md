@@ -36,7 +36,7 @@ The rules below come from the [Package Acceptance Policy](https://docs.brew.sh/P
 
 | Tool | Shelf (core/cask) | Today (stars, 2026-09-27) | What blocks it |
 |------|-------------------|---------------------------|----------------|
-| ai-ui | core | 9 | Notability. The CLI offers to install Docker Desktop, a cask, at run time. |
+| ai-ui | core | 9 | Notability. (It installs nothing at run time since 3.2.0_1: Colima, the Docker CLI and Ollama are formula dependencies.) |
 | comicreel | core | 0 (private repo) | The repo is private and the app is a 2.0 alpha. The launcher fetches the app with uv at run time. It needs a formula that builds the packaged app from source. It is not called storyboarder because an official storyboarder cask already exists. |
 | todoscope | cask | 2 | Developer ID and notarisation are deferred. Postflight clears quarantine. Notability. |
 | downes | cask | 6 | Developer ID and notarisation are deferred. Postflight clears quarantine. Notability. |

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="3.2.0"
+VERSION="3.2.0_1"
 
 # ---------------------------------------------------------------------------
 # Canonical distribution facts.
@@ -126,7 +126,12 @@ Commands:
   open                  Open the UI in your default browser
   status                Show container status
   version               Show CLI version
-  nuke                  Remove everything Sage AI UI — clean slate
+  nuke  [--dry-run] [--all|--genesis]
+                        Remove Sage AI UI for a clean slate (ai-ui nuke --help)
+
+Every command also takes:
+  --runtime NAME        macOS container runtime: colima (the default),
+                        docker-desktop or orbstack. Remembered for next time.
 
 EOF
 }
@@ -135,7 +140,160 @@ cmd_version() {
   echo "ai-ui $VERSION (server $DEFAULT_SERVER_TAG)"
 }
 
-# Ensure Docker is reachable. Auto-starts or installs a provider if needed.
+# ---------------------------------------------------------------------------
+# Container runtime
+# ---------------------------------------------------------------------------
+# On macOS Sage runs in Colima by default: no window, no sign-in, no licence
+# screen. A Mac that already uses Docker Desktop or OrbStack may keep it. Each
+# runtime keeps its own sage-ai-data volume, so the choice is saved and every
+# command follows it. On Linux, Sage uses the Docker Engine as it is.
+RUNTIMES="colima docker-desktop orbstack"
+RUNTIME_FILE="${SAGE_CONFIG_DIR}/runtime"
+RUNTIME_FLAG=""
+RUNTIME=""
+APPLICATIONS_DIR="${APPLICATIONS_DIR:-/Applications}"
+
+# The docker context each runtime creates for itself.
+runtime_context() {
+  case "$1" in
+    colima)         echo colima ;;
+    docker-desktop) echo desktop-linux ;;
+    orbstack)       echo orbstack ;;
+  esac
+}
+
+runtime_installed() {
+  case "$1" in
+    colima)         command -v colima &>/dev/null ;;
+    docker-desktop) [[ -d "$APPLICATIONS_DIR/Docker.app" ]] ;;
+    orbstack)       [[ -d "$APPLICATIONS_DIR/OrbStack.app" ]] ;;
+    *)              return 1 ;;
+  esac
+}
+
+runtime_install_command() {
+  case "$1" in
+    colima)         echo "brew install colima" ;;
+    docker-desktop) echo "brew install --cask docker-desktop" ;;
+    orbstack)       echo "brew install --cask orbstack" ;;
+  esac
+}
+
+# The runtime this Mac used last: each one makes its own context docker's current one.
+last_used_runtime() {
+  case "$(docker context show 2>/dev/null)" in
+    desktop-linux) echo docker-desktop ;;
+    orbstack)      echo orbstack ;;
+    *)             echo colima ;;
+  esac
+}
+
+# The first start on a Mac with more than one runtime asks which to use.
+# The question goes to stderr; the answer is printed.
+ask_runtime() {
+  local default runtime answer="" installed=() n=0
+  default="$(last_used_runtime)"
+  runtime_installed "$default" || default=colima
+  for runtime in $RUNTIMES; do
+    if runtime_installed "$runtime"; then installed+=("$runtime"); fi
+  done
+  if [[ ${#installed[@]} -lt 2 || ! -t 0 ]]; then
+    echo "$default"
+    return
+  fi
+
+  {
+    echo "Sage runs in a container runtime. This Mac has:"
+    for runtime in "${installed[@]}"; do
+      n=$((n + 1))
+      echo "  $n) $runtime"
+    done
+    echo "Ran Sage here before? Pick the runtime you used: your data lives there."
+    echo "ai-ui remembers the answer; switch later with --runtime NAME."
+  } >&2
+  read -rp "Runtime [$default]: " answer || true
+  case "$answer" in
+    "")    echo "$default" ;;
+    [1-9]) echo "${installed[answer - 1]:-$answer}" ;;
+    *)     echo "$answer" ;;
+  esac
+}
+
+# Choose this command's runtime and point docker at it. `ask` (start, try,
+# update, dev) saves the choice, asking on the first start; other commands follow it.
+select_runtime() {
+  if [[ -n "$RUNTIME_FLAG" ]]; then
+    RUNTIME="$RUNTIME_FLAG"
+  elif [[ -f "$RUNTIME_FILE" ]]; then
+    RUNTIME="$(cat "$RUNTIME_FILE")"
+  elif [[ "${1:-}" == ask ]]; then
+    RUNTIME="$(ask_runtime)"
+  else
+    RUNTIME="$(last_used_runtime)"
+  fi
+  if [[ -z "$(runtime_context "$RUNTIME")" ]]; then
+    echo "Error: unknown runtime '$RUNTIME'. Use one of: $RUNTIMES"
+    exit 1
+  fi
+  if [[ -n "$RUNTIME_FLAG" || "${1:-}" == ask ]]; then
+    mkdir -p "$SAGE_CONFIG_DIR"
+    echo "$RUNTIME" > "$RUNTIME_FILE"
+  fi
+  DOCKER_CONTEXT="$(runtime_context "$RUNTIME")"
+  export DOCKER_CONTEXT
+}
+
+# A desktop app that has run before starts in the background, hidden. Its very
+# first start stays in view: it shows terms or setup screens that need a click.
+open_app() {
+  local app="$1" set_up_marker="$2"
+  if [[ -e "$set_up_marker" ]]; then
+    open -g -j -a "$app"
+  else
+    echo "$app's first start shows its own setup screens. Sign-in is optional."
+    open -a "$app"
+  fi
+}
+
+start_runtime() {
+  if ! runtime_installed "$RUNTIME"; then
+    echo "Error: $RUNTIME is not installed."
+    echo "  Install it:    $(runtime_install_command "$RUNTIME")"
+    [[ "$RUNTIME" == colima ]] || echo "  Or use Colima: ai-ui start --runtime colima"
+    exit 1
+  fi
+
+  echo "Starting $RUNTIME..."
+  case "$RUNTIME" in
+    colima)
+      if [[ "$(colima list --json 2>/dev/null)" == *'"name":"default"'* ]]; then
+        colima start
+      else
+        # The first start creates the VM. vz is Apple's own hypervisor, so there is
+        # no QEMU to install; Colima's default 2 GiB of memory is too small for Sage.
+        colima start --vm-type vz --memory 4
+      fi
+      ;;
+    docker-desktop) open_app Docker "$HOME/Library/Group Containers/group.com.docker/settings-store.json" ;;
+    orbstack)       open_app OrbStack "$HOME/.orbstack" ;;
+  esac
+}
+
+wait_for_runtime() {
+  echo "Waiting for $RUNTIME..."
+  for _ in $(seq 1 180); do
+    if docker info &>/dev/null; then
+      echo "$RUNTIME is ready."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Error: $RUNTIME did not answer within 3 minutes."
+  [[ "$RUNTIME" == colima ]] || echo "  Finish any setup screen it shows and run this again, or use Colima: --runtime colima"
+  exit 1
+}
+
+# Make sure the chosen runtime answers, starting it if needed.
 ensure_docker() {
   if docker info &>/dev/null; then
     return 0
@@ -143,45 +301,13 @@ ensure_docker() {
 
   case "$(uname)" in
     Darwin)
-      if [ -d "/Applications/Docker.app" ]; then
-        echo "Starting Docker Desktop..."
-        open -a Docker
-      elif [ -d "/Applications/OrbStack.app" ]; then
-        echo "Starting OrbStack..."
-        open -a OrbStack
-      elif command -v colima &>/dev/null; then
-        echo "Starting Colima..."
-        colima start
-      elif command -v brew &>/dev/null; then
-        echo "No Docker provider found. Installing Docker Desktop via Homebrew..."
-        brew install --cask docker
-        echo "Starting Docker Desktop..."
-        open -a Docker
-      else
-        echo "Error: No Docker provider found and Homebrew is not available."
-        echo "  Install Docker Desktop: https://docs.docker.com/get-docker/"
-        exit 1
-      fi
-
-      echo "Waiting for Docker daemon..."
-      for i in $(seq 1 30); do
-        if docker info &>/dev/null; then
-          echo "Docker is ready."
-          return 0
-        fi
-        sleep 1
-      done
-
-      echo "Error: Docker daemon did not start within 30 seconds."
-      echo "  Try starting it manually and run 'ai-ui start' again."
-      exit 1
+      start_runtime
+      wait_for_runtime
       ;;
 
     Linux)
-      if ! command -v docker &>/dev/null && command -v brew &>/dev/null; then
-        echo "Docker not found. Installing via Homebrew..."
-        brew install docker
-        echo "Note: You also need Docker Engine running."
+      if ! command -v docker &>/dev/null; then
+        echo "Error: Docker is not installed."
         echo "  See: https://docs.docker.com/engine/install/"
         exit 1
       fi
@@ -530,6 +656,7 @@ cmd_update() {
     fi
   done
 
+  ensure_docker
   echo "Pulling $IMAGE..."
   docker pull "$IMAGE"
   cmd_stop
@@ -569,6 +696,27 @@ if [[ $# -eq 0 ]]; then
 fi
 
 command="$1"; shift
+
+# --runtime NAME works with every command: take it out before the command reads its own options.
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runtime)
+      [[ $# -ge 2 ]] || { echo "Error: --runtime needs one of: $RUNTIMES"; exit 1; }
+      RUNTIME_FLAG="$2"; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+# macOS runs bash 3.2, where "${args[@]}" on an empty array trips `set -u`.
+set -- ${args[@]+"${args[@]}"}
+
+if [[ "$(uname)" == Darwin ]]; then
+  case "$command" in
+    start|try|update|dev)       select_runtime ask ;;
+    stop|logs|open|status|nuke) select_runtime ;;
+  esac
+fi
+
 case "$command" in
   start)  cmd_start "$@" ;;
   stop)   cmd_stop ;;
@@ -578,7 +726,7 @@ case "$command" in
   logs)   cmd_logs ;;
   open)   cmd_open ;;
   status) cmd_status ;;
-  nuke)   cmd_nuke ;;
+  nuke)   cmd_nuke "$@" ;;
   version|-v|--version) cmd_version ;;
   -h|--help|help) usage ;;
   *) echo "Unknown command: $command"; usage; exit 1 ;;
