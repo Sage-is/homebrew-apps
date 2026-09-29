@@ -22,7 +22,7 @@ class AiUi < Formula
 
   def caveats
     <<~EOS
-      Start Sage AI UI (pulls the server version this release pins; `ai-ui version` shows it):
+      Start Sage AI UI (pulls and run the official server version release; `ai-ui version` shows the version):
         ai-ui start
 
       Pin a specific server version:
