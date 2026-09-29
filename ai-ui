@@ -6,10 +6,10 @@ VERSION="1.0.4"
 # ---------------------------------------------------------------------------
 # Canonical distribution facts.
 # ---------------------------------------------------------------------------
-# These mirror values in distribution.env (hardlinked across homebrew-apps,
-# WEB-AI--Sage-is-AI-UI, WEB-Sage.Education-docs). When running this script
-# from a development checkout, distribution.env (next to the script) overrides
-# the hardcoded defaults. Brew-installed users get the defaults below.
+# These mirror values in distribution.env. A copy of that file sits next to
+# this script in a development checkout and in a brew install (the formula puts
+# it there), so it pins the server version this CLI release was tested with.
+# The defaults below apply only when it is absent.
 #
 # Bumping these without bumping VERSION is a footgun — they go together.
 
@@ -20,7 +20,7 @@ VOLUME="sage-ai-data"
 DATA_MOUNT="/app/backend/data"
 DEFAULT_PORT=8080
 
-# Source distribution.env if we're running from a checkout (overrides defaults).
+# Source distribution.env when it sits next to the script (a checkout or a brew install).
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$_script_dir/distribution.env" ]]; then
   set -a
@@ -132,7 +132,7 @@ EOF
 }
 
 cmd_version() {
-  echo "ai-ui $VERSION"
+  echo "ai-ui $VERSION (server $DEFAULT_SERVER_TAG)"
 }
 
 # Ensure Docker is reachable. Auto-starts or installs a provider if needed.

@@ -4,6 +4,8 @@
 
 - [ ] **Release the tap's tools** #critical: one command per step, dry run unless `APPLY=1`
   - [x] [WE] `make release_tools` / `tool_release` (tag, push, pin sha256, install, test, retire old `~/bin` copies; hard-linked copies left alone); sandbox-proven 2026-09-28
+  - [ ] [MANUALLY] ai-ui 1.0.5 first (other Macs report `brew upgrade ai-ui` as up to date): commit, then `git-release patch`; the formula now installs `distribution.env`, so the CLI pins server 3.2.0
+  - [x] [WE] Tap gates follow the copy model: `distribution_verify` compares content (was 3 hard links, broken since 2026-08-13); `check_upstream` ignores non-version tags like `pre-reword-diagnostics`
   - [ ] [MANUALLY] Commit this tap, then `make rename_projects APPLY=1` (see the renames card)
   - [ ] [MANUALLY] Release ComicReel 2.0.0-alpha.3 from `MEDIA-ComicReel`: the `comicreel` launcher pins it
   - [ ] [MANUALLY] `make release_tools APPLY=1`: comicreel, cr-deploy, git-release, mdprose, offload

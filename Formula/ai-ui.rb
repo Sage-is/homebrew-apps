@@ -9,12 +9,15 @@ class AiUi < Formula
   depends_on "ollama"
 
   def install
-    bin.install "ai-ui"
+    # The distribution.env beside the script pins the server version this
+    # release was tested with (its SERVER_TAG); `ai-ui version` shows it.
+    libexec.install "ai-ui", "distribution.env"
+    bin.write_exec_script libexec/"ai-ui"
   end
 
   def caveats
     <<~EOS
-      Start Sage AI UI (pulls ghcr.io/sage-is/ai-ui:latest):
+      Start Sage AI UI (pulls the server version this release pins; `ai-ui version` shows it):
         ai-ui start
 
       Pin a specific server version:
@@ -25,9 +28,9 @@ class AiUi < Formula
       First run prompts for a Groq API key (free tier at https://console.groq.com).
       Saved chmod 600 to ~/.sage-is/try.env.
 
-      Update to the latest server image:
-        brew upgrade ai-ui   # updates this CLI when it changes
-        ai-ui update         # pulls the newest server image and restarts
+      Move to a new AI-UI release:
+        brew upgrade ai-ui   # each AI-UI release ships a CLI release that pins it
+        ai-ui update         # pulls that server version and restarts; data stays in the volume
 
       For local LLM inference, start the Ollama service:
         brew services start ollama
@@ -42,5 +45,7 @@ class AiUi < Formula
 
   test do
     assert_match "Usage:", shell_output("#{bin}/ai-ui --help")
+    # The pinned server version came from distribution.env, not the `latest` fallback.
+    assert_match(/server \d+\.\d+\.\d+/, shell_output("#{bin}/ai-ui version"))
   end
 end

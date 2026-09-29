@@ -156,18 +156,16 @@ graph LR
 
 ## The distribution.env contract
 
-Three Sage repos — this one, [Sage-is/AI-UI](https://github.com/Sage-is/AI-UI), and [Sage-is/Sage.Education-docs](https://github.com/Sage-is/Sage.Education-docs) — read canonical distribution facts from a single hardlinked `distribution.env`. Image registry, server tag, volume name, install command, CLI version. Edit once, three repos see it. **This repo is the source of truth.**
-
-Hardlinks don't survive a `git clone`. After cloning the three siblings, run:
+Three Sage repos — this one, [Sage-is/AI-UI](https://github.com/Sage-is/AI-UI), and [Sage-is/Sage.Education-docs](https://github.com/Sage-is/Sage.Education-docs) — each keep an ordinary copy of `distribution.env`: image registry, server tag, volume name, install command, CLI version. This repo owns `CLI_VERSION`; AI-UI owns `SERVER_TAG`. The copies were hard-linked until 2026-08-13; the file's header says why that ended.
 
 ```bash
-make distribution_sync       # from any sibling, re-establishes the hardlink chain
-make distribution_verify     # confirms link count == 3
+make distribution_sync       # publish this repo's copy to the siblings
+make distribution_verify     # refuse while a copy differs or the pinned server image is missing on GHCR
 ```
 
-`release_finish` here and in AI-UI depend on `distribution_verify` — a release halts if the chain has drifted. That's the Jidoka (自働化) primitive: the machine stops itself.
+`release_finish` depends on `distribution_verify`, so a release halts on drift. That's the Jidoka (自働化) primitive: the machine stops itself.
 
-The CLI's `IMAGE_REGISTRY`, `VOLUME`, and default server tag are sourced from `distribution.env` when running from a development checkout. Brew-installed users get the values baked into the formula at install time.
+The brew formula installs `distribution.env` next to the `ai-ui` script, so a brew install pins the server version its release was tested with. `ai-ui version` shows both, for example `ai-ui 1.0.5 (server 3.2.0)`.
 
 ## cr-deploy
 
@@ -280,12 +278,14 @@ brew install --cask talking
 
 ## Two version tracks
 
-This tap ships on its own clock from the server it deploys. Two independent versions:
+Two versions, released as a pair. `ai-ui version` shows both.
 
-- **CLI track** — the version of *this CLI script*. Currently **1.0.4**. Bumps only when the `ai-ui` shell wrapper changes. A new server release does NOT force a CLI bump.
-- **Server track** — the version of the container image at `ghcr.io/sage-is/ai-ui`. Currently **3.2.0**. Bumps on every AI-UI release. Independent of this CLI.
+- **CLI track** — the version of the `ai-ui` script in this tap.
+- **Server track** — the container image `ghcr.io/sage-is/ai-ui`.
 
-Users on the brew path read [CHANGELOG.md](CHANGELOG.md) for CLI changes and [AI-UI's CHANGELOG](https://github.com/Sage-is/AI-UI/blob/master/CHANGELOG.md) for server changes.
+Each AI-UI release is followed by a CLI patch release that pins it. AI-UI's `make ship` writes the new `SERVER_TAG` into `distribution.env` here; `make release` (patch) in this repo then publishes the CLI. So `brew upgrade ai-ui`, then `ai-ui update`, moves a machine to exactly the tested server and keeps its data. `ai-ui start --tag X.Y.Z` still runs any other version, and `--tag latest` the newest.
+
+AI-UI's [CHANGELOG](https://github.com/Sage-is/AI-UI/blob/master/CHANGELOG.md) lists what each server release changed.
 
 ## For contributors
 

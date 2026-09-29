@@ -11,6 +11,9 @@ bump_version() {
 	local VER="$1"
 	sed -i '' "s|/archive/refs/tags/v[^\"]*\.tar\.gz|/archive/refs/tags/v${VER}.tar.gz|" "$FORMULA"
 	sed -i '' "s/^VERSION=\"[^\"]*\"/VERSION=\"${VER}\"/" ai-ui
+	# This repo owns CLI_VERSION in distribution.env; publish the change to the siblings.
+	sed -i '' "s/^CLI_VERSION=.*/CLI_VERSION=${VER}/" distribution.env
+	make -s distribution_sync
 
 	local MAJOR=$(echo "$VER" | awk -F'.' '{print $1}')
 	local VFORMULA="Formula/ai-ui@${MAJOR}.rb"
