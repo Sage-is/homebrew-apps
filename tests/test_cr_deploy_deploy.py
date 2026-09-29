@@ -1,5 +1,7 @@
 """Deploys: tags refused, a build must be seen starting, a dead app fails the check."""
 
+import contextlib
+import io
 import unittest
 from unittest import mock
 
@@ -19,6 +21,9 @@ class Deploy(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
+        quiet = contextlib.redirect_stdout(io.StringIO())  # the tool reports progress on stdout
+        quiet.__enter__()
+        self.addCleanup(quiet.__exit__, None, None, None)
 
     def test_a_tag_is_refused_before_anything_is_sent(self):
         cap = FakeCaptain({})

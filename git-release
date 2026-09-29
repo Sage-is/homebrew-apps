@@ -12,6 +12,13 @@
 #   git-release custom 2.1.0     # non-interactive custom version
 #   git-release -i patch          # interactive with pauses between steps
 #
+# ONE FILE: homebrew-apps/git-release is the source. The git-release formula
+# installs it, and each repo's `make release` runs it from PATH. Hard links to it:
+# ~/bin/git-release (until the brew copy replaces it) and
+# WEB-Startr.sh/src/scripts/release.sh, published at startr.sh/scripts/release.sh.
+# Edit it in place (`cat new > file`): an editor's atomic save or macOS
+# `sed -i` splits a link off.
+#
 set -euo pipefail
 
 VERSION="1.0.0"

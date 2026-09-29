@@ -4,20 +4,27 @@
 
 - [ ] **Release the tap's tools** #critical: one command per step, dry run unless `APPLY=1`
   - [x] [WE] `make release_tools` / `tool_release` (tag, push, pin sha256, install, test, retire old `~/bin` copies; hard-linked copies left alone); sandbox-proven 2026-09-28
-  - [ ] [MANUALLY] Delete the stray `release/1.0.5` branch (a mistaken test run created it); commit and push the formula guard: `origin/develop` can pin AI-UI 2.3.1 on a fresh install
-  - [ ] [MANUALLY] `make release_ai_ui`: the CLI becomes 3.2.0 (one version number, 2026-09-29) and `ai-ui@3` is created; then `brew upgrade ai-ui && ai-ui update` on other Macs
+  - [x] [MANUALLY] Stray `release/1.0.5` branch deleted; the formula guard is on `develop` (6035334)
+  - [x] [MANUALLY] `make release_ai_ui`: CLI 3.2.0 = AI-UI 3.2.0, `ai-ui@3` created (2026-09-29)
+  - [ ] [MANUALLY] On other Macs: `brew update && brew upgrade ai-ui && ai-ui update`
+  - [x] [WE] `make check` before a push: style, unit tests, formula tarballs and pins, `distribution.env` copies, new names (2026-09-29)
+  - [ ] [MANUALLY] Commit the `make check` work; `make install_hooks` once per clone so `git push` runs it
   - [x] [WE] Tap gates follow the copy model: `distribution_verify` compares content (was 3 hard links, broken since 2026-08-13); `check_upstream` ignores non-version tags like `pre-reword-diagnostics`
   - [ ] [MANUALLY] Commit this tap, then `make rename_projects APPLY=1` (see the renames card)
   - [ ] [MANUALLY] Release ComicReel 2.0.0-alpha.3 from `MEDIA-ComicReel`: the `comicreel` launcher pins it
   - [ ] [MANUALLY] `make release_tools APPLY=1`: comicreel, cr-deploy, git-release, mdprose, offload
   - [ ] [MANUALLY] First `v0.1.0` of Sage-is/work-delegation, then `make release_tools APPLY=1` again to pin it
 
+- [ ] **One git-release, from the tap** (2026-09-29): repos run it from PATH and keep no copy
+  - [x] [WE] The 16 repos' `make release` runs `git-release`, with the brew install line when it is missing
+  - [ ] [MANUALLY] Delete each repo's `scripts/release.sh` (a hard link; the tap keeps the file), then commit the Makefile and the deletion after `git-release-v1.0.0` ships
+  - [ ] [MANUALLY] After `brew install git-release`: `rm ~/bin/git-release`; startr.sh keeps `src/scripts/release.sh`, its published copy
+
 - [ ] **Renames and branding, decided 2026-09-28** #brand: plain tool names, no prefix
   - [x] [WE] `captain` → `cr-deploy` (an official cask owns `captain`; CapRover's npm CLI ships `caprover-*` commands, including `caprover-deploy`); `captain` alias until cr-deploy 0.2.0
   - [x] [WE] storyboarder → comicreel: app shown as "Sage.is ComicReel", package `comicreel`, `COMICREEL_*` settings; `storyboarder` command and `STORYBOARDER_*` read for one release; model cache moves on first launch
   - [x] [WE] local-whisper → Talking: links, notes and the app's Settings link point at `Sage-is/talking`; cask url and homepage too
   - [ ] [MANUALLY] `make rename_projects APPLY=1`: repos to `Sage-is/comicreel` and `Sage-is/talking`, folders to `MEDIA-ComicReel` and `APP-Talking`, Claude memory carried along
-  - [ ] [MANUALLY] Commit `scripts/release.sh` in the 16 repos that share the `git-release` hard link (it gained `version`); the tap's `git-release` is now in that chain
   - [ ] Next release after these: drop the `captain`, `storyboarder`, `STORYBOARDER_*` and `STORYBOARDER_REF` aliases
   - [x] `SAGE.IS mini` keeps its casing
 

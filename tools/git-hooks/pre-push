@@ -1,0 +1,4 @@
+#!/bin/sh
+# Refuse a push the tap's checks reject: style, unit tests, formula tarballs and
+# pins, distribution.env copies, and the names of new formulae.
+exec make -s check

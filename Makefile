@@ -118,6 +118,7 @@ help:
 	@echo "  sha256              Compute sha256 for current formula URL"
 	@echo "  show-version        Show current version info"
 	@echo "  check-upstream      Compare local version against upstream AI-UI repo"
+	@echo "  check               Before a push: style, tests, formula tarballs, copies, new names"
 	@echo "  release_ai_ui       Release the ai-ui CLI as the AI-UI version it pins ($(SERVER_TAG))"
 	@echo "  feature_finish      Finish feature: merge into develop, push"
 	@echo "  release_finish      Finish release: merge, tag, push, sha256"
@@ -208,6 +209,20 @@ patch_release minor_release major_release hotfix:
 	@echo "ai-ui's version is the AI-UI version it pins ($(SERVER_TAG)). Run: make release_ai_ui"
 	@echo "A CLI-only fix ships as a formula revision; see README, 'One version number'."
 	@exit 1
+
+check:  ## Before a push: style, unit tests, formula tarballs and pins, distribution.env copies, new names
+	@brew style Formula Casks
+	@cd tests && python3 -B -m unittest -q
+	@scripts/check-formulae.sh
+	@$(MAKE) -s distribution_copies
+	@scripts/check-names.sh $$(git diff --name-only --diff-filter=A origin/develop -- Formula Casks | sed 's|.*/||; s|\.rb$$||')
+
+check_names:  ## Are these names free in Homebrew? NAMES="a b" (also warns on npm and this Mac's PATH)
+	@scripts/check-names.sh $(NAMES)
+
+install_hooks:  ## Run `make check` before every push (points git at tools/git-hooks)
+	@git config core.hooksPath tools/git-hooks
+	@echo "pre-push hook on: tools/git-hooks/pre-push runs make check"
 
 release_ai_ui:  ## Release the ai-ui CLI as AI-UI $(SERVER_TAG), the version distribution.env pins
 	@git-release custom $(SERVER_TAG)
@@ -381,7 +396,7 @@ setup_siblings:
 
 ## setup — fresh-machine bootstrap. Currently equivalent to setup_siblings;
 ## reserved for additional homebrew-apps setup steps (lint config, etc.).
-setup: setup_siblings
+setup: setup_siblings install_hooks
 	@echo ""
 	@echo "=== Setup complete ==="
 
@@ -397,12 +412,14 @@ distribution_sync:
 	done
 	@$(MAKE) distribution_verify
 
-distribution_verify: check_upstream
+distribution_copies:  # the siblings' copies of distribution.env equal this one
 	@for p in $(DIST_PEERS); do \
 		test -f "$$p" || { echo "FAIL: $$p missing — run 'make setup_siblings'"; exit 1; }; \
 		cmp -s $(DIST_SOURCE) "$$p" || { echo "FAIL: $$p differs. Reconcile by hand, then 'make distribution_sync'."; exit 1; }; \
 	done
 	@echo "OK: distribution.env matches both siblings."
+
+distribution_verify: check_upstream distribution_copies
 	@server_tag=$$(grep '^SERVER_TAG=' $(DIST_SOURCE) | cut -d= -f2); \
 	image_reg=$$(grep '^IMAGE=' $(DIST_SOURCE) | cut -d= -f2); \
 	echo "Checking GHCR: $$image_reg:$$server_tag ..."; \

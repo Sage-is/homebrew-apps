@@ -223,6 +223,8 @@ brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install git-relea
 git-release patch
 ```
 
+A repo's `make release` runs it from PATH, so repos keep no copy of their own. [startr.sh](https://startr.sh/scripts/release.sh) publishes the same file for projects without brew.
+
 ## mdprose
 
 **mdprose** is Markdown prose hygiene: unwrap hard-wrapped paragraphs, strip stray whitespace.
