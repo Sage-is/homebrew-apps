@@ -184,3 +184,32 @@ class Nuke(Mac):
         (self.state / "running-desktop-linux").touch()
         self.run_ai_ui("nuke", "--dry-run")
         self.assertIn("docker desktop-linux inspect sage-ai", self.calls())
+
+
+class CredentialHelper(Mac):
+    """Docker Desktop leaves "credsStore": "desktop" behind; without its helper, every pull fails."""
+
+    def write_docker_config(self):
+        config = self.home / ".docker" / "config.json"
+        config.parent.mkdir()
+        config.write_text('{"auths": {}, "credsStore": "desktop", "currentContext": "colima"}\n')
+        return config
+
+    def test_a_missing_helper_is_dropped_before_the_pull_with_a_backup(self):
+        config = self.write_docker_config()
+        result = self.run_ai_ui("start")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("credsStore", config.read_text())
+        self.assertIn('"currentContext":"colima"', config.read_text())
+        backups = list(config.parent.glob("config.json.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn('"credsStore": "desktop"', backups[0].read_text())
+        self.assertIn("docker-credential-desktop is not installed", result.stdout)
+
+    def test_an_installed_helper_is_left_alone(self):
+        config = self.write_docker_config()
+        helper = Path(self.env["PATH"].split(":")[0]) / "docker-credential-desktop"
+        helper.write_text("#!/bin/bash\n")
+        helper.chmod(0o755)
+        self.run_ai_ui("start")
+        self.assertIn('"credsStore": "desktop"', config.read_text())
