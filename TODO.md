@@ -7,7 +7,10 @@
   - [x] [WE] Colima is a formula dependency on macOS, so nothing installs at run time; the post-install message lists the `--runtime` one-liners; 11 runtime tests
   - [x] [WE] `make release_ai_ui` cuts the next revision (`3.2.0_1`) once `v3.2.0` exists; the formula states `version` and `revision`
   - [x] [WE] `ai-ui nuke` works from a brew install: the formula ships `nuke-sage`, its flags pass through, and `--genesis` removes every Docker provider
-  - [ ] [MANUALLY] Commit, then `make release_ai_ui` to release 3.2.0_1
+  - [x] [MANUALLY] Commit, then `make release_ai_ui` to release 3.2.0_1 (2026-09-29)
+  - [x] [WE] 3.2.0_1 on a school Mac: Colima's VM up in 32 s, no window; the pull then failed on Docker Desktop's leftover `credsStore`
+  - [x] [WE] `ai-ui` drops a `credsStore` whose helper is missing, with a dated backup; 2 tests
+  - [ ] [MANUALLY] Commit, then `make release_ai_ui` to release 3.2.0_2
   - [ ] [MANUALLY] Verify on a Mac without Docker (`brew upgrade ai-ui && ai-ui start`: no window) and on a Docker Desktop Mac (the first start asks)
   - [ ] Docker Desktop teams: an admin install with `install --accept-license --user=<name>` skips its terms and password screens
 

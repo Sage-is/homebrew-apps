@@ -123,6 +123,8 @@ For the *why* behind the two-file pattern (and the poka-yoke that keeps the v1 f
 
 Colima's first start creates a small Linux VM with Apple's own hypervisor and 4 GiB of memory; later starts leave its settings alone. Docker Desktop and OrbStack start hidden in the background once they have run before. Their first start stays in view, because it shows setup screens that need a click; sign-in is optional.
 
+A Mac that once ran Docker Desktop may still name its credential helper in `~/.docker/config.json` (`"credsStore": "desktop"`). Without Docker Desktop that helper is gone and every pull fails, so `ai-ui` drops the key and keeps a dated backup beside the file.
+
 ## Clean slate
 
 Need to reset everything for testing or a fresh start? `nuke-sage` is the Genesis Device.
