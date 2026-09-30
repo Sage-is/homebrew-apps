@@ -3,7 +3,7 @@ class AiUiAT3 < Formula
   homepage "https://github.com/Sage-is/AI-UI"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/v3.2.0_2.tar.gz"
   version "3.2.0"
-  sha256 "72455493d4ee738825a8eb6a6f6911e20869426b093146c69605d200aab90656"
+  sha256 "8831b5cb11a0bfc72582429df816bcad2daaf5668ffcb13e21d169566199ecc2"
   license "MIT"
   revision 2
   keg_only :versioned_formula
