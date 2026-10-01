@@ -62,22 +62,26 @@ Anyone who typed `brew install ai-ui@1` keeps running v1. Anyone who typed `brew
 
 The trap: if our release script bumped *every* `ai-ui@N.rb` file every time we shipped, the "stay on v1" promise would break the moment v2 went out.
 
-The safety net lives in [scripts/formula-helpers.sh](../scripts/formula-helpers.sh). The `bump_version` function only updates `ai-ui@${MAJOR}.rb` where `${MAJOR}` is derived from the **new** version being released:
+The safety net lives in [scripts/ai-ui-formula.sh](../scripts/ai-ui-formula.sh). It updates only `Formula/ai-ui.rb` and `Formula/ai-ui@<major of the new release>.rb`. When a release starts a new major, it first copies the current formula to `ai-ui@<old major>.rb`. That copy carries the class `AiUiAT<N>` and the `keg_only :versioned_formula` line, and the script never touches it again. The `major` comes from the **new** version being released:
 
 ```bash
-local MAJOR=$(echo "$VER" | awk -F'.' '{print $1}')
-local VFORMULA="Formula/ai-ui@${MAJOR}.rb"
-if [ -f "$VFORMULA" ]; then
-    # update only this versioned file
-fi
+for f in "$formula" "Formula/ai-ui@${major}.rb"; do
+  [ -f "$f" ] || continue
+  sed -i '' \
+    -e "s|^  url \".*\"|  url \"$url\"|" \
+    -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" \
+    -e '/^  version "/d' -e '/^  revision /d' \
+    "$f"
+  echo "  $f -> AI-UI $version"
+done
 ```
 
-So when we ship v1.0.4, only `ai-ui@1.rb` gets touched. When we later ship v2.0.0, only `ai-ui@2.rb` gets touched — `ai-ui@1.rb` is correctly left alone, frozen at the last v1.x.
+So when we ship v1.0.4, the script updates `ai-ui.rb` and `ai-ui@1.rb`. When we later ship v2.0.0, it updates only `ai-ui.rb` — `ai-ui@1.rb` is correctly left alone, frozen at the last v1.x.
 
 ## Rules to keep this working
 
-1. **Never hand-edit `ai-ui@N.rb` to point at a different major version.** Use the release targets in the [Makefile](../Makefile) (`make patch_release`, `make minor_release`, `make major_release`). They call `bump_version`, which knows the rule.
-2. **Versioned formulas are created once, by `make major_release`.** That's the only place that runs `create_versioned_formula`. Don't `cp` files manually.
+1. **Never hand-edit `ai-ui@N.rb` to point at a different major version.** Run `make ai_ui_formula` after an AI-UI release. That target runs `scripts/ai-ui-formula.sh`, which knows the rule. The old targets (`patch_release`, `minor_release`, `major_release`) no longer exist.
+2. **Versioned formulas are created by `make ai_ui_formula`, at the first release of a new major.** The script runs the copy step there. Never create them by hand, and don't `cp` files manually.
 3. **If you're tempted to `sed -i` across all formula files at once, stop.** That's the exact mistake the helper is preventing. The whole point of `ai-ui@1.rb` is that it gets *left alone* when the main formula moves to v2.
 4. **Old versioned formulas can still get bug fixes** (sha256 corrections, dependency renames) — just not version bumps.
 
@@ -85,5 +89,5 @@ So when we ship v1.0.4, only `ai-ui@1.rb` gets touched. When we later ship v2.0.
 
 - [Formula/ai-ui.rb](../Formula/ai-ui.rb) — the rolling latest
 - [Formula/ai-ui@1.rb](../Formula/ai-ui@1.rb) — the v1 pin
-- [scripts/formula-helpers.sh](../scripts/formula-helpers.sh) — where the safety net lives
-- [Makefile](../Makefile) — release targets that call the helpers
+- [scripts/ai-ui-formula.sh](../scripts/ai-ui-formula.sh) — where the safety net lives
+- [Makefile](../Makefile) — the ai_ui_formula target that runs the safety net

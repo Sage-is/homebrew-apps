@@ -44,6 +44,7 @@ class AiUiAT3 < Formula
 
       Or boot a try.sage trial (seeded personas, hidden LLM, 24h auto-reset):
         ai-ui try
+
       First run prompts for a Groq API key (free tier at https://console.groq.com).
       Saved chmod 600 to ~/.sage-is/try.env.
 

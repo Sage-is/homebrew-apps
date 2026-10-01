@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Before a commit, fix what `brew style` can fix in staged formulae and casks:
+# trailing spaces, most often. Any fix stops the commit so you see it first.
+set -euo pipefail
+
+files=$(git diff --cached --name-only --diff-filter=ACM -- 'Formula/*.rb' 'Casks/*.rb')
+[ -n "$files" ] || exit 0
+
+# shellcheck disable=SC2086  # formula and cask names never contain spaces
+before=$(shasum $files)
+# shellcheck disable=SC2086
+if ! brew style --fix $files; then
+  echo "pre-commit: brew style found a problem it cannot fix (above)."
+  exit 1
+fi
+# shellcheck disable=SC2086
+if [ "$(shasum $files)" != "$before" ]; then
+  echo "pre-commit: brew style fixed" $files
+  echo "  Look with git diff, then git add them and commit again."
+  exit 1
+fi

@@ -2,6 +2,15 @@
 
 ## TODO
 
+- [ ] **The ai-ui CLI moves into AI-UI** (2026-09-30): Homebrew counts the formula's download repo, so AI-UI's stars and forks must be the ones counted #launch
+  - [x] [WE] AI-UI's `cli/` holds `ai-ui`, `nuke-sage` and 16 tests (gate `cli_tests`); `make ai_ui_formula` points the formula at an AI-UI release and keeps the old major as `ai-ui@N`
+  - [x] [WE] Git-flow release machinery for ai-ui removed (Makefile 463 to 190 lines); README, `docs/versioned-formulas.md` and `docs/poka-yoke-lessons.md` follow
+  - [x] [WE] Guards: `make check` refuses while old CLI copies remain; `ai_ui_formula` and the formula check refuse a release without `cli/`; a pre-commit hook runs `brew style --fix`; hooks on for this Mac
+  - [ ] [MANUALLY] Remove the tap's copies in the same commit: `git rm ai-ui scripts/nuke-sage scripts/formula-helpers.sh tests/test_ai_ui_runtime.py`
+  - [x] [WE] AI-UI's `make ship` runs `ai_ui_formula` last; `make check` refuses a push while the formula lags AI-UI's newest release (2026-09-30)
+  - [ ] [MANUALLY] After AI-UI's next release: commit and push the tap's formula change, then `brew upgrade ai-ui && brew test ai-ui`
+  - [ ] Later: `CLI_VERSION` in `distribution.env` is unread now that the CLI's version is `SERVER_TAG`; drop it from all three copies
+
 - [ ] **Colima by default: no Docker Desktop windows on first launch** (ai-ui 3.2.0_1, 2026-09-29) #ux
   - [x] [WE] `ai-ui` runs Sage in Colima, Docker Desktop or OrbStack; the first start asks when a Mac has more than one; `--runtime NAME` picks directly, remembered in `~/.sage-is/runtime`
   - [x] [WE] Colima is a formula dependency on macOS, so nothing installs at run time; the post-install message lists the `--runtime` one-liners; 11 runtime tests
@@ -10,8 +19,8 @@
   - [x] [MANUALLY] Commit, then `make release_ai_ui` to release 3.2.0_1 (2026-09-29)
   - [x] [WE] 3.2.0_1 on a school Mac: Colima's VM up in 32 s, no window; the pull then failed on Docker Desktop's leftover `credsStore`
   - [x] [WE] `ai-ui` drops a `credsStore` whose helper is missing, with a dated backup; 2 tests
-  - [ ] [MANUALLY] Commit, then `make release_ai_ui` to release 3.2.0_2
-  - [ ] [MANUALLY] Verify on a Mac without Docker (`brew upgrade ai-ui && ai-ui start`: no window) and on a Docker Desktop Mac (the first start asks)
+  - [x] [MANUALLY] 3.2.0_2 released and working on the school Mac (2026-09-30), the last CLI built from this tap
+  - [ ] [MANUALLY] Verify on a Docker Desktop Mac: the first start asks which runtime to use
   - [ ] Docker Desktop teams: an admin install with `install --accept-license --user=<name>` skips its terms and password screens
 
 - [ ] **Release the tap's tools** #critical: one command per step, dry run unless `APPLY=1`
@@ -49,7 +58,7 @@
 - [x] Auto-bump `ai-ui` script VERSION in `bump_formula_url`
 - [x] Add `require_gitflow_next` guard for git-flow-next compatibility
 - [ ] Clean stale `release/0` git flow config entry
-- [ ] Test full `make patch_release` → `make release_finish` cycle end-to-end
+- [x] **OBSOLETE (2026-09-30)**: test the `patch_release` → `release_finish` cycle; the ai-ui CLI moved into AI-UI and those targets are gone
 
 ### Script (`ai-ui`)
 

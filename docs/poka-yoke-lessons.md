@@ -1,5 +1,7 @@
 # Poka-Yoke Lessons — How We Build So Mistakes Are Hard
 
+2026-09-30: the ai-ui CLI moved into AI-UI's cli/ folder. The git-flow release targets named below (patch_release, release_finish and the rest) and scripts/formula-helpers.sh are retired; scripts/ai-ui-formula.sh now points the formula at each AI-UI release. The lessons stand.
+
 > **New here?** Read [00-start-here.md](00-start-here.md) first. It explains what poka-yoke is, why we care, and gives you a small vocabulary so the rest of this page makes sense.
 
 **Poka-yoke** (POH-kah YOH-kay) is a Japanese term from the Toyota factories. It means *mistake-proofing*. The idea: don't trust people to remember the rule — design the rule into the tool, so the wrong move feels harder than the right one.
@@ -45,7 +47,7 @@ Each lesson below shows one of these in action.
 
 **The fix:** let the script derive them from real input.
 
-**Where to see it:** in [scripts/formula-helpers.sh:15](../scripts/formula-helpers.sh#L15), the `bump_version` helper does this:
+**Where to see it:** in `scripts/formula-helpers.sh` (retired), the `bump_version` helper does this:
 
 ```bash
 local MAJOR=$(echo "$VER" | awk -F'.' '{print $1}')
@@ -163,7 +165,7 @@ It only deletes the leftover state file if there's no **real** merge in progress
 
 **The fix:** name the modes by their blast radius. Make the user pick.
 
-**Where to see it:** [scripts/nuke-sage](../scripts/nuke-sage) — three explicit modes:
+**Where to see it:** `cli/nuke-sage` in [Sage-is/AI-UI](https://github.com/Sage-is/AI-UI/tree/develop/cli) — three explicit modes:
 
 | Mode | What it removes |
 |---|---|
@@ -185,7 +187,7 @@ There's also a sub-flag, `--include-docker-data`, that **only works with `--gene
 
 **The fix:** every destructive command has a `--dry-run` that shows what *would* happen.
 
-**Where to see it:** [scripts/nuke-sage](../scripts/nuke-sage) — `--dry-run` lists every container, volume, image, and brew formula it would remove, without removing anything.
+**Where to see it:** `cli/nuke-sage` in [Sage-is/AI-UI](https://github.com/Sage-is/AI-UI/tree/develop/cli) — `--dry-run` lists every container, volume, image, and brew formula it would remove, without removing anything.
 
 **Why it's a poka-yoke:** dry-run is free. It costs the user 2 seconds and saves them an hour when they realize they were in the wrong directory.
 
@@ -223,7 +225,7 @@ We never use `[USER]` or `[ME]` — those framings imply hand-off. `[WE]` signal
 **Where to see it:**
 
 - [ai-ui:4](../ai-ui#L4) — `VERSION="1.0.3"` is a single shell variable in the CLI.
-- [scripts/formula-helpers.sh:13](../scripts/formula-helpers.sh#L13) — `bump_version` updates the formula URL **and** that VERSION line in the same call.
+- `scripts/formula-helpers.sh` (retired) — `bump_version` updates the formula URL **and** that VERSION line in the same call.
 - nlt-py — `__version__` lives in `__init__.py` and is kept in sync with `pyproject.toml` by a single tool.
 
 **Why it's a poka-yoke:** humans copy-paste between files and forget one. Scripts that update everything in one shot don't forget.
@@ -445,7 +447,7 @@ Lessons we *don't* keep: ones that say "be careful." Careful is not a poka-yoke.
 
 - [versioned-formulas.md](versioned-formulas.md) — full write-up of Lesson 1
 - [../Makefile](../Makefile) — release flow
-- [../scripts/formula-helpers.sh](../scripts/formula-helpers.sh) — `bump_version` and `create_versioned_formula`
-- [../scripts/nuke-sage](../scripts/nuke-sage) — blast-radius modes
-- [../ai-ui](../ai-ui) — the CLI, including the project registry
+- `scripts/formula-helpers.sh` (retired) — `bump_version` and `create_versioned_formula`
+- `cli/nuke-sage` in [Sage-is/AI-UI](https://github.com/Sage-is/AI-UI/tree/develop/cli) — blast-radius modes
+- `cli/ai-ui` in [Sage-is/AI-UI](https://github.com/Sage-is/AI-UI/tree/develop/cli) — the CLI, including the project registry
 - `~/.claude/CLAUDE.md` — global conventions ([MANUALLY]/[WE], hardlinks, ai-coauthor)

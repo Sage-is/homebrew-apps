@@ -37,7 +37,7 @@ wait_for_archive() {  # GitHub serves a new tag's archive within seconds
 }
 
 [ -f "$formula" ] || die "no $formula"
-case "$tool" in ai-ui*) die "ai-ui releases with \`make release\`, which also moves distribution.env" ;; esac
+case "$tool" in ai-ui*) die "ai-ui ships inside AI-UI's releases: run \`make ai_ui_formula\` after one" ;; esac
 
 pinned_version=$(field version)
 [ -n "$pinned_version" ] || die "$formula needs a version line"

@@ -2,8 +2,8 @@
 # Release every formula in this tap that is behind: `make release_tools [APPLY=1]`.
 #
 # Behind: the tool says a newer version than its formula pins, or the formula
-# still has a placeholder sha256. ai-ui is left out; it releases with
-# `make release`, which also moves distribution.env.
+# still has a placeholder sha256. ai-ui is left out; it ships inside AI-UI's
+# releases, and `make ai_ui_formula` points its formula at each one.
 #
 # --dry-run (the default) prints the plan and each release's steps; it
 # commits, tags and pushes nothing. --apply releases them one by one through

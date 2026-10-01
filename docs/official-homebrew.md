@@ -32,11 +32,13 @@ The rules below come from the [Package Acceptance Policy](https://docs.brew.sh/P
 
 **Quarantine.** A cask must not clear the quarantine flag.
 
+**Signing is a cask rule.** Homebrew builds a formula from source, so a command-line tool needs no signature or notarisation.
+
 ## Where each tool stands
 
 | Tool | Shelf (core/cask) | Today (stars, 2026-09-27) | What blocks it |
 |------|-------------------|---------------------------|----------------|
-| ai-ui | core | 9 | Notability. (It installs nothing at run time since 3.2.0_1: Colima, the Docker CLI and Ollama are formula dependencies.) |
+| ai-ui | core | 9 on AI-UI; 0 on this tap, where the CLI lives (2026-09-30) | Notability, on the route below. In core, Homebrew's maintainers own `revision`, so CLI-only `3.2.0_N` releases end when the CLI moves into AI-UI. Its default image is a pinned tag; pinning it by digest would make the run-time pull immutable. It installs nothing at run time since 3.2.0_1. |
 | comicreel | core | 0 (private repo) | The repo is private and the app is a 2.0 alpha. The launcher fetches the app with uv at run time. It needs a formula that builds the packaged app from source. It is not called storyboarder because an official storyboarder cask already exists. |
 | todoscope | cask | 2 | Developer ID and notarisation are deferred. Postflight clears quarantine. Notability. |
 | downes | cask | 6 | Developer ID and notarisation are deferred. Postflight clears quarantine. Notability. |
@@ -47,6 +49,22 @@ The rules below come from the [Package Acceptance Policy](https://docs.brew.sh/P
 | git-release | core | 0 | Notability, counted on its own repo (it lives in this tap today). Otherwise shaped for core. |
 | work-delegation | core | 0 | Notability. Otherwise shaped for core. |
 | cr-deploy | stays in the tap | 0 | It is an internal ops tool. (Formerly captain; renamed because an official cask uses that name and CapRover's own CLI ships a `caprover-deploy` command.) |
+
+## The route for ai-ui (decided 2026-09-30)
+
+**What Homebrew counts.** Its audit measures the repo in the formula's download `url`, then the homepage. Today that is this tap, with 0 stars, 0 forks and 0 watchers. So the CLI moves into AI-UI, and the formula downloads AI-UI's release.
+
+**Which bar.** We submit it ourselves, so the bar is three times the normal one: 225 stars, 90 forks or 90 watchers on AI-UI. One is enough. The audit compares the pull-request author with the repo owner; the written policy counts any of us as the owner.
+
+**Where the numbers come from.** Similar projects (Open WebUI, LibreChat, LobeHub, AnythingLLM) have 5 to 9 stars per fork and 160 to 270 stars per watcher. Left alone, 225 stars comes long before 90 forks. So forks come from work that needs one, and stars from a launch:
+- Workshops where teams fork AI-UI, change something real and run it with `ai-ui dev`.
+- An opt-in `ai-ui dev --fork`, and a fork-and-PR path for outside contributors.
+- A launch: awesome-selfhosted "(fork of Open WebUI)", a Show HN, r/selfhosted and r/LocalLLaMA.
+- Release notes for operators through Watch, Custom, Releases.
+
+**What we never do.** Buy or reward stars, forks or watches: GitHub bans rank abuse and engagement paid for with "gifts or other give-aways". Ask friends to upvote: Show HN forbids it. Run empty-fork drives, or find a stand-in to submit at the lower bar. Send a machine-written awesome-selfhosted entry: that list refuses them.
+
+The checklist lives on AI-UI's board, under Pitch & Documentation.
 
 ## How to submit when a tool qualifies
 

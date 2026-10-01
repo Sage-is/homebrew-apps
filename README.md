@@ -135,7 +135,7 @@ ai-ui nuke --all                  # remove all Sage artifacts, keep config vault
 ai-ui nuke --genesis              # scorched earth — everything goes
 ```
 
-`ai-ui nuke` runs the copy of `nuke-sage` that the formula installs; in a checkout, run `scripts/nuke-sage` directly.
+`ai-ui nuke` runs the copy of `nuke-sage` that the formula installs; in an AI-UI checkout, run `cli/nuke-sage` directly.
 
 It scans, shows you exactly what it found, and asks before touching anything.
 
@@ -170,7 +170,7 @@ make distribution_sync       # publish this repo's copy to the siblings
 make distribution_verify     # refuse while a copy differs or the pinned server image is missing on GHCR
 ```
 
-`release_finish` depends on `distribution_verify`, so a release halts on drift. That's the Jidoka (自働化) primitive: the machine stops itself.
+`ai_ui_formula` depends on `distribution_verify`, so the formula never points at a release whose image or copies are missing. That's the Jidoka (自働化) primitive: the machine stops itself.
 
 The brew formula installs `distribution.env` next to the `ai-ui` script, so a brew install pins the server version its release was tested with. `ai-ui version` shows both, for example `ai-ui 3.2.0 (server 3.2.0)`.
 
@@ -287,17 +287,17 @@ brew install --cask talking
 
 ## One version number
 
-The `ai-ui` CLI carries the version of the AI-UI server it pins: `brew upgrade ai-ui` to 3.2.0, then `ai-ui update`, puts a machine on AI-UI 3.2.0 and keeps its data. `ai-ui version` shows both numbers; they match.
+Since 2026-09-30 the `ai-ui` CLI lives in AI-UI's `cli/` folder and ships inside every AI-UI release. Its version is the AI-UI version it pins. `ai-ui version` shows both numbers; they match.
 
-After each AI-UI release (`make ship` there writes the new `SERVER_TAG` into `distribution.env` here), run `make release_ai_ui`: it releases the CLI under that same number. The old `patch_release`, `minor_release`, `major_release` and `hotfix` targets refuse, because they computed the CLI's number from its own last tag.
+After each AI-UI release (`make ship` there writes the new `SERVER_TAG` into `distribution.env` here), run `make ai_ui_formula`. It points `Formula/ai-ui.rb` and the matching `ai-ui@N` at that release's tarball and fills the sha256. The first release of a new major keeps the old major as `ai-ui@<old>`.
 
-A fix to the CLI alone, between AI-UI releases, ships as a formula revision: run `make release_ai_ui` again. Once `v3.2.0` exists, it releases `v3.2.0_1`, `v3.2.0_2` and so on. The formula then states `version "3.2.0"` and `revision 1` outright, because Homebrew reads a `v3.2.0_1` tag as version 0.1. Brew and `ai-ui version` show `3.2.0_1`. Four numbers stay AI-UI's: its hotfixes are `3.2.0.1`.
+A fix to the CLI alone ships in the next AI-UI release; four-number hotfixes stay AI-UI's. `3.2.0_2` was the last CLI built from this tap.
 
 `ai-ui start --tag X.Y.Z` still runs any other server version, and `--tag latest` the newest. AI-UI's [CHANGELOG](https://github.com/Sage-is/AI-UI/blob/master/CHANGELOG.md) lists what each release changed.
 
 ## For contributors
 
-This repo uses [git-flow-next](https://github.com/will-stone/git-flow-next) for releases AND for feature work. **The Sage projects use feature branches, not pull requests, as the primary contribution flow.** The reason is portability: git-flow works against any git remote — self-hosted, mirrored, federated — not just centralized SaaS. A deliberate stance on resilience, not stylistic preference.
+This repo uses [git-flow-next](https://github.com/will-stone/git-flow-next) for feature work. **The Sage projects use feature branches, not pull requests, as the primary contribution flow.** The reason is portability: git-flow works against any git remote — self-hosted, mirrored, federated — not just centralized SaaS. A deliberate stance on resilience, not stylistic preference.
 
 ```bash
 git flow feature start <feature-name>    # create branch
@@ -306,34 +306,17 @@ git flow feature finish <feature-name>   # merge into develop, delete branch
 git push origin develop                  # push to whichever remote you use
 ```
 
-PRs are accepted but not the primary path. The Makefile handles the full release workflow — version bumping, formula URL updates, sha256 computation, the works.
+PRs are accepted but not the primary path.
 
 ```bash
-make help               # see all targets
-make release            # interactive release flow
-make patch_release      # start a patch bump
-make release_finish     # merge, tag, push, update sha256
-make check-upstream     # compare local version against upstream AI-UI
+make help                           # every target
+make ai_ui_formula                  # after an AI-UI release: point the ai-ui formula at it
+make tool_release TOOL=x VERSION=y  # release one of the other tools
+make release_tools                  # release every tool that is behind
+make check                          # before a push
 ```
 
-```mermaid
-graph LR
-    start_rel["make patch_release<br/>minor_release<br/>major_release"] --> branch["Create<br/>release branch"]
-    branch --> bump["Bump version<br/>in formula + CLI"]
-    bump --> commit["Commit"]
-    commit --> finish["make release_finish"]
-    finish --> merge["Merge to master<br/>+ tag + push"]
-    merge --> wait["Wait for<br/>GitHub archive"]
-    wait --> sha["Compute sha256<br/>update formula"]
-    sha --> sync["Commit sha256<br/>sync to develop"]
-    sync --> done["Release<br/>complete"]
-```
-
-Release targets automatically update the formula URL, the CLI's VERSION string, and any matching versioned formulas. After tagging, `release_finish` waits for the GitHub archive to become available, computes the sha256, and commits it to both master and develop. Two commands, zero manual steps.
-
-Tools other than ai-ui release with `make tool_release TOOL=x VERSION=y`.
-
-Major releases (`make major_release`) also create a versioned formula — `ai-ui@1`, `ai-ui@2`, etc. — so users can pin.
+`ai-ui` follows AI-UI's releases through `make ai_ui_formula`; the other tools release with `make tool_release`.
 
 ## The vision
 
