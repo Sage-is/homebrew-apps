@@ -7,8 +7,8 @@ cask "talking" do
   desc "Offline two-way voice: transcription and read-along speech via WhisperKit"
   homepage "https://github.com/Sage-is/talking"
 
-  depends_on macos: :sonoma
   depends_on arch: :arm64
+  depends_on macos: :sonoma
 
   app "Talking.app"
 

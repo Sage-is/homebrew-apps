@@ -21,13 +21,11 @@ cask "mini" do
   # never reaches the Dock. Remove any bundle that is ours case-insensitively
   # but is not spelled the new way. Comparing downcased names cannot tell the
   # two apart -- both lowercase to the same string -- so test the exact name.
-  preflight do
-    Dir.glob("#{appdir}/*.app").each do |bundle|
-      base = File.basename(bundle)
-      next if base == "SAGE.IS mini.app"
-
-      FileUtils.rm_r(bundle) if base.downcase == "sage.is mini.app"
-    end
+  # An older bundle named with other capitals blocks the install. APFS ignores case,
+  # so this one path matches every spelling; by preflight time an upgrade has
+  # already moved the cask's own copy aside, so only a stray copy is removed.
+  preflight_steps do
+    remove "Sage.is mini.app", base: :appdir, recursive: true
   end
 
   # The app is ad-hoc signed, not notarized, so Gatekeeper would refuse it and
@@ -38,10 +36,9 @@ cask "mini" do
   # for this app on every install, which is what Homebrew deprecated
   # --no-quarantine to discourage. Notarization is the real fix and removes the
   # need for this block entirely.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args:         ["-d", "-r", "com.apple.quarantine", "#{appdir}/SAGE.IS mini.app"],
-                   must_succeed: false
+  postflight_steps do
+    run "/usr/bin/xattr", args:         ["-d", "-r", "com.apple.quarantine", "{{appdir}}/SAGE.IS mini.app"],
+                          must_succeed: false
   end
 
   # Courses are the teacher's work and are never removed. Only our own state

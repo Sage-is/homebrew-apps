@@ -12,8 +12,8 @@ cask "todoscope" do
     strategy :github_latest
   end
 
-  depends_on macos: :monterey
   depends_on arch: :arm64
+  depends_on macos: :monterey
 
   app "TodoScope.app"
 
@@ -22,10 +22,8 @@ cask "todoscope" do
   # shows only "damaged app". Stripping the quarantine bit at install time is
   # the difference between "opens first try" and a dead end.
   # Remove this block once releases are signed and notarized.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/TodoScope.app"],
-                   sudo: false
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/TodoScope.app"]
   end
 
   zap trash: [

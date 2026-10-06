@@ -23,10 +23,8 @@ cask "downes" do
   # for this app on every install, which is what Homebrew deprecated
   # --no-quarantine to discourage. Notarization is the real fix and removes the
   # need for this block entirely.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args:         ["-d", "-r", "com.apple.quarantine", "#{appdir}/Downes.app"],
-                   must_succeed: false
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-d", "-r", "com.apple.quarantine", "{{appdir}}/Downes.app"], must_succeed: false
   end
 
   # Courses are the teacher's work and are never removed. Only our own state
