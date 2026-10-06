@@ -339,30 +339,15 @@ def _is_ip(value: str) -> bool:
 
 
 class DnsRecord:
-    """One Cloudflare record we manage, with the proxy switch the certificate step needs."""
+    """One Cloudflare record we manage, with the proxy switch the domain steps need."""
 
-    def __init__(self, token: str, zone_id: str, record: dict, target: str):
-        self.token, self.zone_id, self.record, self.target = token, zone_id, record, target
+    def __init__(self, token: str, zone_id: str, record: dict):
+        self.token, self.zone_id, self.record = token, zone_id, record
 
     def set_proxied(self, proxied: bool) -> None:
         want = {k: self.record[k] for k in ("type", "name", "content")} | {"proxied": proxied, "ttl": 1}
         cf_call(self.token, "PATCH", f"/zones/{self.zone_id}/dns_records/{self.record['id']}", want)
         self.record["proxied"] = proxied
-
-    def wait_direct(self, timeout_s: int = 300) -> bool:
-        """True once the name resolves to the origin, not to Cloudflare's edge."""
-        import socket
-        deadline = time.time() + timeout_s
-        origin = {ai[4][0] for ai in socket.getaddrinfo(self.target, 80, socket.AF_INET)} if not _is_ip(self.target) else {self.target}
-        while time.time() < deadline:
-            try:
-                now = {ai[4][0] for ai in socket.getaddrinfo(self.record["name"], 80, socket.AF_INET)}
-            except OSError:
-                now = set()
-            if now and now <= origin:
-                return True
-            time.sleep(10)
-        return False
 
 
 def dns_ensure(cap: Captain, spec: dict, *, dry_run: bool) -> DnsRecord | None:
@@ -371,7 +356,7 @@ def dns_ensure(cap: Captain, spec: dict, *, dry_run: bool) -> DnsRecord | None:
     The captain's nginx fronts every app from the captain node, whatever node
     the app is pinned to. A record aimed anywhere else shows as Cloudflare 522
     and the captain's domain verification fails (1107). Returns the record when
-    a token manages it, so the certificate step can drop the proxy for a minute.
+    a token manages it, so the domain steps can drop the proxy for a few minutes.
     """
     domain, dns = spec.get("domain") or "", spec.get("dns") or {}
     if not domain or dns.get("manage") is False:
@@ -399,16 +384,56 @@ def dns_ensure(cap: Captain, spec: dict, *, dry_run: bool) -> DnsRecord | None:
     live = records[0] if records else None
     if live and all(live.get(k) == v for k, v in want.items() if k != "ttl"):
         print(f"  dns {domain}: {rtype} {target}, proxied {proxied} (as is)")
-        return DnsRecord(token, zone["id"], live, target)
+        return DnsRecord(token, zone["id"], live)
     was = f"{live['type']} {live['content']}, proxied {live.get('proxied')}" if live else "absent"
     print(f"  dns {domain}: {was} -> {rtype} {target}, proxied {proxied}" + (" (dry run)" if dry_run else ""))
     if dry_run:
         return None
     if live:
         cf_call(token, "PATCH", f"/zones/{zone['id']}/dns_records/{live['id']}", want)
-        return DnsRecord(token, zone["id"], live | want, target)
+        return DnsRecord(token, zone["id"], live | want)
     created = cf_call(token, "POST", f"/zones/{zone['id']}/dns_records", want).get("result") or {}
-    return DnsRecord(token, zone["id"], created or want, target)
+    return DnsRecord(token, zone["id"], created or want)
+
+
+class DomainChecks:
+    """The captain's domain calls, connect and certificate, which first fetch the name over plain http.
+
+    A zone that forces https answers that fetch through the proxy with a redirect
+    the captain does not follow (1107). On the first 1107 the record goes DNS-only
+    and stays so for the calls that remain; close() puts the proxy back. Resolvers
+    keep the proxied answer up to its 300 s TTL, and only the captain's resolver
+    counts, so the wait retries the captain's check itself, not a local lookup.
+    """
+
+    POLL_S, TIMEOUT_S = 30, 600
+
+    def __init__(self, cap: Captain, record: DnsRecord | None, body: dict):
+        self.cap, self.record, self.body, self.direct = cap, record, body, False
+
+    def call(self, path: str) -> None:
+        try:
+            self.cap.post(path, self.body)
+        except ApiError as e:
+            if e.status != 1107 or self.direct or self.record is None or not self.record.record.get("proxied"):
+                raise
+            print("  the captain's check failed through the proxy; DNS-only until the domain steps finish")
+            self.record.set_proxied(False)
+            self.direct = True
+            deadline = time.time() + self.TIMEOUT_S
+            while True:
+                time.sleep(self.POLL_S)
+                try:
+                    self.cap.post(path, self.body)
+                    return
+                except ApiError as again:
+                    if again.status != 1107 or time.time() > deadline:
+                        raise
+
+    def close(self) -> None:
+        if self.direct:
+            self.record.set_proxied(True)
+            print("  proxy back on")
 
 
 def ensure(cap: Captain, spec: dict, *, dry_run: bool) -> None:
@@ -424,7 +449,10 @@ def ensure(cap: Captain, spec: dict, *, dry_run: bool) -> None:
     want = desired(spec, live)
     # The captain refuses force-SSL until one domain holds a certificate (1108):
     # on a first pass leave it off, connect the domain, enable https, then turn it on.
-    ssl_ready = any(c.get("hasSsl") for c in live.get("customDomain") or [])
+    # The default subdomain's certificate counts: without that check a live app that
+    # already forces https (a password manager, say) served plain http for a while.
+    ssl_ready = bool(live.get("hasDefaultSubDomainSsl")) or any(
+        c.get("hasSsl") for c in live.get("customDomain") or [])
     force_later = bool(want.get("forceSsl")) and not ssl_ready
     if force_later:
         want["forceSsl"] = False
@@ -436,36 +464,24 @@ def ensure(cap: Captain, spec: dict, *, dry_run: bool) -> None:
         cap.post("/user/apps/appDefinitions/update", want)
     record = dns_ensure(cap, spec, dry_run=dry_run)
     have = {c.get("publicDomain") for c in live.get("customDomain", [])}
-    if domain and domain not in have:
-        print(f"  domain {domain}: {'would connect' if dry_run else 'connecting'}")
-        if not dry_run:
-            cap.post("/user/apps/appDefinitions/customdomain", {"appName": name, "customDomain": domain})
-    if domain and not dry_run and spec.get("https", True):
-        fresh = app_definition(cap, name) or {}
-        for c in fresh.get("customDomain", []):
-            if c.get("publicDomain") == domain and not c.get("hasSsl"):
+    if domain and dry_run and domain not in have:
+        print(f"  domain {domain}: would connect")
+    if domain and not dry_run:
+        checks = DomainChecks(cap, record, {"appName": name, "customDomain": domain})
+        try:
+            if domain not in have:
+                print(f"  domain {domain}: connecting")
+                checks.call("/user/apps/appDefinitions/customdomain")  # a failure here ends the run
+            fresh = (app_definition(cap, name) or {}) if spec.get("https", True) else {}
+            if any(c.get("publicDomain") == domain and not c.get("hasSsl") for c in fresh.get("customDomain", [])):
                 print(f"  https for {domain}: enabling (DNS must already point at the captain)")
                 try:
-                    cap.post("/user/apps/appDefinitions/enablecustomdomainssl", {"appName": name, "customDomain": domain})
+                    checks.call("/user/apps/appDefinitions/enablecustomdomainssl")
+                    print(f"  https for {domain}: enabled")
                 except ApiError as e:
-                    # A zone that forces https answers the captain's plain-http pre-check with a
-                    # redirect it does not follow (1107). Drop the proxy for the step, put it back.
-                    if e.status == 1107 and record is not None and record.record.get("proxied"):
-                        print("  https pre-check refused through the proxy; DNS-only for the certificate step")
-                        record.set_proxied(False)
-                        try:
-                            if record.wait_direct():
-                                cap.post("/user/apps/appDefinitions/enablecustomdomainssl", {"appName": name, "customDomain": domain})
-                                print(f"  https for {domain}: enabled")
-                            else:
-                                print("  the name still resolves to the proxy after five minutes; certificate step left for a re-run")
-                        except ApiError as e2:
-                            print(f"  https not enabled yet: {e2}")
-                        finally:
-                            record.set_proxied(True)
-                            print("  proxy back on")
-                    else:
-                        print(f"  https not enabled yet: {e}")
+                    print(f"  https not enabled yet: {e}")
+        finally:
+            checks.close()
     if force_later:
         fresh = app_definition(cap, name) or {} if not dry_run else {}
         if any(c.get("hasSsl") for c in fresh.get("customDomain") or []):

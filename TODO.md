@@ -64,6 +64,12 @@
   - [ ] Next release after these: drop the `captain`, `storyboarder`, `STORYBOARDER_*` and `STORYBOARDER_REF` aliases
   - [x] `SAGE.IS mini` keeps its casing
 
+- [ ] **cr-deploy: domains behind Cloudflare's proxy, and no env values on screen** (2026-10-06) #security
+  - [x] [WE] `ensure` keeps force-SSL on when the default subdomain already has a certificate (a live password manager served plain http without it); test `ForceSsl`
+  - [x] [WE] `DomainChecks`: a 1107 on connect or certificate turns the record DNS-only once, retries the captain's own check every 30 s for up to 10 min, then restores the proxy; the old wait on this Mac's resolver timed out behind Tailscale DNS; test `DomainThroughTheProxy`; proven on warden.startr.cloud (81 s)
+  - [ ] Mask every env value in the app summary, not only PASSWORD/SECRET/KEY/TOKEN names, and add ADMIN to the hidden names: `STALWART_RECOVERY_ADMIN` leaked twice into a session transcript (moved from the Trellis board's Stalwart card, 2026-10-06)
+  - [ ] [MANUALLY] Commit, then `make tool_release` for cr-deploy; `~/bin/cr-deploy` is a stale second copy without either fix: delete it
+
 ## v0.2.0 — Current
 
 ### Makefile
