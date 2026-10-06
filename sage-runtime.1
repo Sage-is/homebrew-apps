@@ -35,7 +35,7 @@ A new Colima VM uses Apple's
 hypervisor, Rosetta, and
 .Sy virtiofs
 mounts with file events. Its memory is a third of the Mac's memory,
-clamped to 4 through 10 GiB. It uses half the Mac's cores, clamped to 2
+clamped to 4 through 8 GiB. It uses half the Mac's cores, clamped to 2
 through 8, and a 100 GiB disk. The environment can override these
 values. An existing Colima VM keeps its settings.
 .Pp
@@ -104,7 +104,7 @@ Print the version number.
 .Bl -tag -width 24n
 .It Ev SAGE_RUNTIME_MEMORY
 Memory in GiB for a newly created Colima VM. When unset, use a third of
-physical memory, clamped to 4 through 10 GiB.
+physical memory, clamped to 4 through 8 GiB.
 .It Ev SAGE_RUNTIME_CPU
 Number of CPUs for a newly created Colima VM. When unset, use half the
 Mac's cores, clamped to 2 through 8.
@@ -116,6 +116,17 @@ Homebrew prefix used to find Docker CLI plugins in
 .It Ev DOCKER_CONFIG
 Docker configuration directory. When unset, the script uses
 .Pa ~/.docker .
+.It Ev SAGE_DATA
+Folder both runtimes mount, such as the Sprig registry. Default
+.Pa ~/SageData .
+Two runtimes writing there at once lose data with no error, so
+.Cm use
+stops the other runtimes before starting one, and
+.Fl -keep-other ,
+.Cm copy-volume
+and
+.Cm copy-image
+refuse while containers in both runtimes use it.
 .It Ev APPLICATIONS_DIR
 Directory used to find Docker.app and OrbStack.app. When unset, the
 script uses

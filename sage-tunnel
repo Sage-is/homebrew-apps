@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""sage-tunnel: Cloudflare tunnels with fixed hostnames, made from the terminal.
+
+    sage-tunnel version
+    sage-tunnel list                          tunnels, their hostnames and live connections
+    sage-tunnel create NAME HOSTNAME --service URL --env-file PATH
+                                              a tunnel routed to HOSTNAME; its connector token
+                                              goes into PATH at mode 600, never to the screen
+    sage-tunnel route NAME HOSTNAME --service URL
+                                              add HOSTNAME to an existing tunnel
+    sage-tunnel unroute NAME HOSTNAME         remove a hostname and its DNS record
+    sage-tunnel delete NAME [--yes]           the tunnel and every DNS record pointing at it
+
+Credentials: CLOUDFLARE_API_TOKEN, scoped to Account > Cloudflare Tunnel: Edit and
+Zone > DNS: Edit on each hostname's zone. CLOUDFLARE_ACCOUNT_ID picks the account
+when the token sees more than one. Hand the token over with `sage-secret run`, so it
+is never typed or printed.
+
+A tunnel's routes live in Cloudflare, so its connector needs only the token: either
+`cloudflared tunnel run --token ...`, or CLOUDFLARED_TUNNEL_TOKEN in the env file of
+a service that runs cloudflared itself. `create` writes CLOUDFLARED_TUNNEL_TOKEN and
+CLOUDFLARED_HOSTNAME into that file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+VERSION = "0.1.0"
+CF_API = os.environ.get("SAGE_TUNNEL_API", "https://api.cloudflare.com/client/v4")
+CATCH_ALL = {"service": "http_status:404"}
+SCOPES = "Account > Cloudflare Tunnel: Edit and Zone > DNS: Edit"
+
+
+class Cloudflare:
+    def __init__(self, token: str):
+        self.token = token
+        self._account = None
+
+    def call(self, method: str, path: str, data: dict | None = None) -> dict:
+        req = urllib.request.Request(
+            CF_API + path,
+            data=json.dumps(data).encode("utf-8") if data is not None else None,
+            method=method,
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            payload = json.loads(e.read().decode("utf-8") or "{}")
+        if not payload.get("success"):
+            errors = "; ".join(f"{x.get('code')} {x.get('message')}" for x in payload.get("errors") or [])
+            raise RuntimeError(f"Cloudflare {method} {path.split('?')[0]}: {errors or 'failed'}")
+        return payload["result"]
+
+    def account(self) -> str:
+        if self._account is None:
+            self._account = os.environ.get("CLOUDFLARE_ACCOUNT_ID") or ""
+            if not self._account:
+                accounts = self.call("GET", "/accounts")
+                if len(accounts) != 1:
+                    names = ", ".join(f"{a['name']} ({a['id']})" for a in accounts) or "none"
+                    raise RuntimeError(f"the token sees {len(accounts)} accounts ({names}); set CLOUDFLARE_ACCOUNT_ID")
+                self._account = accounts[0]["id"]
+        return self._account
+
+    def tunnel(self, name: str) -> dict | None:
+        q = urllib.parse.urlencode({"name": name, "is_deleted": "false"})
+        found = self.call("GET", f"/accounts/{self.account()}/cfd_tunnel?{q}")
+        return found[0] if found else None
+
+    def must_tunnel(self, name: str) -> dict:
+        tunnel = self.tunnel(name)
+        if tunnel is None:
+            raise RuntimeError(f"no tunnel named {name}. See: sage-tunnel list")
+        return tunnel
+
+    def ingress(self, tunnel_id: str) -> list[dict]:
+        config = self.call("GET", f"/accounts/{self.account()}/cfd_tunnel/{tunnel_id}/configurations")
+        rules = ((config or {}).get("config") or {}).get("ingress") or []
+        return [r for r in rules if r.get("hostname")]
+
+    def set_ingress(self, tunnel_id: str, rules: list[dict]) -> None:
+        self.call("PUT", f"/accounts/{self.account()}/cfd_tunnel/{tunnel_id}/configurations",
+                  {"config": {"ingress": rules + [CATCH_ALL]}})
+
+    def zone(self, hostname: str) -> dict:
+        labels = hostname.split(".")
+        for i in range(len(labels) - 1):
+            name = ".".join(labels[i:])
+            found = self.call("GET", f"/zones?{urllib.parse.urlencode({'name': name})}")
+            if found:
+                return found[0]
+        raise RuntimeError(f"no zone this token can see holds {hostname}")
+
+    def records(self, zone_id: str, hostname: str) -> list[dict]:
+        return self.call("GET", f"/zones/{zone_id}/dns_records?{urllib.parse.urlencode({'name': hostname})}")
+
+
+def target(tunnel_id: str) -> str:
+    return f"{tunnel_id}.cfargotunnel.com"
+
+
+def point_dns(cf: Cloudflare, hostname: str, tunnel_id: str) -> str:
+    """A proxied CNAME from hostname to the tunnel. Never replaces another kind of record."""
+    zone = cf.zone(hostname)
+    record = {"type": "CNAME", "name": hostname, "content": target(tunnel_id), "proxied": True}
+    existing = cf.records(zone["id"], hostname)
+    other = [r for r in existing if r["type"] != "CNAME"]
+    if other:
+        kinds = ", ".join(sorted({r["type"] for r in other}))
+        raise RuntimeError(f"{hostname} already has {kinds} records; remove them first, this tool replaces only a CNAME")
+    if not existing:
+        cf.call("POST", f"/zones/{zone['id']}/dns_records", record)
+        return "created"
+    if existing[0]["content"] == record["content"] and existing[0].get("proxied"):
+        return "already pointed"
+    cf.call("PUT", f"/zones/{zone['id']}/dns_records/{existing[0]['id']}", record)
+    return f"repointed from {existing[0]['content']}"
+
+
+def unpoint_dns(cf: Cloudflare, hostname: str, tunnel_id: str) -> bool:
+    zone = cf.zone(hostname)
+    for r in cf.records(zone["id"], hostname):
+        if r["type"] == "CNAME" and r["content"] == target(tunnel_id):
+            cf.call("DELETE", f"/zones/{zone['id']}/dns_records/{r['id']}")
+            return True
+    return False
+
+
+def route(cf: Cloudflare, tunnel: dict, hostname: str, service: str) -> None:
+    rules = [r for r in cf.ingress(tunnel["id"]) if r["hostname"] != hostname]
+    cf.set_ingress(tunnel["id"], rules + [{"hostname": hostname, "service": service}])
+    print(f"{hostname} -> {service} on tunnel {tunnel['name']}; DNS {point_dns(cf, hostname, tunnel['id'])}")
+
+
+def write_env(path: Path, values: dict[str, str]) -> None:
+    """Set KEY=VALUE lines in path, keeping every other line, at mode 600."""
+    lines = path.read_text().splitlines() if path.exists() else []
+    kept = [line for line in lines if line.split("=", 1)[0].strip() not in values]
+    kept += [f"{k}={v}" for k, v in values.items()]
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(kept) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def create(cf: Cloudflare, name: str, hostname: str, service: str, env_file: Path) -> None:
+    if not env_file.parent.is_dir():
+        raise RuntimeError(f"no folder {env_file.parent} for the env file")
+    tunnel = cf.tunnel(name)
+    if tunnel is None:
+        tunnel = cf.call("POST", f"/accounts/{cf.account()}/cfd_tunnel", {"name": name, "config_src": "cloudflare"})
+        print(f"created tunnel {name}")
+    else:
+        print(f"tunnel {name} exists; reusing it")
+    route(cf, tunnel, hostname, service)
+    token = cf.call("GET", f"/accounts/{cf.account()}/cfd_tunnel/{tunnel['id']}/token")
+    write_env(env_file, {"CLOUDFLARED_TUNNEL_TOKEN": token, "CLOUDFLARED_HOSTNAME": hostname})
+    print(f"wrote CLOUDFLARED_TUNNEL_TOKEN (hidden) and CLOUDFLARED_HOSTNAME to {env_file} (mode 600)")
+    print("Recreate the service so it reads the file; a restart keeps its old environment.")
+
+
+def show(cf: Cloudflare) -> None:
+    tunnels = cf.call("GET", f"/accounts/{cf.account()}/cfd_tunnel?is_deleted=false")
+    if not tunnels:
+        print("No tunnels.")
+    for t in tunnels:
+        hosts = ", ".join(r["hostname"] for r in cf.ingress(t["id"])) or "no hostnames"
+        print(f"{t['name']:24} {t.get('status', '?'):9} {len(t.get('connections') or []):2} connections  {hosts}")
+
+
+def delete(cf: Cloudflare, name: str, yes: bool) -> None:
+    tunnel = cf.must_tunnel(name)
+    hosts = [r["hostname"] for r in cf.ingress(tunnel["id"])]
+    if not yes:
+        if not sys.stdin.isatty():
+            raise RuntimeError(f"deleting {name} removes {', '.join(hosts) or 'no hostnames'}; run again with --yes")
+        if input(f"Delete tunnel {name} and the DNS for {', '.join(hosts) or 'nothing'}? Type yes: ") != "yes":
+            raise RuntimeError("nothing changed")
+    for host in hosts:
+        if unpoint_dns(cf, host, tunnel["id"]):
+            print(f"removed DNS for {host}")
+    cf.call("DELETE", f"/accounts/{cf.account()}/cfd_tunnel/{tunnel['id']}")
+    print(f"deleted tunnel {name}")
+
+
+def cli() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sage-tunnel", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("version")
+    sub.add_parser("list")
+    c = sub.add_parser("create")
+    c.add_argument("name")
+    c.add_argument("hostname")
+    c.add_argument("--service", required=True, help="where the connector sends traffic, e.g. http://localhost:8000")
+    c.add_argument("--env-file", required=True, type=Path, help="the file that receives the connector token")
+    r = sub.add_parser("route")
+    r.add_argument("name")
+    r.add_argument("hostname")
+    r.add_argument("--service", required=True)
+    u = sub.add_parser("unroute")
+    u.add_argument("name")
+    u.add_argument("hostname")
+    d = sub.add_parser("delete")
+    d.add_argument("name")
+    d.add_argument("--yes", action="store_true")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = cli().parse_args(argv[1:])
+    if args.cmd == "version":
+        print(f"sage-tunnel {VERSION}")
+        return 0
+    token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+    if not token:
+        print(f"Error: CLOUDFLARE_API_TOKEN is not set. It needs {SCOPES}.\n"
+              "  Hand it over without typing it: sage-secret run -- sage-tunnel ...", file=sys.stderr)
+        return 1
+    cf = Cloudflare(token)
+    try:
+        if args.cmd == "list":
+            show(cf)
+        elif args.cmd == "create":
+            create(cf, args.name, args.hostname, args.service, args.env_file)
+        elif args.cmd == "route":
+            route(cf, cf.must_tunnel(args.name), args.hostname, args.service)
+        elif args.cmd == "unroute":
+            tunnel = cf.must_tunnel(args.name)
+            cf.set_ingress(tunnel["id"], [r for r in cf.ingress(tunnel["id"]) if r["hostname"] != args.hostname])
+            gone = unpoint_dns(cf, args.hostname, tunnel["id"])
+            print(f"{args.hostname} removed from {args.name}" + ("; DNS removed" if gone else "; it had no DNS record here"))
+        elif args.cmd == "delete":
+            delete(cf, args.name, args.yes)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

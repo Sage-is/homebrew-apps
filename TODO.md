@@ -11,6 +11,14 @@
   - [ ] [MANUALLY] After AI-UI's next release: commit and push the tap's formula change, then `brew upgrade ai-ui && brew test ai-ui`
   - [ ] Later: `CLI_VERSION` in `distribution.env` is unread now that the CLI's version is `SERVER_TAG`; drop it from all three copies
 
+- [ ] **sage-tunnel and sage-secret: tunnels by tool, secrets by reference** (Alexander, 2026-10-06) #security
+  - [x] [WE] `sage-tunnel` (list, create, route, unroute, delete): routes live in Cloudflare, proxied CNAMEs only, connector token written to the env file at 600 and never printed; 11 tests, 3 mutations caught
+  - [x] [WE] `sage-secret` (setup, check, run): `bw:ITEM[/FIELD]` references resolved per run from an agent account on Vaultwarden, vault locked after; bootstrap credentials in the Keychain; 11 tests
+  - [ ] [MANUALLY] `brew install bitwarden-cli`; the Vaultwarden agent account and its "Agents" collection; a Cloudflare token (Tunnel: Edit, DNS: Edit on startr.cloud) stored there as `cloudflare-tunnel-startr`
+  - [ ] [MANUALLY] `sage-secret setup --server <vaultwarden url>` (security prompts for the agent's API key and password)
+  - [ ] [WE] `sage-tunnel create yt-transcribe yt.startr.cloud` for the transcription service, then recreate it and check the fixed URL
+  - [ ] Level 2, a credential-injecting proxy: research brief pending (NVIDIA and Meta work, Secretless Broker, placeholder-token designs)
+
 - [ ] **sage-runtime: Docker Desktop optional for every project** (Alexander, 2026-10-06) #ux
   - [x] [WE] `sage-runtime` (status, use, copy-volume, copy-image), man page, formula depending on colima, docker, buildx, compose and the keychain helper; 20 tests, mutation-checked
   - [ ] [MANUALLY] `brew install colima docker docker-buildx docker-compose docker-credential-helper` on this Mac, then [WE] prove `use`, both copies and the switch back against real runtimes

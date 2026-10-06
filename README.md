@@ -209,6 +209,32 @@ sage-runtime status                      # what runs, and what in ~/.docker will
 
 `use` also repairs Docker Desktop's leftover `credsStore` and points docker at Homebrew's buildx and compose. See `man sage-runtime`.
 
+## sage-secret
+
+**sage-secret** runs a command with secrets from Bitwarden (a self-hosted Vaultwarden works) without writing them to files or showing them. Env files and the environment hold references such as `bw:cloudflare-tunnel-startr`; each run unlocks an agent account's vault, resolves them for the one command, and locks the vault again. The agent account's own credentials live in the login Keychain.
+
+```bash
+brew install sage-is/apps/sage-secret
+sage-secret setup --server https://vault.example.com
+CLOUDFLARE_API_TOKEN=bw:cloudflare-tunnel-startr sage-secret run -- sage-tunnel list
+```
+
+The command it runs still receives the real values. See `man sage-secret`.
+
+## sage-tunnel
+
+**sage-tunnel** makes Cloudflare tunnels with fixed hostnames: it creates the tunnel, routes the hostname to a local service, points the DNS at it, and writes the connector token into the service's env file at mode 600, never to the screen.
+
+```bash
+brew install sage-is/apps/sage-tunnel
+export CLOUDFLARE_API_TOKEN=bw:cloudflare-tunnel-startr
+sage-secret run -- sage-tunnel create yt-transcribe yt.startr.cloud \
+  --service http://localhost:8000 --env-file ~/bin/youtube_transcript_server/.env
+sage-secret run -- sage-tunnel list
+```
+
+See `man sage-tunnel`.
+
 ## offload
 
 **offload** moves heavy data from the Mac to external drives by symlink, safely.

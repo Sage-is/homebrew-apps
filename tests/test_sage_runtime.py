@@ -27,6 +27,8 @@ case "$1 ${2:-}" in
   "volume ls")     ls "$vols" 2>/dev/null ;;
   "volume inspect") [[ -d "$vols/$3" ]] ;;
   "buildx version") [[ ! -e "$STATE/no-buildx" ]] ;;
+  "ps --format")     ls "$STATE/run-$ctx" 2>/dev/null ;;
+  "inspect -f")      cat "$STATE/run-$ctx/${@: -1}" 2>/dev/null ;;
   "save "*)        printf 'IMAGE %s' "$2" ;;
   "load "*)        cat > "$STATE/loaded-$ctx" ;;
   "run "*)
@@ -103,6 +105,11 @@ class Mac(unittest.TestCase):
             (folder / rel).write_text(text)
         return folder
 
+    def container(self, context, name, *mounts):
+        folder = self.state / f"run-{context}"
+        folder.mkdir(exist_ok=True)
+        (folder / name).write_text(" ".join(str(m) for m in mounts) + "\n")
+
     def docker_config(self, data):
         self.config.parent.mkdir(exist_ok=True)
         self.config.write_text(json.dumps(data))
@@ -134,11 +141,11 @@ class Use(Mac):
     def test_a_new_colima_vm_gets_the_development_profile(self):
         self.ok("use", "colima")
         self.assertIn("colima start --vm-type vz --vz-rosetta --mount-type virtiofs --mount-inotify "
-                      "--memory 10 --cpu 5 --disk 100", self.calls())
+                      "--memory 8 --cpu 5 --disk 100", self.calls())
 
     def test_a_small_mac_gets_the_floor_and_overrides_win(self):
-        self.ok("use", "colima", MAC_RAM_GIB="8", MAC_CORES="4")
-        self.assertIn("--memory 4 --cpu 2", " ".join(self.calls()))
+        self.ok("use", "colima", MAC_RAM_GIB="16", MAC_CORES="4")
+        self.assertIn("--memory 5 --cpu 2", " ".join(self.calls()))
         for marker in ("colima-vm", "running-colima"):  # the VM deleted, so the next use creates one
             (self.state / marker).unlink()
         self.ok("use", "colima", SAGE_RUNTIME_MEMORY="6", SAGE_RUNTIME_DISK="60")
@@ -182,6 +189,51 @@ class Use(Mac):
         self.assertEqual(result.returncode, 1)
         self.assertIn("brew install --cask orbstack", result.stderr)
         self.assertIsNone(self.saved())
+
+
+class SharedData(Mac):
+    """Two VMs never share file locks, so ~/SageData has one runtime at a time."""
+
+    def setUp(self):
+        super().setUp()
+        self.install("Docker")
+        self.running("desktop-linux")
+        (self.state / "colima-vm").touch()
+        self.shared = self.home / "SageData" / "sprig-registry"
+
+    def test_switching_stops_the_other_runtime_before_starting_this_one(self):
+        self.ok("use", "colima")
+        calls = self.calls()
+        quit_desktop = next(i for i, c in enumerate(calls) if c.startswith("osascript"))
+        start_colima = next(i for i, c in enumerate(calls) if c.startswith("colima start"))
+        self.assertLess(quit_desktop, start_colima)
+
+    def test_keep_other_is_refused_while_both_sides_use_the_shared_folder(self):
+        self.running("colima")
+        self.container("colima", "local-registry", self.shared)
+        self.container("desktop-linux", "old-registry", self.shared)
+        result = self.run_tool("use", "colima", "--keep-other")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("local-registry", result.stderr)
+        self.assertIn("old-registry", result.stderr)
+        self.assertIn("lose data", result.stderr)
+
+    def test_keep_other_is_fine_when_only_one_side_uses_it(self):
+        self.running("colima")
+        self.container("colima", "local-registry", self.shared)
+        self.container("desktop-linux", "web", "/var/lib/docker/volumes/x/_data")
+        self.ok("use", "colima", "--keep-other")
+
+    def test_a_copy_is_refused_while_both_sides_use_the_shared_folder(self):
+        self.running("colima")
+        (self.home / ".sage-is").mkdir()
+        (self.home / ".sage-is" / "runtime").write_text("colima\n")
+        self.container("colima", "a", self.shared)
+        self.container("desktop-linux", "b", self.shared / "x")
+        self.volume("desktop-linux", "trellis-data", {"f": "1"})
+        result = self.run_tool("copy-volume", "trellis-data")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Stop one side first", result.stderr)
 
 
 class DockerConfig(Mac):

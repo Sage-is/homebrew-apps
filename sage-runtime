@@ -20,6 +20,10 @@ APPLICATIONS_DIR="${APPLICATIONS_DIR:-/Applications}"
 BREW_PLUGINS="${HOMEBREW_PREFIX:-/opt/homebrew}/lib/docker/cli-plugins"
 DOCKER_CONFIG_FILE="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
 COPY_IMAGE="alpine:3"
+# Folders both runtimes mount (the Sprig registry, backups, caches). Two VMs
+# never share file locks, so two runtimes writing here at once lose data with
+# no error (measured 2026-10-06). One runtime uses it at a time.
+SAGE_DATA="${SAGE_DATA:-$HOME/SageData}"
 
 usage() {
   cat <<EOF
@@ -40,8 +44,13 @@ Commands:
 
 Runtimes: $RUNTIMES
 
+\$SAGE_DATA (default ~/SageData) holds folders both runtimes mount, such as the
+Sprig registry. Two runtimes writing there at once lose data, so use stops
+the others before starting one, and --keep-other and the copy commands
+refuse while containers on both sides use it.
+
 A new Colima VM gets a development profile: vz with Rosetta, virtiofs mounts
-with file events, a third of the Mac's memory (4 to 10 GiB) and half its cores
+with file events, a third of the Mac's memory (4 to 8 GiB) and half its cores
 (2 to 8). Override with SAGE_RUNTIME_MEMORY, SAGE_RUNTIME_CPU and
 SAGE_RUNTIME_DISK (GiB, default 100). An existing VM keeps its own settings.
 EOF
@@ -120,13 +129,15 @@ clamp() {
 
 # A new Colima VM for development work. vz is Apple's hypervisor and Rosetta
 # runs linux/amd64 images and buildx stages at near native speed, as Docker
-# Desktop's own setting did. Image builds (Vite, multi-arch) need more than
-# Colima's 2 GiB default.
+# Desktop's own setting did. Image builds need more than Colima's 2 GiB
+# default: AI-UI's Vite build alone takes a 4 GiB heap. The ceiling stays at
+# 8 GiB because a vz VM may keep memory it has touched; a release build can
+# borrow more for a while with `colima stop; colima start --memory 10`.
 create_colima() {
   local ram_gib cores
   ram_gib=$(( $(sysctl -n hw.memsize) / 1073741824 ))
   cores=$(sysctl -n hw.ncpu)
-  local memory="${SAGE_RUNTIME_MEMORY:-$(clamp $(( ram_gib / 3 )) 4 10)}"
+  local memory="${SAGE_RUNTIME_MEMORY:-$(clamp $(( ram_gib / 3 )) 4 8)}"
   local cpu="${SAGE_RUNTIME_CPU:-$(clamp $(( cores / 2 )) 2 8)}"
   local disk="${SAGE_RUNTIME_DISK:-100}"
   echo "Creating the Colima VM: ${memory} GiB memory, ${cpu} CPUs, ${disk} GiB disk."
@@ -215,6 +226,7 @@ fix_plugin_dirs() {
     [[ "$dir" == "$BREW_PLUGINS" ]] && return 0
     i=$((i + 1))
   done
+  cp "$DOCKER_CONFIG_FILE" "$DOCKER_CONFIG_FILE.$(date +%Y%m%d-%H%M%S).bak"
   if (( i == 0 )); then
     plutil -insert cliPluginsExtraDirs -json "[\"$BREW_PLUGINS\"]" "$DOCKER_CONFIG_FILE"
   else
@@ -234,6 +246,33 @@ stale_builders() {
     endpoint="$(plutil -extract Nodes.0.Endpoint raw -o - "$file" 2>/dev/null)" || continue
     [[ "$endpoint" == unix://* || "$endpoint" == tcp://* ]] && continue
     [[ "$contexts" == *" $endpoint "* ]] || echo "$(basename "$file") $endpoint"
+  done
+}
+
+# Running containers in RUNTIME that mount something under $SAGE_DATA, one name per line.
+shared_data_users() {
+  local ctx name
+  ctx="$(runtime_context "$1")"
+  runtime_running "$1" || return 0
+  for name in $(docker --context "$ctx" ps --format '{{.Names}}'); do
+    if docker --context "$ctx" inspect -f '{{range .Mounts}}{{.Source}} {{end}}' "$name" \
+        | tr ' ' '\n' | grep -q "^$SAGE_DATA"; then
+      echo "$name"
+    fi
+  done
+}
+
+# Refuse when RUNTIME and another running runtime both have containers on $SAGE_DATA.
+guard_shared_data() {
+  local rt="$1" other mine theirs
+  mine="$(shared_data_users "$rt" | tr '\n' ' ')"
+  [[ -n "$mine" ]] || return 0
+  for other in $RUNTIMES; do
+    [[ "$other" == "$rt" ]] && continue
+    theirs="$(shared_data_users "$other" | tr '\n' ' ')"
+    if [[ -n "$theirs" ]]; then
+      die "both $rt ($mine) and $other ($theirs) are using $SAGE_DATA. Two runtimes writing there at once lose data. Stop one side first."
+    fi
   done
 }
 
@@ -293,15 +332,19 @@ cmd_use() {
   check_runtime "$rt"
   fix_credentials
   fix_plugin_dirs
-  start_runtime "$rt"
-  docker context use "$(runtime_context "$rt")" >/dev/null
-  mkdir -p "$SAGE_CONFIG_DIR"
-  echo "$rt" > "$RUNTIME_FILE"
+  # Stop the others before starting this one: containers with a restart policy
+  # come back as soon as a runtime starts, and two runtimes must never share
+  # $SAGE_DATA or the published ports at the same moment.
   if (( keep_other == 0 )); then
     for other in $RUNTIMES; do
       if [[ "$other" != "$rt" ]] && runtime_installed "$other"; then stop_runtime "$other"; fi
     done
   fi
+  start_runtime "$rt"
+  (( keep_other == 0 )) || guard_shared_data "$rt"
+  docker context use "$(runtime_context "$rt")" >/dev/null
+  mkdir -p "$SAGE_CONFIG_DIR"
+  echo "$rt" > "$RUNTIME_FILE"
   echo "docker now uses $rt (context $(runtime_context "$rt")). ai-ui and trellis-crm follow."
 }
 
@@ -331,6 +374,7 @@ parse_copy() {
   [[ "$FROM" != "$TO" ]] || die "--from and --to are both $TO"
   start_runtime "$FROM"
   start_runtime "$TO"
+  guard_shared_data "$TO"
 }
 
 cmd_copy_volume() {
