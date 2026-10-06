@@ -16,6 +16,7 @@ SECRETS = (CF_TOKEN, SESSION, "agent-master-pw", "client-secret-val", "the-user"
 # Each item is a JSON file in $STATE/items; "late" items appear only after `bw sync`.
 STUBS = {
     "bw": r"""echo "bw $*" >> "$STATE/calls"
+echo "$BITWARDENCLI_APPDATA_DIR" > "$STATE/appdata"
 case "$1" in
   status)  if [[ -e "$STATE/logged-in" ]]; then s=locked; else s=unauthenticated; fi
            echo "{\"status\":\"$s\",\"serverUrl\":\"https://vault.example\",\"userEmail\":\"agents@sage.is\"}" ;;
@@ -148,6 +149,13 @@ class Run(Base):
         result = self.run_tool("run", *cmd, X="bw:cloudflare-tunnel-startr")
         self.assertEqual(result.returncode, 1)
         self.assertIn("brew install bitwarden-cli", result.stderr)
+
+
+class Isolation(Base):
+    def test_the_agent_keeps_its_own_bw_folder(self):
+        cmd, _ = self.child_saw("X")
+        self.run_tool("run", *cmd, X="bw:cloudflare-tunnel-startr")
+        self.assertEqual((self.state / "appdata").read_text().strip(), self.env["HOME"] + "/.sage-is/bw-agent")
 
 
 class CheckAndSetup(Base):
