@@ -1,0 +1,167 @@
+.\" sage-runtime(1) manpage — mdoc format
+.\" Version 0.1.0
+.Dd October 6, 2026
+.Dt SAGE-RUNTIME 1
+.Os
+.Sh NAME
+.Nm sage-runtime
+.Nd switch between local container runtimes and copy their data
+.Sh SYNOPSIS
+.Nm
+.Ar COMMAND
+.Op Ar args ...
+.Sh DESCRIPTION
+.Nm
+switches Docker between Colima, Docker Desktop, and OrbStack. Each
+runtime has its own images and volumes. Docker talks to the runtime
+named by its context.
+.Pp
+.Cm use
+starts the selected runtime, sets Docker's context, records the choice
+in
+.Pa ~/.sage-is/runtime ,
+and stops the other installed runtimes unless
+.Fl -keep-other
+is given. The saved choice takes precedence over Docker's context when
+.Nm
+finds the current runtime. The
+.Cm copy-volume
+and
+.Cm copy-image
+commands move data between runtimes.
+.Pp
+A new Colima VM uses Apple's
+.Sy vz
+hypervisor, Rosetta, and
+.Sy virtiofs
+mounts with file events. Its memory is a third of the Mac's memory,
+clamped to 4 through 10 GiB. It uses half the Mac's cores, clamped to 2
+through 8, and a 100 GiB disk. The environment can override these
+values. An existing Colima VM keeps its settings.
+.Pp
+.Cm status
+reports installed and running runtimes, Docker's context, and detected
+configuration problems. It checks credential helpers, buildx, and
+buildx builders whose saved context no longer exists. When
+.Cm use
+runs, it repairs an unusable Docker credential-helper setting and adds
+the Homebrew Docker plugin directory to the Docker configuration when
+needed.
+.Pp
+.Fl h
+and
+.Fl -help
+print usage. The
+.Cm version
+command and the
+.Fl -version
+and
+.Fl v
+options print the version.
+.Sh COMMANDS
+.Bl -tag -width 28n
+.It Cm status
+Show whether each runtime is installed or running, the volume count
+for each running runtime, and which runtime is in use. Show Docker's
+context and report if it differs from the selected runtime. Also report
+an unavailable credential helper, missing buildx, and buildx builders
+that point at missing contexts. Print
+.Sy No problems found.
+when none are detected.
+.It Cm use Ar RUNTIME Op Fl -keep-other
+Start
+.Ar RUNTIME ,
+set Docker's context, save the runtime choice in
+.Pa ~/.sage-is/runtime ,
+and stop other installed runtimes. With
+.Fl -keep-other ,
+leave the others running.
+.Pp
+A first launch of Docker Desktop or OrbStack opens its setup screens in
+view; later launches open in the background. Sign-in is optional. The
+command waits up to three minutes for the runtime to answer.
+.It Cm copy-volume Ar NAME Oo Fl -from Ar RUNTIME Oc Oo Fl -to Ar RUNTIME Oc Oo Fl -force Oc
+Copy the named volume between runtimes. By default, the destination is
+the runtime in use, and the source is the first installed runtime other
+than the destination. The command starts both runtimes.
+.Pp
+If the destination already has a non-empty volume with that name, the
+command refuses to copy unless
+.Fl -force
+is given. With
+.Fl -force ,
+it deletes the destination volume's contents before copying. The
+command checks that the source and destination have the same number of
+files and folders after the copy.
+.It Cm copy-image Ar REF Oo Fl -from Ar RUNTIME Oc Oo Fl -to Ar RUNTIME Oc
+Copy an image between runtimes using Docker's save and load operations.
+The default source and destination are the same as for
+.Cm copy-volume .
+.It Cm version
+Print the version number.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width 24n
+.It Ev SAGE_RUNTIME_MEMORY
+Memory in GiB for a newly created Colima VM. When unset, use a third of
+physical memory, clamped to 4 through 10 GiB.
+.It Ev SAGE_RUNTIME_CPU
+Number of CPUs for a newly created Colima VM. When unset, use half the
+Mac's cores, clamped to 2 through 8.
+.It Ev SAGE_RUNTIME_DISK
+Disk size in GiB for a newly created Colima VM. When unset, use 100.
+.It Ev HOMEBREW_PREFIX
+Homebrew prefix used to find Docker CLI plugins in
+.Pa lib/docker/cli-plugins .
+.It Ev DOCKER_CONFIG
+Docker configuration directory. When unset, the script uses
+.Pa ~/.docker .
+.It Ev APPLICATIONS_DIR
+Directory used to find Docker.app and OrbStack.app. When unset, the
+script uses
+.Pa /Applications .
+.El
+.Sh FILES
+.Bl -tag -width 36n
+.It Pa ~/.sage-is/runtime
+Saved runtime choice. Its value takes precedence over Docker's current
+context when the script determines which runtime is in use.
+.It Pa ~/.docker/config.json
+Docker configuration read and updated by
+.Cm use .
+The command can repair an unavailable credential helper and register
+the Homebrew plugin directory here.
+.It Pa ~/.docker/config.json.YYYYMMDD-HHMMSS.bak
+Dated backup made before
+.Cm use
+changes an unavailable credential-helper setting.
+.It Pa ~/.docker/buildx/instances
+Buildx builder records checked by
+.Cm status
+for endpoints that do not match an available Docker context.
+.El
+.Sh EXAMPLES
+.Ss Switch to Colima
+.Bd -literal -offset indent
+sage-runtime use colima
+.Ed
+.Ss Copy the trellis-data volume from Docker Desktop
+.Bd -literal -offset indent
+sage-runtime copy-volume trellis-data --from docker-desktop --to colima
+.Ed
+.Ss Copy an image
+.Bd -literal -offset indent
+sage-runtime copy-image alpine:3 --from docker-desktop --to colima
+.Ed
+.Ss Switch back to Docker Desktop
+.Bd -literal -offset indent
+sage-runtime use docker-desktop
+.Ed
+.Sh EXIT STATUS
+.Nm
+exits 0 on success and 1 on any error.
+.Sh SEE ALSO
+.Xr colima 1 ,
+.Xr docker 1 ,
+.Xr ai-ui 1 ,
+.Xr trellis-crm

@@ -191,6 +191,24 @@ cr-deploy rollback APP
 
 See `man cr-deploy`. It was called `captain` before its first release; that command still works, with a warning, until cr-deploy 0.2.0.
 
+## sage-runtime
+
+**sage-runtime** switches docker between Colima, Docker Desktop and OrbStack, so no project needs Docker Desktop. Each runtime keeps its own volumes and images; the switch starts one, points docker's context at it, remembers it for `ai-ui` and `trellis-crm`, and stops the others. Data comes across on request.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install sage-runtime
+```
+
+```bash
+sage-runtime use colima                  # the first time builds a dev VM: vz, Rosetta, virtiofs, sized for this Mac
+sage-runtime copy-volume trellis-data    # from the other runtime into the one in use
+sage-runtime copy-image IMAGE:TAG
+sage-runtime use docker-desktop          # and back
+sage-runtime status                      # what runs, and what in ~/.docker will break
+```
+
+`use` also repairs Docker Desktop's leftover `credsStore` and points docker at Homebrew's buildx and compose. See `man sage-runtime`.
+
 ## offload
 
 **offload** moves heavy data from the Mac to external drives by symlink, safely.

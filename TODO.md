@@ -11,6 +11,13 @@
   - [ ] [MANUALLY] After AI-UI's next release: commit and push the tap's formula change, then `brew upgrade ai-ui && brew test ai-ui`
   - [ ] Later: `CLI_VERSION` in `distribution.env` is unread now that the CLI's version is `SERVER_TAG`; drop it from all three copies
 
+- [ ] **sage-runtime: Docker Desktop optional for every project** (Alexander, 2026-10-06) #ux
+  - [x] [WE] `sage-runtime` (status, use, copy-volume, copy-image), man page, formula depending on colima, docker, buildx, compose and the keychain helper; 20 tests, mutation-checked
+  - [ ] [MANUALLY] `brew install colima docker docker-buildx docker-compose docker-credential-helper` on this Mac, then [WE] prove `use`, both copies and the switch back against real runtimes
+  - [ ] [WE] Verify on Colima: `host.docker.internal` with `host-gateway` (to the Mac and to a published port), amd64 via Rosetta, file events for hot reload
+  - [ ] [MANUALLY] Commit, then `make tool_release TOOL=sage-runtime VERSION=0.1.0 APPLY=1`
+  - [ ] [WE] ai-ui and trellis-crm source sage-runtime's runtime block instead of their own copies (`depends_on "sage-runtime"`)
+
 - [ ] **Colima by default: no Docker Desktop windows on first launch** (ai-ui 3.2.0_1, 2026-09-29) #ux
   - [x] [WE] `ai-ui` runs Sage in Colima, Docker Desktop or OrbStack; the first start asks when a Mac has more than one; `--runtime NAME` picks directly, remembered in `~/.sage-is/runtime`
   - [x] [WE] Colima is a formula dependency on macOS, so nothing installs at run time; the post-install message lists the `--runtime` one-liners; 11 runtime tests

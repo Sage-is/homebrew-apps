@@ -1,0 +1,381 @@
+#!/bin/bash
+set -euo pipefail
+
+# sage-runtime: one switch between the container runtimes a Mac can carry.
+#
+# Colima, Docker Desktop and OrbStack can all be installed at once. Each runs
+# its own engine with its own volumes and images, and the docker CLI talks to
+# whichever one its context names. `use` starts one runtime, points docker at
+# it, saves the choice where ai-ui and trellis-crm read it (~/.sage-is/runtime)
+# and stops the others, since they all forward published ports to localhost.
+# `copy-volume` and `copy-image` move data across, so nothing has to be
+# migrated up front and Docker Desktop is never required.
+
+VERSION="0.1.0"
+PROG="sage-runtime"
+SAGE_CONFIG_DIR="${HOME}/.sage-is"
+RUNTIME_FILE="${SAGE_CONFIG_DIR}/runtime"
+RUNTIMES="colima docker-desktop orbstack"
+APPLICATIONS_DIR="${APPLICATIONS_DIR:-/Applications}"
+BREW_PLUGINS="${HOMEBREW_PREFIX:-/opt/homebrew}/lib/docker/cli-plugins"
+DOCKER_CONFIG_FILE="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+COPY_IMAGE="alpine:3"
+
+usage() {
+  cat <<EOF
+Usage: $PROG <command> [options]
+
+Commands:
+  status                  Which runtimes are installed and running, which one
+                          docker uses, and anything in ~/.docker that will break
+  use RUNTIME [--keep-other]
+                          Start RUNTIME, point docker at it, remember it, and
+                          stop the other runtimes (unless --keep-other)
+  copy-volume NAME [--from RUNTIME] [--to RUNTIME] [--force]
+                          Copy a named volume between runtimes (default: from
+                          the one not in use to the one in use)
+  copy-image REF [--from RUNTIME] [--to RUNTIME]
+                          Copy an image between runtimes
+  version                 Show the version
+
+Runtimes: $RUNTIMES
+
+A new Colima VM gets a development profile: vz with Rosetta, virtiofs mounts
+with file events, a third of the Mac's memory (4 to 10 GiB) and half its cores
+(2 to 8). Override with SAGE_RUNTIME_MEMORY, SAGE_RUNTIME_CPU and
+SAGE_RUNTIME_DISK (GiB, default 100). An existing VM keeps its own settings.
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+need_docker() {
+  command -v docker &>/dev/null || die "the docker CLI is missing. Install it: brew install docker"
+}
+
+# --- the runtimes -------------------------------------------------------------
+
+# The docker context each runtime creates for itself.
+runtime_context() {
+  case "$1" in
+    colima)         echo colima ;;
+    docker-desktop) echo desktop-linux ;;
+    orbstack)       echo orbstack ;;
+  esac
+}
+
+check_runtime() {
+  [[ -n "$(runtime_context "${1:-}")" ]] || die "unknown runtime '${1:-}'. Use one of: $RUNTIMES"
+}
+
+runtime_installed() {
+  case "$1" in
+    colima)         command -v colima &>/dev/null ;;
+    docker-desktop) [[ -d "$APPLICATIONS_DIR/Docker.app" ]] ;;
+    orbstack)       [[ -d "$APPLICATIONS_DIR/OrbStack.app" ]] ;;
+  esac
+}
+
+runtime_install_command() {
+  case "$1" in
+    colima)         echo "brew install colima docker docker-buildx docker-credential-helper" ;;
+    docker-desktop) echo "brew install --cask docker-desktop" ;;
+    orbstack)       echo "brew install --cask orbstack" ;;
+  esac
+}
+
+runtime_running() {
+  docker --context "$(runtime_context "$1")" info &>/dev/null
+}
+
+installed_runtimes() {
+  local rt
+  for rt in $RUNTIMES; do
+    if runtime_installed "$rt"; then echo "$rt"; fi
+  done
+}
+
+# The runtime in use: the saved choice, else the one docker's context names.
+current_runtime() {
+  if [[ -f "$RUNTIME_FILE" ]]; then
+    cat "$RUNTIME_FILE"
+    return
+  fi
+  case "$(docker context show 2>/dev/null)" in
+    desktop-linux) echo docker-desktop ;;
+    orbstack)      echo orbstack ;;
+    *)             echo colima ;;
+  esac
+}
+
+clamp() {
+  local value="$1" low="$2" high="$3"
+  if (( value < low )); then value=$low; fi
+  if (( value > high )); then value=$high; fi
+  echo "$value"
+}
+
+# A new Colima VM for development work. vz is Apple's hypervisor and Rosetta
+# runs linux/amd64 images and buildx stages at near native speed, as Docker
+# Desktop's own setting did. Image builds (Vite, multi-arch) need more than
+# Colima's 2 GiB default.
+create_colima() {
+  local ram_gib cores
+  ram_gib=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  cores=$(sysctl -n hw.ncpu)
+  local memory="${SAGE_RUNTIME_MEMORY:-$(clamp $(( ram_gib / 3 )) 4 10)}"
+  local cpu="${SAGE_RUNTIME_CPU:-$(clamp $(( cores / 2 )) 2 8)}"
+  local disk="${SAGE_RUNTIME_DISK:-100}"
+  echo "Creating the Colima VM: ${memory} GiB memory, ${cpu} CPUs, ${disk} GiB disk."
+  colima start --vm-type vz --vz-rosetta --mount-type virtiofs --mount-inotify \
+    --memory "$memory" --cpu "$cpu" --disk "$disk"
+}
+
+colima_exists() {
+  [[ "$(colima list --json 2>/dev/null)" == *'"name":"default"'* ]]
+}
+
+# A desktop app that has run before starts in the background, hidden. Its very
+# first start stays in view: it shows terms or setup screens that need a click.
+open_app() {
+  local app="$1" set_up_marker="$2"
+  if [[ -e "$set_up_marker" ]]; then
+    open -g -j -a "$app"
+  else
+    echo "$app's first start shows its own setup screens. Sign-in is optional."
+    open -a "$app"
+  fi
+}
+
+start_runtime() {
+  local rt="$1"
+  runtime_running "$rt" && return 0
+  runtime_installed "$rt" || die "$rt is not installed. Install it: $(runtime_install_command "$rt")"
+  echo "Starting $rt..."
+  case "$rt" in
+    colima)
+      if colima_exists; then colima start; else create_colima; fi
+      ;;
+    docker-desktop) open_app Docker "$HOME/Library/Group Containers/group.com.docker/settings-store.json" ;;
+    orbstack)       open_app OrbStack "$HOME/.orbstack" ;;
+  esac
+  local _
+  for _ in $(seq 1 180); do
+    runtime_running "$rt" && return 0
+    sleep 1
+  done
+  die "$rt did not answer within 3 minutes. Finish any setup screen it shows and run this again."
+}
+
+stop_runtime() {
+  local rt="$1"
+  runtime_running "$rt" || return 0
+  echo "Stopping $rt..."
+  case "$rt" in
+    colima)         colima stop ;;
+    docker-desktop) osascript -e 'quit app "Docker"' >/dev/null ;;
+    orbstack)       osascript -e 'quit app "OrbStack"' >/dev/null ;;
+  esac
+}
+
+# --- docker's own config ------------------------------------------------------
+
+# Docker Desktop writes "credsStore": "desktop". Its helper leaves with the app,
+# and then every pull and login fails with "error getting credentials". The
+# keychain helper serves every runtime, Docker Desktop included.
+fix_credentials() {
+  local store backup
+  [[ -f "$DOCKER_CONFIG_FILE" ]] || return 0
+  store="$(plutil -extract credsStore raw -o - "$DOCKER_CONFIG_FILE" 2>/dev/null)" || return 0
+  command -v "docker-credential-$store" &>/dev/null && return 0
+  backup="$DOCKER_CONFIG_FILE.$(date +%Y%m%d-%H%M%S).bak"
+  cp "$DOCKER_CONFIG_FILE" "$backup"
+  if command -v docker-credential-osxkeychain &>/dev/null; then
+    plutil -replace credsStore -string osxkeychain "$DOCKER_CONFIG_FILE"
+    echo "credsStore: $store has no helper here; now osxkeychain (backup: $backup)"
+  else
+    plutil -remove credsStore "$DOCKER_CONFIG_FILE"
+    echo "credsStore: removed $store, which has no helper here (backup: $backup)"
+    echo "  Keep logins in the keychain: brew install docker-credential-helper"
+  fi
+}
+
+# Homebrew's buildx and compose live outside docker's own plugin folder.
+fix_plugin_dirs() {
+  [[ -d "$BREW_PLUGINS" ]] || return 0
+  if [[ ! -f "$DOCKER_CONFIG_FILE" ]]; then
+    mkdir -p "$(dirname "$DOCKER_CONFIG_FILE")"
+    echo '{}' > "$DOCKER_CONFIG_FILE"
+  fi
+  local i=0 dir
+  while dir="$(plutil -extract "cliPluginsExtraDirs.$i" raw -o - "$DOCKER_CONFIG_FILE" 2>/dev/null)"; do
+    [[ "$dir" == "$BREW_PLUGINS" ]] && return 0
+    i=$((i + 1))
+  done
+  if (( i == 0 )); then
+    plutil -insert cliPluginsExtraDirs -json "[\"$BREW_PLUGINS\"]" "$DOCKER_CONFIG_FILE"
+  else
+    plutil -insert cliPluginsExtraDirs.0 -string "$BREW_PLUGINS" "$DOCKER_CONFIG_FILE"
+  fi
+  echo "cliPluginsExtraDirs: added $BREW_PLUGINS (Homebrew's buildx and compose)"
+}
+
+# A buildx builder remembers the context it was made on. One whose context is
+# gone is found by name, so `inspect || create` guards never replace it.
+stale_builders() {
+  local dir="${DOCKER_CONFIG:-$HOME/.docker}/buildx/instances" contexts file endpoint
+  [[ -d "$dir" ]] || return 0
+  contexts=" $(docker context ls -q 2>/dev/null | tr '\n' ' ') "
+  for file in "$dir"/*; do
+    [[ -f "$file" ]] || continue
+    endpoint="$(plutil -extract Nodes.0.Endpoint raw -o - "$file" 2>/dev/null)" || continue
+    [[ "$endpoint" == unix://* || "$endpoint" == tcp://* ]] && continue
+    [[ "$contexts" == *" $endpoint "* ]] || echo "$(basename "$file") $endpoint"
+  done
+}
+
+# --- commands -----------------------------------------------------------------
+
+cmd_status() {
+  local rt mark current problems=0
+  current="$(current_runtime)"
+  echo "Runtimes:"
+  for rt in $RUNTIMES; do
+    if ! runtime_installed "$rt"; then
+      printf '  %-15s not installed\n' "$rt"
+      continue
+    fi
+    mark=""
+    [[ "$rt" == "$current" ]] && mark="  <- in use"
+    if runtime_running "$rt"; then
+      printf '  %-15s running, %s volumes%s\n' "$rt" \
+        "$(docker --context "$(runtime_context "$rt")" volume ls -q 2>/dev/null | wc -l | tr -d ' ')" "$mark"
+    else
+      printf '  %-15s stopped%s\n' "$rt" "$mark"
+    fi
+  done
+  echo "docker context: $(docker context show 2>/dev/null || echo none)"
+  [[ "$(docker context show 2>/dev/null)" == "$(runtime_context "$current")" ]] \
+    || { echo "  Not the runtime in use. Run: $PROG use $current"; problems=1; }
+
+  local store
+  store="$(plutil -extract credsStore raw -o - "$DOCKER_CONFIG_FILE" 2>/dev/null)" || store=""
+  if [[ -n "$store" ]] && ! command -v "docker-credential-$store" &>/dev/null; then
+    echo "credsStore \"$store\" has no helper on this Mac: pulls and logins will fail. Run: $PROG use $current"
+    problems=1
+  fi
+  if ! docker buildx version &>/dev/null; then
+    echo "buildx not found. Install it: brew install docker-buildx (then: $PROG use $current)"
+    problems=1
+  fi
+  local line
+  while read -r line; do
+    [[ -n "$line" ]] || continue
+    echo "buildx builder ${line% *} points at the missing context ${line#* }. Remove it: docker buildx rm ${line% *}"
+    problems=1
+  done < <(stale_builders)
+  (( problems == 0 )) && echo "No problems found."
+  return 0
+}
+
+cmd_use() {
+  local rt="" keep_other=0 other
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-other) keep_other=1; shift ;;
+      -*) die "unknown option $1" ;;
+      *)  rt="$1"; shift ;;
+    esac
+  done
+  check_runtime "$rt"
+  fix_credentials
+  fix_plugin_dirs
+  start_runtime "$rt"
+  docker context use "$(runtime_context "$rt")" >/dev/null
+  mkdir -p "$SAGE_CONFIG_DIR"
+  echo "$rt" > "$RUNTIME_FILE"
+  if (( keep_other == 0 )); then
+    for other in $RUNTIMES; do
+      if [[ "$other" != "$rt" ]] && runtime_installed "$other"; then stop_runtime "$other"; fi
+    done
+  fi
+  echo "docker now uses $rt (context $(runtime_context "$rt")). ai-ui and trellis-crm follow."
+}
+
+# --from and --to for the copy commands: the default copies from the other
+# installed runtime into the one in use.
+parse_copy() {
+  FROM="" TO="" FORCE=0 ITEM=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)  FROM="${2:-}"; shift 2 ;;
+      --to)    TO="${2:-}"; shift 2 ;;
+      --force) FORCE=1; shift ;;
+      -*)      die "unknown option $1" ;;
+      *)       ITEM="$1"; shift ;;
+    esac
+  done
+  [[ -n "$ITEM" ]] || die "name what to copy. See: $PROG --help"
+  TO="${TO:-$(current_runtime)}"
+  if [[ -z "$FROM" ]]; then
+    local rt
+    for rt in $(installed_runtimes); do
+      if [[ "$rt" != "$TO" ]]; then FROM="$rt"; break; fi
+    done
+  fi
+  check_runtime "$FROM"
+  check_runtime "$TO"
+  [[ "$FROM" != "$TO" ]] || die "--from and --to are both $TO"
+  start_runtime "$FROM"
+  start_runtime "$TO"
+}
+
+cmd_copy_volume() {
+  parse_copy "$@"
+  local name="$ITEM" src dst
+  src="$(runtime_context "$FROM")"
+  dst="$(runtime_context "$TO")"
+  docker --context "$src" volume inspect "$name" &>/dev/null || die "$FROM has no volume $name"
+  if docker --context "$dst" volume inspect "$name" &>/dev/null \
+     && [[ -n "$(docker --context "$dst" run --rm -v "$name:/v" "$COPY_IMAGE" ls -A /v)" ]] \
+     && (( FORCE == 0 )); then
+    die "$TO already has a volume $name with data in it. Add --force to copy over it."
+  fi
+  echo "Copying volume $name from $FROM to $TO..."
+  if (( FORCE == 1 )); then  # an exact copy, not a merge with what was there
+    docker --context "$dst" run --rm -v "$name:/v" "$COPY_IMAGE" find /v -mindepth 1 -delete
+  fi
+  docker --context "$src" run --rm -v "$name:/v:ro" "$COPY_IMAGE" tar -C /v -cf - . \
+    | docker --context "$dst" run --rm -i -v "$name:/v" "$COPY_IMAGE" tar -C /v -xf -
+  local count='find /v | wc -l; du -sk /v | cut -f1'
+  local before after
+  before="$(docker --context "$src" run --rm -v "$name:/v:ro" "$COPY_IMAGE" sh -c "$count" | tr '\n' ' ')"
+  after="$(docker --context "$dst" run --rm -v "$name:/v:ro" "$COPY_IMAGE" sh -c "$count" | tr '\n' ' ')"
+  read -r n_before kb_before <<< "$before"
+  read -r n_after kb_after <<< "$after"
+  [[ "$n_before" == "$n_after" ]] || die "copy incomplete: $n_before entries in $FROM, $n_after in $TO"
+  echo "Copied $n_after files and folders (${kb_after} KiB; ${kb_before} KiB in $FROM)."
+}
+
+cmd_copy_image() {
+  parse_copy "$@"
+  echo "Copying image $ITEM from $FROM to $TO..."
+  docker --context "$(runtime_context "$FROM")" save "$ITEM" \
+    | docker --context "$(runtime_context "$TO")" load
+}
+
+case "${1:-}" in
+  status|use|copy-volume|copy-image) need_docker ;;
+esac
+case "${1:-}" in
+  status)              shift; cmd_status ;;
+  use)                 shift; cmd_use "$@" ;;
+  copy-volume)         shift; cmd_copy_volume "$@" ;;
+  copy-image)          shift; cmd_copy_image "$@" ;;
+  version|--version|-v) echo "$PROG $VERSION" ;;
+  ""|help|-h|--help)   usage ;;
+  *)                   usage >&2; exit 1 ;;
+esac
