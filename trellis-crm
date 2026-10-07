@@ -1,0 +1,885 @@
+#!/bin/bash
+set -euo pipefail
+
+# trellis-crm runs Trellis, the Sage.is CRM, on this machine. It is built for a
+# box that stays on: the container comes back with Docker, listens on 127.0.0.1
+# unless told otherwise, keeps its settings in one file at mode 600, and shares
+# a network with AI-UI. `trellis-crm boot` starts Colima at power-on.
+
+PROG="trellis-crm"
+IMAGE_REGISTRY="ghcr.io/sage-is/trellis"
+# The formula pins this to its own version at install; a checkout runs latest.
+DEFAULT_TAG="latest"
+VERSION="$DEFAULT_TAG"
+IMAGE="$IMAGE_REGISTRY:$DEFAULT_TAG"
+CONTAINER="trellis-crm"
+VOLUME="trellis-crm-data"
+NETWORK="sage-net"
+AI_UI_CONTAINER="sage-ai"
+DEFAULT_PORT=8030
+
+SAGE_CONFIG_DIR="${HOME}/.sage-is"
+ENV_FILE="${SAGE_CONFIG_DIR}/trellis-crm.env"
+BACKUP_DIR="${SAGE_CONFIG_DIR}/backups/trellis-crm"
+BOOT_LABEL="is.sage.colima"
+BOOT_PLIST="${LAUNCH_DAEMONS_DIR:-/Library/LaunchDaemons}/$BOOT_LABEL.plist"
+
+# Dev mode runs a checkout beside the real Trellis, never in its place: its own
+# container, volume and port, loopback only, synthetic data only.
+DEV_CONTAINER="trellis-crm-dev"
+DEV_VOLUME="trellis-crm-dev-data"
+DEV_PORT=8031
+SAGE_PROJECTS="${SAGE_CONFIG_DIR}/projects"
+TRELLIS_REMOTE="Sage-is/trellis"
+# The repo is private: SSH, so a read-only deploy key is all a box needs.
+TRELLIS_CLONE_URL="${TRELLIS_CLONE_URL:-git@github.com:Sage-is/trellis.git}"
+
+usage() {
+  cat <<EOF
+Usage: $PROG <command> [options]
+
+Commands:
+  start  [--port PORT] [--bind ADDR] [--url URL] [--profile NAME] [--tag X.Y.Z]
+                        Start Trellis (default: http://localhost:$DEFAULT_PORT). Port, address,
+                        URL and profile are saved in $ENV_FILE
+  stop                  Stop Trellis; it stays stopped across reboots until start
+  update [--tag X.Y.Z]  Back up, pull the image and start again
+  status                Container, image, address and health
+  logs                  Follow the container's output
+  open                  Open Trellis in your browser
+  backup [--to DIR]     Copy the database and artifacts into one .tar.gz
+                        (default: $BACKUP_DIR)
+  restore FILE [--yes]  Replace the record with a backup (the current one is backed up first)
+  boot   [--print|--remove]
+                        Start Colima at power-on with nobody signed in (asks for sudo)
+  nuke   [--dry-run] [--yes] [--force]
+                        Remove Trellis and its record from this machine
+  dev    [--dir DIR] [--port PORT] [--profile NAME] [--where] [--stop]
+                        Run your Trellis checkout with live reload (default:
+                        http://localhost:$DEV_PORT), beside the real one and on
+                        synthetic data. Finds the checkout like ai-ui dev does
+  version               Show the version
+
+Every command also takes:
+  --runtime NAME        macOS container runtime: colima (the default),
+                        docker-desktop or orbstack. Shared with ai-ui.
+
+EOF
+}
+
+cmd_version() {
+  echo "$PROG $VERSION (image $IMAGE_REGISTRY:$DEFAULT_TAG)"
+}
+
+set_tag() {
+  IMAGE="$IMAGE_REGISTRY:$1"
+}
+
+# ---------------------------------------------------------------------------
+# Container runtime. The same block as AI-UI's cli/ai-ui: both CLIs share the
+# choice in ~/.sage-is/runtime, so change the two together.
+# ---------------------------------------------------------------------------
+RUNTIMES="colima docker-desktop orbstack"
+RUNTIME_FILE="${SAGE_CONFIG_DIR}/runtime"
+RUNTIME_FLAG=""
+RUNTIME=""
+APPLICATIONS_DIR="${APPLICATIONS_DIR:-/Applications}"
+
+# The docker context each runtime creates for itself.
+runtime_context() {
+  case "$1" in
+    colima)         echo colima ;;
+    docker-desktop) echo desktop-linux ;;
+    orbstack)       echo orbstack ;;
+  esac
+}
+
+runtime_installed() {
+  case "$1" in
+    colima)         command -v colima &>/dev/null ;;
+    docker-desktop) [[ -d "$APPLICATIONS_DIR/Docker.app" ]] ;;
+    orbstack)       [[ -d "$APPLICATIONS_DIR/OrbStack.app" ]] ;;
+    *)              return 1 ;;
+  esac
+}
+
+runtime_install_command() {
+  case "$1" in
+    colima)         echo "brew install colima" ;;
+    docker-desktop) echo "brew install --cask docker-desktop" ;;
+    orbstack)       echo "brew install --cask orbstack" ;;
+  esac
+}
+
+# The runtime this Mac used last: each one makes its own context docker's current one.
+last_used_runtime() {
+  case "$(docker context show 2>/dev/null)" in
+    desktop-linux) echo docker-desktop ;;
+    orbstack)      echo orbstack ;;
+    *)             echo colima ;;
+  esac
+}
+
+# The first start on a Mac with more than one runtime asks which to use.
+# The question goes to stderr; the answer is printed.
+ask_runtime() {
+  local default runtime answer="" installed=() n=0
+  default="$(last_used_runtime)"
+  runtime_installed "$default" || default=colima
+  for runtime in $RUNTIMES; do
+    if runtime_installed "$runtime"; then installed+=("$runtime"); fi
+  done
+  if [[ ${#installed[@]} -lt 2 || ! -t 0 ]]; then
+    echo "$default"
+    return
+  fi
+
+  {
+    echo "Trellis runs in a container runtime. This Mac has:"
+    for runtime in "${installed[@]}"; do
+      n=$((n + 1))
+      echo "  $n) $runtime"
+    done
+    echo "Pick the one AI-UI uses, if it runs here: they share a network."
+    echo "$PROG remembers the answer; switch later with --runtime NAME."
+  } >&2
+  read -rp "Runtime [$default]: " answer || true
+  case "$answer" in
+    "")    echo "$default" ;;
+    [1-9]) echo "${installed[answer - 1]:-$answer}" ;;
+    *)     echo "$answer" ;;
+  esac
+}
+
+# Choose this command's runtime and point docker at it. `ask` (start, update,
+# restore) saves the choice, asking on the first start; other commands follow it.
+select_runtime() {
+  if [[ -n "$RUNTIME_FLAG" ]]; then
+    RUNTIME="$RUNTIME_FLAG"
+  elif [[ -f "$RUNTIME_FILE" ]]; then
+    RUNTIME="$(cat "$RUNTIME_FILE")"
+  elif [[ "${1:-}" == ask ]]; then
+    RUNTIME="$(ask_runtime)"
+  else
+    RUNTIME="$(last_used_runtime)"
+  fi
+  if [[ -z "$(runtime_context "$RUNTIME")" ]]; then
+    echo "Error: unknown runtime '$RUNTIME'. Use one of: $RUNTIMES"
+    exit 1
+  fi
+  if [[ -n "$RUNTIME_FLAG" || "${1:-}" == ask ]]; then
+    mkdir -p "$SAGE_CONFIG_DIR"
+    echo "$RUNTIME" > "$RUNTIME_FILE"
+  fi
+  DOCKER_CONTEXT="$(runtime_context "$RUNTIME")"
+  export DOCKER_CONTEXT
+}
+
+# A desktop app that has run before starts in the background, hidden. Its very
+# first start stays in view: it shows terms or setup screens that need a click.
+open_app() {
+  local app="$1" set_up_marker="$2"
+  if [[ -e "$set_up_marker" ]]; then
+    open -g -j -a "$app"
+  else
+    echo "$app's first start shows its own setup screens. Sign-in is optional."
+    open -a "$app"
+  fi
+}
+
+start_runtime() {
+  if ! runtime_installed "$RUNTIME"; then
+    echo "Error: $RUNTIME is not installed."
+    echo "  Install it:    $(runtime_install_command "$RUNTIME")"
+    [[ "$RUNTIME" == colima ]] || echo "  Or use Colima: $PROG start --runtime colima"
+    exit 1
+  fi
+
+  echo "Starting $RUNTIME..."
+  case "$RUNTIME" in
+    colima)
+      if [[ "$(colima list --json 2>/dev/null)" == *'"name":"default"'* ]]; then
+        colima start
+      else
+        # The first start creates the VM. vz is Apple's own hypervisor, so there is
+        # no QEMU to install; Colima's default 2 GiB of memory is too small for Sage.
+        colima start --vm-type vz --memory 4
+      fi
+      ;;
+    docker-desktop) open_app Docker "$HOME/Library/Group Containers/group.com.docker/settings-store.json" ;;
+    orbstack)       open_app OrbStack "$HOME/.orbstack" ;;
+  esac
+}
+
+wait_for_runtime() {
+  echo "Waiting for $RUNTIME..."
+  for _ in $(seq 1 180); do
+    if docker info &>/dev/null; then
+      echo "$RUNTIME is ready."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Error: $RUNTIME did not answer within 3 minutes."
+  [[ "$RUNTIME" == colima ]] || echo "  Finish any setup screen it shows and run this again, or use Colima: --runtime colima"
+  exit 1
+}
+
+# Docker Desktop writes "credsStore": "desktop" into docker's config. Once Docker
+# Desktop is gone, so is its docker-credential-desktop helper, and every pull fails
+# with "error getting credentials". Drop a credsStore whose helper is missing.
+drop_missing_credential_helper() {
+  local config="${DOCKER_CONFIG:-$HOME/.docker}/config.json" store backup
+  store="$(plutil -extract credsStore raw -o - "$config" 2>/dev/null)" || return 0
+  command -v "docker-credential-$store" &>/dev/null && return 0
+  backup="$config.$(date +%Y%m%d-%H%M%S).bak"
+  cp "$config" "$backup"
+  plutil -remove credsStore "$config"
+  echo "Removed \"credsStore\": \"$store\" from $config: docker-credential-$store is not installed."
+  echo "  The previous file is at $backup"
+}
+
+# Make sure the chosen runtime answers, starting it if needed.
+ensure_docker() {
+  if [[ "$(uname)" == Darwin ]]; then
+    drop_missing_credential_helper
+  fi
+  if docker info &>/dev/null; then
+    return 0
+  fi
+
+  case "$(uname)" in
+    Darwin)
+      start_runtime
+      wait_for_runtime
+      ;;
+
+    Linux)
+      if ! command -v docker &>/dev/null; then
+        echo "Error: Docker is not installed."
+        echo "  See: https://docs.docker.com/engine/install/"
+        exit 1
+      fi
+      echo "Error: Docker daemon is not running."
+      echo "  Start it with: sudo systemctl start docker"
+      echo "  Enable on boot: sudo systemctl enable docker"
+      exit 1
+      ;;
+
+    *)
+      echo "Error: Cannot connect to Docker."
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Settings: one env file at mode 600. The container reads every line through
+# --env-file; trellis-crm itself reads TRELLIS_PORT and TRELLIS_BIND.
+# ---------------------------------------------------------------------------
+env_get() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
+}
+
+env_set() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+  grep -v "^$key=" "$ENV_FILE" > "$tmp" || true
+  echo "$key=$value" >> "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+random_secret() {
+  head -c 48 /dev/urandom | base64 | tr -d '/+=\n' | cut -c "1-$1"
+}
+
+host_timezone() {
+  local tz
+  tz="$(readlink /etc/localtime 2>/dev/null | sed 's#.*zoneinfo/##')" || true
+  echo "${tz:-America/Toronto}"
+}
+
+ensure_env_file() {
+  [[ -f "$ENV_FILE" ]] && return 0
+  mkdir -p "$SAGE_CONFIG_DIR"
+  (umask 077 && cat > "$ENV_FILE") <<EOF
+# Trellis on this machine, written by \`$PROG start\` on its first run.
+# The container reads every line. Edit, then run \`$PROG start\` again.
+# This file holds secrets: keep it at mode 600 and out of shared backups.
+
+# Where people reach Trellis. Behind a tunnel or a proxy: its https address.
+CRM_PUBLIC_URL=http://localhost:$DEFAULT_PORT
+# The port and address on this machine. 127.0.0.1 keeps Trellis off the network.
+TRELLIS_PORT=$DEFAULT_PORT
+TRELLIS_BIND=127.0.0.1
+# Which profile's fields and columns: sage or realestate.
+CRM_PROFILE=sage
+TZ=$(host_timezone)
+# The tick (mail, sheets, reviews, nudges) runs beside the web server.
+RUN_WORKER=1
+DJANGO_SECRET_KEY=$(random_secret 50)
+# The first admin, made on the first boot of a new volume only.
+# Change the password after you sign in.
+DJANGO_SUPERUSER_USERNAME=admin
+DJANGO_SUPERUSER_PASSWORD=$(random_secret 20)
+# The bearer key AI-UI sends to Trellis's tools at http://$CONTAINER:8000/api/v1/.
+CRM_API_KEY=$(random_secret 40)
+# Signs POST /intake/.
+INTAKE_SECRET=$(random_secret 40)
+# AI-UI on this machine, over the $NETWORK network. The key and Space come from AI-UI.
+AI_UI_URL=http://$AI_UI_CONTAINER:8080
+AI_UI_API_KEY=
+NOTIFY_SPACE_ID=
+EOF
+  chmod 600 "$ENV_FILE"
+}
+
+# 0.0.0.0 listens everywhere; ask this machine's loopback.
+local_address() {
+  local bind
+  bind="$(env_get TRELLIS_BIND)"
+  case "$bind" in
+    ""|0.0.0.0) echo 127.0.0.1 ;;
+    *)          echo "$bind" ;;
+  esac
+}
+
+local_url() {
+  local port
+  port="$(env_get TRELLIS_PORT)"
+  echo "http://$(local_address):${port:-$DEFAULT_PORT}"
+}
+
+container_running() {
+  docker container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true
+}
+
+pull_image() {
+  echo "Pulling $IMAGE..."
+  if ! docker pull "$IMAGE"; then
+    echo "Error: could not pull $IMAGE."
+    echo "  A private image needs a sign-in first: docker login ghcr.io (a token with read:packages)."
+    exit 1
+  fi
+}
+
+# Trellis and AI-UI reach each other by container name on one network: AI-UI
+# calls http://trellis-crm:8000 and Trellis calls http://sage-ai:8080. `ai-ui
+# start` makes a new sage-ai off this network; run `trellis-crm start` after it
+# until ai-ui joins the network itself.
+ensure_network() {
+  docker network inspect "$NETWORK" &>/dev/null || docker network create "$NETWORK" >/dev/null
+  if docker container inspect "$AI_UI_CONTAINER" &>/dev/null; then
+    docker network connect "$NETWORK" "$AI_UI_CONTAINER" &>/dev/null || true
+  fi
+}
+
+# The first boot migrates the database before it answers. Dev passes its own address.
+wait_healthy() {
+  local url
+  url="${1:-$(local_url)}/crm/health/"
+  echo "Waiting for Trellis to answer..."
+  for _ in $(seq 1 120); do
+    if curl -fsS --max-time 2 "$url" &>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Error: Trellis did not answer at $url within 2 minutes. See: $PROG logs"
+  exit 1
+}
+
+# Ask before an act that cannot be undone. --yes answers for scripts.
+confirm() {
+  local question="$1" yes="$2" answer=""
+  [[ "$yes" == 1 ]] && return 0
+  if [[ ! -t 0 ]]; then
+    echo "$question Run again with --yes to confirm."
+    exit 1
+  fi
+  read -rp "$question Type yes: " answer || true
+  if [[ "$answer" != yes ]]; then
+    echo "Nothing changed."
+    exit 1
+  fi
+}
+
+# Saved checkout paths, one `project=path` line each: the same file and format
+# as ai-ui's, so both CLIs remember each other's checkouts.
+sage_project_dir() {
+  [[ -f "$SAGE_PROJECTS" ]] && sed -n "s/^${1}=//p" "$SAGE_PROJECTS" | tail -n 1
+}
+
+sage_set_project_dir() {
+  local project="$1" dir="$2"
+  mkdir -p "$SAGE_CONFIG_DIR"
+  if [[ -f "$SAGE_PROJECTS" ]]; then
+    sed -i.bak "/^${project}=/d" "$SAGE_PROJECTS" && rm -f "${SAGE_PROJECTS}.bak"
+  fi
+  echo "${project}=${dir}" >> "$SAGE_PROJECTS"
+}
+
+# A clone is known by its git remote, not its folder name.
+is_repo_for() {
+  [[ -d "$1/.git" ]] && git -C "$1" remote -v 2>/dev/null | grep -qi "$2"
+}
+
+# Inside a matching clone, or one folder above one.
+find_repo_nearby() {
+  local root subdir
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || true
+  if [[ -n "$root" ]] && is_repo_for "$root" "$1"; then
+    echo "$root"; return 0
+  fi
+  for subdir in ./*/; do
+    [[ -d "$subdir/.git" ]] || continue
+    if is_repo_for "$subdir" "$1"; then
+      (cd "$subdir" && pwd); return 0
+    fi
+  done
+  return 1
+}
+
+is_ephemeral_path() {
+  case "$1" in
+    /tmp/*|/private/tmp/*|/var/folders/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_start() {
+  local port="" bind="" url="" profile="" first_run=0 new_volume=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)    port="$2"; shift 2 ;;
+      --bind)    bind="$2"; shift 2 ;;
+      --url)     url="$2"; shift 2 ;;
+      --profile) profile="$2"; shift 2 ;;
+      --tag)     set_tag "$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  [[ -f "$ENV_FILE" ]] || first_run=1
+  ensure_env_file
+  if [[ -n "$port" ]]; then
+    # A URL still on the old local port follows the new one.
+    if [[ "$(env_get CRM_PUBLIC_URL)" == "http://localhost:$(env_get TRELLIS_PORT)" ]]; then
+      env_set CRM_PUBLIC_URL "http://localhost:$port"
+    fi
+    env_set TRELLIS_PORT "$port"
+  fi
+  [[ -z "$bind" ]] || env_set TRELLIS_BIND "$bind"
+  [[ -z "$url" ]] || env_set CRM_PUBLIC_URL "${url%/}"
+  [[ -z "$profile" ]] || env_set CRM_PROFILE "$profile"
+  port="$(env_get TRELLIS_PORT)"
+  port="${port:-$DEFAULT_PORT}"
+  bind="$(env_get TRELLIS_BIND)"
+  bind="${bind:-127.0.0.1}"
+
+  ensure_docker
+  docker image inspect "$IMAGE" &>/dev/null || pull_image
+  ensure_network
+  docker volume inspect "$VOLUME" &>/dev/null || new_volume=1
+  docker rm -f "$CONTAINER" &>/dev/null || true
+
+  echo "Starting Trellis ($IMAGE)..."
+  docker run -d --name "$CONTAINER" \
+    --restart unless-stopped \
+    --network "$NETWORK" \
+    -p "$bind:$port:8000" \
+    -v "$VOLUME:/data" \
+    --env-file "$ENV_FILE" \
+    "$IMAGE" >/dev/null
+  wait_healthy
+
+  echo ""
+  echo "Trellis is running at $(env_get CRM_PUBLIC_URL)"
+  case "$bind" in
+    127.0.0.1|localhost) ;;
+    *) echo "  It listens on $bind:$port, open to the network. Put TLS in front of it." ;;
+  esac
+  if [[ $first_run == 1 && $new_volume == 1 ]]; then
+    echo "  Sign in as $(env_get DJANGO_SUPERUSER_USERNAME) with $(env_get DJANGO_SUPERUSER_PASSWORD), then change the password."
+  elif [[ $first_run == 1 ]]; then
+    echo "  The volume $VOLUME already had an admin: sign in with that account's password."
+  fi
+  if [[ $first_run == 1 ]]; then
+    echo "  Settings and secrets: $ENV_FILE"
+  fi
+}
+
+# Same lookup as `ai-ui dev`: --dir, then TRELLIS_DEV_DIR, then a clone here,
+# then the saved path, then a fresh clone in ~/src/trellis.
+cmd_dev() {
+  local port="$DEV_PORT" explicit_dir="" profile="realestate" repo_dir="" saved needs_clone=0
+  saved="$(sage_project_dir trellis)" || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir)     explicit_dir="$2"; shift 2 ;;
+      --port)    port="$2"; shift 2 ;;
+      --profile) profile="$2"; shift 2 ;;
+      --where)
+        if [[ -n "$saved" ]]; then echo "$saved"; else echo "No saved checkout yet. Run: $PROG dev"; fi
+        return 0 ;;
+      --stop)
+        ensure_docker
+        docker rm -f "$DEV_CONTAINER" &>/dev/null || true
+        echo "Dev mode stopped. The real Trellis and both volumes are untouched."
+        return 0 ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  if [[ -n "$explicit_dir" ]]; then
+    repo_dir="$(cd "$explicit_dir" 2>/dev/null && pwd)" || { echo "Error: no folder at $explicit_dir"; exit 1; }
+  elif [[ -n "${TRELLIS_DEV_DIR:-}" ]]; then
+    repo_dir="$TRELLIS_DEV_DIR"
+  elif repo_dir="$(find_repo_nearby "$TRELLIS_REMOTE")"; then
+    echo "Found a Trellis checkout here: $repo_dir"
+  elif [[ -n "$saved" && -d "$saved" ]]; then
+    repo_dir="$saved"
+  else
+    [[ -z "$saved" ]] || echo "Heads up: the saved checkout $saved is gone. Moved it? $PROG dev --dir /new/path"
+    repo_dir="${HOME}/src/trellis"
+    needs_clone=1
+  fi
+  if [[ -n "$saved" && "$saved" != "$repo_dir" && $needs_clone == 0 ]]; then
+    echo "Note: switching from $saved to $repo_dir."
+  fi
+
+  if [[ $needs_clone == 1 && ! -d "$repo_dir" ]]; then
+    echo "Cloning Trellis into $repo_dir..."
+    if ! git clone "$TRELLIS_CLONE_URL" "$repo_dir"; then
+      echo "Error: could not clone $TRELLIS_CLONE_URL. The repository is private:"
+      echo "  this Mac needs a read-only deploy key for $TRELLIS_REMOTE, or your own GitHub access."
+      exit 1
+    fi
+  fi
+  if [[ ! -f "$repo_dir/manage.py" ]]; then
+    echo "Error: $repo_dir is not a Trellis checkout (no manage.py)."
+    exit 1
+  fi
+  # Colima shares only the home folder with containers; elsewhere the mount is empty.
+  case "$repo_dir/" in
+    "$HOME"/*) ;;
+    *) echo "Error: $repo_dir is outside your home folder, which the container cannot see. Move it under $HOME."
+       exit 1 ;;
+  esac
+  if is_ephemeral_path "$repo_dir"; then
+    echo "Heads up: $repo_dir may not survive a reboot. For a lasting place: $PROG dev --dir ~/src/trellis"
+  fi
+  sage_set_project_dir trellis "$repo_dir"
+
+  ensure_docker
+  docker image inspect "$IMAGE" &>/dev/null || pull_image
+  docker rm -f "$DEV_CONTAINER" &>/dev/null || true
+  # Not the settings file: it holds the real instance's secrets and AI-UI keys,
+  # and a dev copy must never post into a real Space or reach real mailboxes.
+  echo "Starting dev mode from $repo_dir..."
+  docker run -d --name "$DEV_CONTAINER" \
+    -p "127.0.0.1:$port:8000" \
+    -v "$repo_dir:/app" \
+    -v "$DEV_VOLUME:/data" \
+    -e DATA_DIR=/data \
+    -e DJANGO_DEBUG=1 \
+    -e LOAD_FIXTURES=1 \
+    -e RUN_WORKER=1 \
+    -e CRM_PROFILE="$profile" \
+    -e TZ="$(host_timezone)" \
+    "$IMAGE" >/dev/null
+  wait_healthy "http://127.0.0.1:$port"
+  docker exec "$DEV_CONTAINER" python manage.py dev_superuser >/dev/null
+
+  echo ""
+  echo "Dev mode is running at http://localhost:$port (this Mac only)."
+  echo "  Source: $repo_dir. Edits reload by themselves; schema changes need: docker exec $DEV_CONTAINER python manage.py migrate"
+  echo "  Synthetic data only. Sign in as admin@example.com with: password"
+  echo "  The real Trellis and its record are untouched. Stop dev mode: $PROG dev --stop"
+}
+
+cmd_stop() {
+  if container_running; then
+    docker stop "$CONTAINER" >/dev/null
+    echo "Stopped. Trellis stays stopped, across reboots too, until: $PROG start"
+  else
+    echo "Trellis is not running."
+  fi
+}
+
+cmd_update() {
+  # --tag is start's option too; read it here so the pull fetches that image.
+  local arg prev=""
+  for arg in "$@"; do
+    [[ "$prev" == --tag ]] && set_tag "$arg"
+    prev="$arg"
+  done
+
+  ensure_docker
+  if container_running; then
+    cmd_backup
+  fi
+  pull_image
+  cmd_start "$@"
+}
+
+cmd_status() {
+  if ! docker container inspect "$CONTAINER" &>/dev/null; then
+    echo "Trellis is not set up here. Start it with: $PROG start"
+    return 0
+  fi
+  docker container inspect -f 'Container: {{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}
+Image:     {{.Config.Image}}' "$CONTAINER"
+  echo "Address:   $(local_url) (public: $(env_get CRM_PUBLIC_URL))"
+  echo "Settings:  $ENV_FILE"
+  local health
+  health="$(curl -sS --max-time 5 "$(local_url)/crm/health/" 2>/dev/null)" || true
+  echo "Health:    ${health:-not answering}"
+}
+
+cmd_logs() {
+  docker logs -f --tail 200 "$CONTAINER"
+}
+
+cmd_open() {
+  local url
+  url="$(env_get CRM_PUBLIC_URL)"
+  if [[ -z "$url" ]]; then
+    echo "Trellis is not set up here. Start it with: $PROG start"
+    exit 1
+  fi
+  case "$(uname)" in
+    Darwin) open "$url" ;;
+    *)      xdg-open "$url" 2>/dev/null || echo "Open $url in your browser." ;;
+  esac
+}
+
+# A consistent copy while Trellis runs: SQLite's backup API copies the
+# database, then the copy and the artifacts leave as one .tar.gz.
+cmd_backup() {
+  local dir="$BACKUP_DIR" file
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to) dir="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+  if ! container_running; then
+    echo "Trellis is not running; the backup reads through it. Start it first: $PROG start"
+    exit 1
+  fi
+
+  mkdir -p "$dir"
+  file="$dir/trellis-crm-$(date +%Y%m%d-%H%M%S).tar.gz"
+  docker exec -i "$CONTAINER" python - <<'PY'
+import pathlib, sqlite3
+
+out = pathlib.Path("/tmp/backup")
+out.mkdir(exist_ok=True)
+pathlib.Path("/data/artifacts").mkdir(exist_ok=True)
+source = sqlite3.connect("/data/trellis.sqlite3")
+copy = sqlite3.connect(out / "trellis.sqlite3")
+source.backup(copy)
+copy.close()
+source.close()
+PY
+  (umask 077 && docker exec "$CONTAINER" tar -czf - -C /tmp/backup trellis.sqlite3 -C /data artifacts > "$file")
+  docker exec "$CONTAINER" rm -rf /tmp/backup
+  echo "Backed up to $file ($(du -h "$file" | cut -f1))"
+}
+
+cmd_restore() {
+  local file="" yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      -*) echo "Unknown option: $1"; usage; exit 1 ;;
+      *) file="$1"; shift ;;
+    esac
+  done
+  if [[ ! -f "$file" ]]; then
+    echo "Usage: $PROG restore FILE [--yes]"
+    exit 1
+  fi
+  confirm "Replace the record in $VOLUME with $file?" "$yes"
+
+  ensure_docker
+  if container_running; then
+    cmd_backup
+  fi
+  docker rm -f "$CONTAINER" &>/dev/null || true
+  echo "Restoring $file..."
+  docker run --rm -i -v "$VOLUME:/data" --entrypoint sh "$IMAGE" \
+    -c 'rm -rf /data/trellis.sqlite3* /data/artifacts && tar -xzf - -C /data' < "$file"
+  cmd_start
+}
+
+# Colima at power-on with nobody signed in: a LaunchDaemon runs
+# `colima start --foreground` as this user, and Docker brings the containers
+# back by their restart policy. At shutdown launchd stops Colima, which stops
+# the VM cleanly; ExitTimeOut gives it two minutes.
+boot_plist() {
+  local colima="$1"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$BOOT_LABEL</string>
+  <key>UserName</key><string>$(id -un)</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$colima</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>$(dirname "$colima"):/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$HOME</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ExitTimeOut</key><integer>120</integer>
+  <key>StandardOutPath</key><string>$SAGE_CONFIG_DIR/logs/colima-boot.log</string>
+  <key>StandardErrorPath</key><string>$SAGE_CONFIG_DIR/logs/colima-boot.log</string>
+</dict>
+</plist>
+EOF
+}
+
+cmd_boot() {
+  local mode=install colima tmp
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --print)  mode=print; shift ;;
+      --remove) mode=remove; shift ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+  if [[ "$(uname)" != Darwin ]]; then
+    echo "boot is for macOS. On Linux: sudo systemctl enable docker"
+    exit 1
+  fi
+  if [[ "$RUNTIME" != colima ]]; then
+    echo "Error: only Colima starts at boot with nobody signed in; $RUNTIME starts at sign-in."
+    echo "  Switch with: $PROG start --runtime colima"
+    exit 1
+  fi
+  if [[ $mode == remove ]]; then
+    sudo launchctl bootout "system/$BOOT_LABEL" 2>/dev/null || true
+    sudo rm -f "$BOOT_PLIST"
+    echo "Colima no longer starts at boot."
+    return 0
+  fi
+  if ! colima="$(command -v colima)"; then
+    echo "Error: colima is not installed. Install it: brew install colima"
+    exit 1
+  fi
+  if [[ $mode == print ]]; then
+    boot_plist "$colima"
+    return 0
+  fi
+
+  mkdir -p "$SAGE_CONFIG_DIR/logs"
+  tmp="$(mktemp)"
+  boot_plist "$colima" > "$tmp"
+  echo "Installing $BOOT_PLIST (sudo asks for your password)..."
+  sudo install -m 644 -o root -g wheel "$tmp" "$BOOT_PLIST"
+  rm -f "$tmp"
+  # launchd owns Colima from here: stop the copy this session started, and the
+  # daemon starts it again. The containers come back by their restart policy.
+  colima stop &>/dev/null || true
+  sudo launchctl bootout "system/$BOOT_LABEL" 2>/dev/null || true
+  sudo launchctl bootstrap system "$BOOT_PLIST"
+  echo "Colima now starts at boot as $(id -un), with nobody signed in."
+  echo "  Its log: $SAGE_CONFIG_DIR/logs/colima-boot.log"
+  echo "  Rehearse it: restart without signing in, then reach Trellis through its tunnel."
+}
+
+cmd_nuke() {
+  local dry_run=0 yes=0 force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --yes)     yes=1; shift ;;
+      --force)   force=1; shift ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+  if [[ -f "$BOOT_PLIST" && $force == 0 ]]; then
+    echo "This Mac starts Colima at boot ($BOOT_PLIST), so it is a server."
+    echo "  Back up first ($PROG backup --to DIR), then: $PROG nuke --force"
+    exit 1
+  fi
+
+  echo "This removes, for good:"
+  echo "  the container $CONTAINER"
+  echo "  the volume $VOLUME: the database and every artifact"
+  echo "  the settings and secrets in $ENV_FILE"
+  echo "Backups in $BACKUP_DIR, the image and the $NETWORK network stay."
+  if [[ $dry_run == 1 ]]; then
+    echo "[dry-run] Nothing was removed."
+    return 0
+  fi
+  confirm "Remove Trellis and its record?" "$yes"
+
+  ensure_docker
+  docker rm -f "$CONTAINER" &>/dev/null || true
+  docker volume rm "$VOLUME" &>/dev/null || true
+  rm -f "$ENV_FILE"
+  echo "Removed."
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+command="$1"; shift
+
+# --runtime NAME works with every command: take it out before the command reads its own options.
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runtime)
+      [[ $# -ge 2 ]] || { echo "Error: --runtime needs one of: $RUNTIMES"; exit 1; }
+      RUNTIME_FLAG="$2"; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+# macOS runs bash 3.2, where "${args[@]}" on an empty array trips `set -u`.
+set -- ${args[@]+"${args[@]}"}
+
+if [[ "$(uname)" == Darwin ]]; then
+  case "$command" in
+    start|update|restore|dev)               select_runtime ask ;;
+    stop|status|logs|backup|boot|nuke)      select_runtime ;;
+  esac
+fi
+
+case "$command" in
+  start)   cmd_start "$@" ;;
+  stop)    cmd_stop ;;
+  update)  cmd_update "$@" ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs ;;
+  open)    cmd_open ;;
+  backup)  cmd_backup "$@" ;;
+  restore) cmd_restore "$@" ;;
+  boot)    cmd_boot "$@" ;;
+  nuke)    cmd_nuke "$@" ;;
+  dev)     cmd_dev "$@" ;;
+  version|-v|--version) cmd_version ;;
+  -h|--help|help) usage ;;
+  *) echo "Unknown command: $command"; usage; exit 1 ;;
+esac

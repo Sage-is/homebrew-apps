@@ -209,6 +209,20 @@ sage-runtime status                      # what runs, and what in ~/.docker will
 
 `use` also repairs Docker Desktop's leftover `credsStore` and points docker at Homebrew's buildx and compose. See `man sage-runtime`.
 
+## trellis-crm
+
+**trellis-crm** runs Trellis, the Sage.is CRM, on a Mac that stays on: a container that comes back with Docker, listening on 127.0.0.1, settings and secrets in one file at mode 600, on one network with AI-UI. The Trellis source is private; this tool and its tests live here, and the image comes from GHCR as a private package.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install trellis-crm
+docker login ghcr.io          # once, with a token that can only read packages
+trellis-crm start             # http://localhost:8030
+trellis-crm boot              # Colima at power-on, nobody signed in
+trellis-crm backup            # the database and artifacts in one .tar.gz
+```
+
+`trellis-crm dev` runs a checkout beside the real Trellis, never in its place: its own container, volume and port (8031), loopback only, synthetic data only, live reload. It finds the checkout the way `ai-ui dev` does and shares its saved paths in `~/.sage-is/projects`. A box that clones the private repo needs a read-only deploy key for `Sage-is/trellis`.
+
 ## sage-secret
 
 **sage-secret** runs a command with secrets from Bitwarden (a self-hosted Vaultwarden works) without writing them to files or showing them. Env files and the environment hold references such as `bw:cloudflare-tunnel-startr`; each run unlocks an agent account's vault, resolves them for the one command, and locks the vault again. The agent account's own credentials live in the login Keychain.

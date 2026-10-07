@@ -70,6 +70,11 @@
   - [ ] Mask every env value in the app summary, not only PASSWORD/SECRET/KEY/TOKEN names, and add ADMIN to the hidden names: `STALWART_RECOVERY_ADMIN` leaked twice into a session transcript (moved from the Trellis board's Stalwart card, 2026-10-06)
   - [ ] [MANUALLY] Commit, then `make tool_release` for cr-deploy; `~/bin/cr-deploy` is a stale second copy without either fix: delete it
 
+- [ ] **trellis-crm joins the tap** (Alexander, 2026-10-07): the Trellis source stays private; the CLI, its tests and its formula live here
+  - [x] [WE] Moved from Trellis `cli/` with its 31 tests; `trellis-crm dev` added, beside the real instance on `127.0.0.1:8031` (5 tests); `Formula/trellis-crm.rb`, not yet released
+  - [ ] [MANUALLY] First image `v0.1.0` on GHCR as a private package (Trellis `make ship`), then `make tool_release TOOL=trellis-crm VERSION=0.1.0`
+  - [ ] One copy of the shared shell: `trellis-crm` carries ai-ui's runtime block and path helpers; one file in the tap, sourced by both
+
 ## v0.2.0 — Current
 
 ### Makefile
