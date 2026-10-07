@@ -21,7 +21,7 @@ class FakeCloudflare:
 
     def __init__(self):
         self.accounts = [{"id": "acct1", "name": "Sage.is"}]
-        self.zones = [{"id": "zone1", "name": "startr.cloud"}]
+        self.zones = [{"id": "zone1", "name": "startr.cloud", "account": {"id": "acct1", "name": "Sage.is"}}]
         self.tunnels = {}
         self.configs = {}
         self.records = {}
@@ -34,7 +34,7 @@ class FakeCloudflare:
         if parts == ["accounts"]:
             return self.accounts
         if parts == ["zones"]:
-            return [z for z in self.zones if z["name"] == query.get("name")]
+            return [z for z in self.zones if query.get("name") in (None, z["name"])]
         if parts[:3] == ["accounts", "acct1", "cfd_tunnel"]:
             if len(parts) == 3 and method == "GET":
                 return [t for t in self.tunnels.values() if query.get("name") in (None, t["name"])]
@@ -178,6 +178,12 @@ class Create(Base):
         self.assertEqual(result.returncode, 1)
         self.assertIn("CLOUDFLARE_ACCOUNT_ID", result.stderr)
         self.ok("list", CLOUDFLARE_ACCOUNT_ID="acct1")
+
+    def test_a_token_scoped_to_one_zone_finds_its_account_through_the_zone(self):
+        self.cf.accounts = []
+        self.create()
+        (tunnel,) = self.cf.tunnels.values()
+        self.assertEqual(tunnel["name"], "yt-transcribe")
 
 
 class Routes(Base):

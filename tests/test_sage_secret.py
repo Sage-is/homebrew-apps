@@ -27,7 +27,9 @@ case "$1" in
   get)     [[ "$*" == *"--session session-key-xyz"* ]] || exit 1
            f="$STATE/items/$3.json"; [[ -e "$f" ]] || { echo "Not found." >&2; exit 1; }; cat "$f" ;;
   sync)    cp "$STATE"/late/*.json "$STATE/items/" 2>/dev/null; true ;;
-  list)    printf '['; first=1; for f in "$STATE"/items/*.json; do [[ $first == 1 ]] || printf ','; first=0; cat "$f"; done; printf ']' ;;
+  list)    if [[ "$2" == organizations ]]; then echo '[{"name":"Sage.is"}]'; exit 0; fi
+           if [[ "$2" == collections ]]; then echo '[{"name":"Agents"}]'; exit 0; fi
+           printf '['; first=1; for f in "$STATE"/items/*.json; do [[ $first == 1 ]] || printf ','; first=0; cat "$f"; done; printf ']' ;;
   lock)    touch "$STATE/locked" ;;
   config)  echo "$3" > "$STATE/server" ;;
 esac""",
@@ -163,6 +165,8 @@ class CheckAndSetup(Base):
         out = self.run_tool("check").stdout
         self.assertIn("agents@sage.is", out)
         self.assertIn("1 items visible: cloudflare-tunnel-startr", out)
+        self.assertIn("1 collections visible: Agents", out)
+        self.assertTrue(any(c.startswith("bw sync") for c in self.calls()), "check must sync before it lists")
         self.assertTrue((self.state / "locked").exists())
 
     def test_setup_points_bw_at_the_server_and_lets_security_prompt(self):

@@ -19,6 +19,7 @@
   - [ ] [WE] `sage-tunnel create yt-transcribe yt.startr.cloud` for the transcription service, then recreate it and check the fixed URL
   - [ ] Level 2, a credential-injecting proxy: research brief pending (NVIDIA and Meta work, Secretless Broker, placeholder-token designs)
 
+  - [x] [WE] First real run 2026-10-07 (agent Lamarr Relay 42 on warden.startr.cloud, yt.startr.cloud created): `check` now syncs first and lists organizations and collections; `sage-tunnel` finds the account through the token's zone when a zone-scoped token can list no accounts; hints name the command as it was run; 12 + 12 tests
 - [ ] **sage-runtime: Docker Desktop optional for every project** (Alexander, 2026-10-06) #ux
   - [x] [WE] `sage-runtime` (status, use, copy-volume, copy-image), man page, formula depending on colima, docker, buildx, compose and the keychain helper; 20 tests, mutation-checked
   - [ ] [MANUALLY] `brew install colima docker docker-buildx docker-compose docker-credential-helper` on this Mac, then [WE] prove `use`, both copies and the switch back against real runtimes

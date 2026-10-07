@@ -67,6 +67,11 @@ class Cloudflare:
             self._account = os.environ.get("CLOUDFLARE_ACCOUNT_ID") or ""
             if not self._account:
                 accounts = self.call("GET", "/accounts")
+                if not accounts:
+                    # A token scoped to one zone cannot list accounts, but its zones name theirs.
+                    owners = {z["account"]["id"]: z["account"].get("name", "?")
+                              for z in self.call("GET", "/zones?per_page=50") if z.get("account")}
+                    accounts = [{"id": i, "name": n} for i, n in owners.items()]
                 if len(accounts) != 1:
                     names = ", ".join(f"{a['name']} ({a['id']})" for a in accounts) or "none"
                     raise RuntimeError(f"the token sees {len(accounts)} accounts ({names}); set CLOUDFLARE_ACCOUNT_ID")
