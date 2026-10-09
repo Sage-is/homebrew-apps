@@ -1,5 +1,5 @@
 .\" sage-tunnel(1) manpage — mdoc format
-.Dd October 6, 2026
+.Dd October 9, 2026
 .Dt SAGE-TUNNEL 1
 .Os
 .Sh NAME
@@ -16,12 +16,15 @@ hostnames to services through Cloudflare and points their DNS records at
 the tunnel. Its version is
 .Sy 0.1.0 .
 .Pp
-A connector can run
-.Cm cloudflared tunnel run --token ... ,
-or a service can run cloudflared using
+The connector needs only the token; routes live in Cloudflare. Give
+cloudflared the token as
+.Ev TUNNEL_TOKEN
+in its environment, never as
+.Fl -token
+on its command line: any process list shows a command line. A service
+that runs cloudflared itself keeps the token as
 .Ev CLOUDFLARED_TUNNEL_TOKEN
-from its environment. The connector needs only the token; routes live
-in Cloudflare.
+in its env file.
 .Pp
 .Cm create
 creates a tunnel or reuses one with the same name, routes its hostname,
@@ -30,18 +33,74 @@ and writes
 and
 .Ev CLOUDFLARED_HOSTNAME
 to the required env file. It keeps other lines in that file and sets its
-mode to 600. Recreate the service to load the new environment; a restart
-keeps its old environment.
+mode to 600. A key already in the file keeps its line, so a reference
+below it, such as
+.Li TUNNEL_TOKEN=${CLOUDFLARED_TUNNEL_TOKEN} ,
+still resolves in compose. It writes through a symlink, and in place when
+the file has hard links, so every name for the file sees the new values.
+Recreate the service to load the new environment; a restart keeps its old
+environment.
+.Pp
+.Cm rotate
+changes nothing unless the env file holds a
+.Ev CLOUDFLARED_TUNNEL_TOKEN
+for that tunnel and can be rewritten. So a file that holds no token, or
+another tunnel's token, stays as it is. The same goes for
+.Ev TUNNEL_TOKEN ,
+the key cloudflared reads itself: a token there must be for that tunnel,
+and it gets the new token too. As in docker and compose, the last line
+for a key counts. A
+.Li bw:
+reference, which
+.Nm sage-secret
+fills in from the vault, stops it too:
+.Nm
+cannot write the vault. Then
+.Cm rotate
+gives the tunnel a new secret and writes the new token to the file.
+It prints the command that replaces a vault copy of the old token
+without showing the new one.
+The tunnel keeps its id, routes and DNS records. The old token
+can no longer open connections, but connectors already running it stay
+connected until they restart. So
+.Cm rotate
+disconnects every connector, as Cloudflare advises for a leaked
+token, and lists the addresses they ran from: an address you do not run
+means someone else used the old token. The tunnel is down until you
+recreate the service.
+.Fl -keep-connectors
+skips the disconnect for a planned rotation. A failure to list the
+connectors is only a warning. If a step fails once the secret may have
+changed, the error says what it left undone; run
+.Cm rotate
+again before the service restarts.
 .Pp
 Routes use proxied CNAME records. The tool replaces only CNAME records;
 it refuses to replace another record type. It adds a catch-all ingress
 rule that returns HTTP 404.
+.Pp
+A tunnel configured locally keeps its routes in a cloudflared config
+file, where
+.Nm
+cannot see them.
+.Cm list
+notes this in place of its hostnames.
+.Cm create ,
+.Cm route ,
+.Cm unroute
+and
+.Cm delete
+refuse such a tunnel and change nothing: a configuration they wrote
+would leave out its hostnames, and a delete would leave their DNS
+records behind.
+Manage it with cloudflared.
 .Sh COMMANDS
 .Bl -tag -width 24n
 .It Cm version
 Print the version and exit. This command does not require an API token.
 .It Cm list
-List tunnels with their status, live connection count, and hostnames.
+List tunnels with their status, live connection count, and hostnames,
+or a note for a tunnel configured locally.
 .It Cm create Ar NAME Ar HOSTNAME Fl -service Ar URL Fl -env-file Ar PATH
 Create or reuse a tunnel, route the hostname to the service, and write
 the connector token and hostname to the env file.
@@ -51,6 +110,12 @@ DNS at the tunnel.
 .It Cm unroute Ar NAME Ar HOSTNAME
 Remove the hostname from the tunnel and remove its DNS record if it is a
 CNAME pointing at that tunnel.
+.It Cm rotate Ar NAME Fl -env-file Ar PATH Op Fl -keep-connectors
+Give the tunnel a new token, write it to the env file, which must hold a
+token for that tunnel, and disconnect the connectors that still run the
+old one. With
+.Fl -keep-connectors ,
+they serve until they restart.
 .It Cm delete Ar NAME Op Fl -yes
 Delete the tunnel and remove DNS CNAME records pointing at it for its
 hostnames. Without
@@ -98,6 +163,11 @@ sage-secret run -- sage-tunnel route yt-transcribe transcript.startr.cloud \\
 .Ss List tunnels
 .Bd -literal -offset indent
 sage-secret run -- sage-tunnel list
+.Ed
+.Ss Replace a leaked connector token
+.Bd -literal -offset indent
+sage-secret run -- sage-tunnel rotate yt-transcribe \\
+  --env-file ~/bin/youtube_transcript_server/.env
 .Ed
 .Ss Delete a tunnel without prompting
 .Bd -literal -offset indent

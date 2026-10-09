@@ -9,6 +9,9 @@
     sage-tunnel route NAME HOSTNAME --service URL
                                               add HOSTNAME to an existing tunnel
     sage-tunnel unroute NAME HOSTNAME         remove a hostname and its DNS record
+    sage-tunnel rotate NAME --env-file PATH [--keep-connectors]
+                                              a new connector token into PATH; connectors
+                                              still on the old one are disconnected
     sage-tunnel delete NAME [--yes]           the tunnel and every DNS record pointing at it
 
 Credentials: CLOUDFLARE_API_TOKEN, scoped to Account > Cloudflare Tunnel: Edit and
@@ -16,17 +19,37 @@ Zone > DNS: Edit on each hostname's zone. CLOUDFLARE_ACCOUNT_ID picks the accoun
 when the token sees more than one. Hand the token over with `sage-secret run`, so it
 is never typed or printed.
 
-A tunnel's routes live in Cloudflare, so its connector needs only the token: either
-`cloudflared tunnel run --token ...`, or CLOUDFLARED_TUNNEL_TOKEN in the env file of
-a service that runs cloudflared itself. `create` writes CLOUDFLARED_TUNNEL_TOKEN and
-CLOUDFLARED_HOSTNAME into that file.
+A tunnel's routes live in Cloudflare, so its connector needs only the token. Hand it
+to cloudflared as TUNNEL_TOKEN in its environment, never as `--token`: any process
+list shows a command line. `create` writes CLOUDFLARED_TUNNEL_TOKEN and
+CLOUDFLARED_HOSTNAME into the env file of the service that runs cloudflared.
+
+A tunnel configured locally keeps its routes in a cloudflared config file instead,
+where this tool cannot see them. `list` says so in place of its hostnames; `create`,
+`route`, `unroute` and `delete` refuse such a tunnel and change nothing.
+
+`rotate` changes nothing unless PATH holds a token for the tunnel, none for another,
+and can be rewritten. Then it gives the tunnel a new secret and keeps its id, routes
+and DNS. The new token goes to CLOUDFLARED_TUNNEL_TOKEN, and to TUNNEL_TOKEN when
+that held the old one. Each keeps its line, so a ${...} reference below it still
+resolves. The old token opens no new connections, but connectors already running
+it stay up until they restart. So `rotate` disconnects them, as Cloudflare advises
+for a leaked token, and the hostnames are offline until the service is recreated.
+For a planned rotation, --keep-connectors leaves them serving until then.
+
+This tool cannot write the vault, so a bw: reference in PATH stops `rotate` too.
+A vault copy of a raw token in PATH goes dead with it; `rotate` prints the command
+that replaces it.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import secrets
+import shlex
 import sys
 import tempfile
 import urllib.error
@@ -38,6 +61,13 @@ VERSION = "0.1.0"
 CF_API = os.environ.get("SAGE_TUNNEL_API", "https://api.cloudflare.com/client/v4")
 CATCH_ALL = {"service": "http_status:404"}
 SCOPES = "Account > Cloudflare Tunnel: Edit and Zone > DNS: Edit"
+LOCAL = "configured locally (cloudflared config, not the dashboard)"
+
+
+class CloudflareError(RuntimeError):
+    def __init__(self, message: str, codes: set[int]):
+        super().__init__(message)
+        self.codes = codes
 
 
 class Cloudflare:
@@ -52,14 +82,20 @@ class Cloudflare:
             method=method,
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
         )
+        where = f"Cloudflare {method} {path.split('?')[0]}"
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                payload = json.loads(r.read().decode("utf-8"))
+                status, body = r.status, r.read()
         except urllib.error.HTTPError as e:
-            payload = json.loads(e.read().decode("utf-8") or "{}")
+            status, body = e.code, e.read()
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except ValueError:  # say, a proxy's HTML error page
+            raise CloudflareError(f"{where}: HTTP {status}, not JSON", set()) from None
         if not payload.get("success"):
-            errors = "; ".join(f"{x.get('code')} {x.get('message')}" for x in payload.get("errors") or [])
-            raise RuntimeError(f"Cloudflare {method} {path.split('?')[0]}: {errors or 'failed'}")
+            errors = payload.get("errors") or []
+            text = "; ".join(f"{x.get('code')} {x.get('message')}" for x in errors) or "failed"
+            raise CloudflareError(f"{where}: {text}", {x.get("code") for x in errors})
         return payload["result"]
 
     def account(self) -> str:
@@ -89,14 +125,40 @@ class Cloudflare:
             raise RuntimeError(f"no tunnel named {name}. See: sage-tunnel list")
         return tunnel
 
-    def ingress(self, tunnel_id: str) -> list[dict]:
-        config = self.call("GET", f"/accounts/{self.account()}/cfd_tunnel/{tunnel_id}/configurations")
-        rules = ((config or {}).get("config") or {}).get("ingress") or []
+    def ingress(self, tunnel: dict) -> list[dict] | None:
+        """The tunnel's hostname rules, or None for a tunnel configured locally."""
+        # Cloudflare sends a local tunnel's connector no configuration, so one stored for it anyway, say by
+        # an earlier PUT, is not what it serves. Its config_src decides first.
+        if tunnel.get("config_src") == "local":
+            return None
+        try:
+            config = self.call("GET", f"/accounts/{self.account()}/cfd_tunnel/{tunnel['id']}/configurations") or {}
+        except CloudflareError as e:
+            # 1055, configuration not found: a remote tunnel has none before its first route, and any
+            # other tunnel keeps its routes in a cloudflared config file.
+            if 1055 not in e.codes:
+                raise
+            return [] if tunnel.get("config_src") == "cloudflare" else None
+        if config.get("source") == "local":
+            return None
+        rules = (config.get("config") or {}).get("ingress") or []
         return [r for r in rules if r.get("hostname")]
+
+    def must_ingress(self, tunnel: dict) -> list[dict]:
+        rules = self.ingress(tunnel)
+        if rules is None:
+            # Its hostnames are out of sight: route and unroute would write a configuration without
+            # them, and delete would leave their DNS records behind.
+            raise RuntimeError(f"tunnel {tunnel['name']} is {LOCAL}; manage it with cloudflared")
+        return rules
 
     def set_ingress(self, tunnel_id: str, rules: list[dict]) -> None:
         self.call("PUT", f"/accounts/{self.account()}/cfd_tunnel/{tunnel_id}/configurations",
                   {"config": {"ingress": rules + [CATCH_ALL]}})
+
+    def connectors(self, tunnel_id: str) -> list[dict]:
+        # Tunnel objects lost their connections field on 2026-10-05; this endpoint replaced it.
+        return self.call("GET", f"/accounts/{self.account()}/cfd_tunnel/{tunnel_id}/connections")
 
     def zone(self, hostname: str) -> dict:
         labels = hostname.split(".")
@@ -143,26 +205,43 @@ def unpoint_dns(cf: Cloudflare, hostname: str, tunnel_id: str) -> bool:
 
 
 def route(cf: Cloudflare, tunnel: dict, hostname: str, service: str) -> None:
-    rules = [r for r in cf.ingress(tunnel["id"]) if r["hostname"] != hostname]
+    rules = [r for r in cf.must_ingress(tunnel) if r["hostname"] != hostname]
     cf.set_ingress(tunnel["id"], rules + [{"hostname": hostname, "service": service}])
     print(f"{hostname} -> {service} on tunnel {tunnel['name']}; DNS {point_dns(cf, hostname, tunnel['id'])}")
 
 
 def write_env(path: Path, values: dict[str, str]) -> None:
-    """Set KEY=VALUE lines in path, keeping every other line, at mode 600."""
+    """Set KEY=VALUE lines in path, keeping every other line, at mode 600.
+    A symlink or hard link to path still reaches the new values."""
+    path = path.resolve()
     lines = path.read_text().splitlines() if path.exists() else []
-    kept = [line for line in lines if line.split("=", 1)[0].strip() not in values]
-    kept += [f"{k}={v}" for k, v in values.items()]
+    kept, new = [], dict(values)
+    for line in lines:
+        key = line.split("=", 1)[0].strip()
+        if key not in values:
+            kept.append(line)
+        elif key in new:
+            # The first line for a key takes the value, and later ones go: compose fills in a
+            # ${KEY} reference only from the lines above it.
+            kept.append(f"{key}={new.pop(key)}")
+    text = "\n".join(kept + [f"{k}={v}" for k, v in new.items()]) + "\n"
+    if path.exists() and path.stat().st_nlink > 1:
+        # A new inode would leave the other links on the old values. chmod first: it can refuse,
+        # and the write truncates.
+        os.chmod(path, 0o600)
+        path.write_text(text)
+        return
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     with os.fdopen(fd, "w") as f:
-        f.write("\n".join(kept) + "\n")
+        f.write(text)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
 def create(cf: Cloudflare, name: str, hostname: str, service: str, env_file: Path) -> None:
-    if not env_file.parent.is_dir():
-        raise RuntimeError(f"no folder {env_file.parent} for the env file")
+    folder = env_file.resolve().parent  # write_env writes where a symlink points
+    if not folder.is_dir():
+        raise RuntimeError(f"no folder {folder} for the env file")
     tunnel = cf.tunnel(name)
     if tunnel is None:
         tunnel = cf.call("POST", f"/accounts/{cf.account()}/cfd_tunnel", {"name": name, "config_src": "cloudflare"})
@@ -176,18 +255,100 @@ def create(cf: Cloudflare, name: str, hostname: str, service: str, env_file: Pat
     print("Recreate the service so it reads the file; a restart keeps its old environment.")
 
 
+def token_tunnel(token: str) -> str | None:
+    """The id of the tunnel a connector token opens, or None for a value that is no token."""
+    try:
+        # cloudflared reads a token as base64 JSON: "a" the account, "t" the tunnel id, "s" its secret.
+        # b64decode skips what is not base64, such as quotes around the value.
+        return json.loads(base64.b64decode(token))["t"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def held_tokens(env_file: Path) -> dict[str, str]:
+    """Each connector token in env_file, by key. As for docker and compose, the last line wins.
+    TUNNEL_TOKEN is the key cloudflared reads itself, say in a container run with --env-file."""
+    lines = (line.partition("=") for line in env_file.read_text().splitlines())
+    return {key.strip(): value for key, _, value in lines
+            if key.strip() in ("CLOUDFLARED_TUNNEL_TOKEN", "TUNNEL_TOKEN")}
+
+
+def rotate(cf: Cloudflare, name: str, env_file: Path, keep: bool) -> None:
+    if not env_file.is_file():
+        raise RuntimeError(f"{env_file} is not a file; name the env file the service reads")
+    tokens = held_tokens(env_file)
+    for key, value in tokens.items():
+        if value.strip(" \"'").startswith("bw:"):  # sage-secret run fills it in from the vault
+            raise RuntimeError(f"{key} in {env_file} is a vault reference, and rotate cannot write the vault. "
+                               "Put the raw token in the file, rotate, then replace the vault copy")
+    held = {key: token_tunnel(value) for key, value in tokens.items()}
+    if not held.get("CLOUDFLARED_TUNNEL_TOKEN"):
+        raise RuntimeError(f"{env_file} has no tunnel token in CLOUDFLARED_TUNNEL_TOKEN; "
+                           "name the env file the service reads")
+    tunnel = cf.must_tunnel(name)
+    for key, tid in held.items():
+        if tid not in (None, tunnel["id"]):
+            raise RuntimeError(f"{key} in {env_file} holds a token for tunnel {tid}, not {name} ({tunnel['id']})")
+    keys = [key for key, tid in held.items() if tid]  # a value that is no token, such as ${...}, stays
+    # The PATCH kills the old token, so first prove that the same write works on this file.
+    write_env(env_file, {})
+    path = f"/accounts/{cf.account()}/cfd_tunnel/{tunnel['id']}"
+    secret = base64.b64encode(secrets.token_bytes(32)).decode()
+    # From the PATCH on, whatever fails must say what it left behind, so these catch every exception.
+    try:
+        cf.call("PATCH", path, {"name": tunnel["name"], "tunnel_secret": secret})
+    except Exception as e:
+        # Cloudflare can apply it and still answer with an error, or lose the answer.
+        raise RuntimeError(f"{e}\n  Cloudflare may have changed the secret anyway, and {env_file} still holds "
+                           "the old token. Run rotate again before the service restarts.") from e
+    print(f"rotated the token of tunnel {name}; its id, hostnames and DNS stay")
+    try:
+        write_env(env_file, dict.fromkeys(keys, cf.call("GET", f"{path}/token")))
+    except Exception as e:
+        raise RuntimeError(f"{e}\n  {env_file} still holds the old token, which opens no new connections. "
+                           "Run rotate again before the service restarts.") from e
+    print(f"wrote {' and '.join(keys)} (hidden) to {env_file} (mode 600)")
+    print("If the vault holds the old token, replace it there without showing the new one:\n"
+          f"  sage-secret run --env {shlex.quote(str(env_file))} -- "
+          "sage-secret put ITEM --replace --from-env CLOUDFLARED_TUNNEL_TOKEN")
+    # Connectors already running the old token stay up until they restart. Cut them off only once
+    # the new token is on disk, so a failure before this point leaves the service serving.
+    old = None
+    try:
+        old = cf.connectors(tunnel["id"])
+    except Exception as e:
+        # The list only shows who ran the old token, so the disconnect goes ahead without it.
+        print(f"Warning: {e}", file=sys.stderr)
+    if not keep:
+        try:
+            cf.call("DELETE", f"{path}/connections")
+        except Exception as e:
+            raise RuntimeError(f"{e}\n  The new token is in {env_file}, but connectors on the old one are still up. "
+                               "To cut them off, run rotate again.") from e
+    state = "serving until they restart" if keep else f"disconnected; {name} is down until the service is recreated"
+    print(f"connectors on the old token: {'unknown' if old is None else len(old)}, {state}")
+    for c in old or []:
+        ips = ", ".join(sorted({x["origin_ip"] for x in c.get("conns") or [] if x.get("origin_ip")}))
+        print(f"  {ips or '?'} since {c.get('run_at', '?')}")
+    if old:
+        print("An address you do not run means someone else used the old token.")
+    print("Recreate the service so it reads the file; a restart keeps its old environment.")
+
+
 def show(cf: Cloudflare) -> None:
     tunnels = cf.call("GET", f"/accounts/{cf.account()}/cfd_tunnel?is_deleted=false")
     if not tunnels:
         print("No tunnels.")
     for t in tunnels:
-        hosts = ", ".join(r["hostname"] for r in cf.ingress(t["id"])) or "no hostnames"
-        print(f"{t['name']:24} {t.get('status', '?'):9} {len(t.get('connections') or []):2} connections  {hosts}")
+        rules = cf.ingress(t)
+        hosts = LOCAL if rules is None else ", ".join(r["hostname"] for r in rules) or "no hostnames"
+        live = sum(len(c.get("conns") or []) for c in cf.connectors(t["id"]))
+        print(f"{t['name']:24} {t.get('status', '?'):9} {live:2} connections  {hosts}")
 
 
 def delete(cf: Cloudflare, name: str, yes: bool) -> None:
     tunnel = cf.must_tunnel(name)
-    hosts = [r["hostname"] for r in cf.ingress(tunnel["id"])]
+    hosts = [r["hostname"] for r in cf.must_ingress(tunnel)]
     if not yes:
         if not sys.stdin.isatty():
             raise RuntimeError(f"deleting {name} removes {', '.join(hosts) or 'no hostnames'}; run again with --yes")
@@ -218,6 +379,11 @@ def cli() -> argparse.ArgumentParser:
     u = sub.add_parser("unroute")
     u.add_argument("name")
     u.add_argument("hostname")
+    o = sub.add_parser("rotate")
+    o.add_argument("name")
+    o.add_argument("--env-file", required=True, type=Path, help="the file that receives the new connector token")
+    o.add_argument("--keep-connectors", action="store_true",
+                   help="a planned rotation: connectors on the old token serve until they restart")
     d = sub.add_parser("delete")
     d.add_argument("name")
     d.add_argument("--yes", action="store_true")
@@ -244,12 +410,14 @@ def main(argv: list[str]) -> int:
             route(cf, cf.must_tunnel(args.name), args.hostname, args.service)
         elif args.cmd == "unroute":
             tunnel = cf.must_tunnel(args.name)
-            cf.set_ingress(tunnel["id"], [r for r in cf.ingress(tunnel["id"]) if r["hostname"] != args.hostname])
+            cf.set_ingress(tunnel["id"], [r for r in cf.must_ingress(tunnel) if r["hostname"] != args.hostname])
             gone = unpoint_dns(cf, args.hostname, tunnel["id"])
             print(f"{args.hostname} removed from {args.name}" + ("; DNS removed" if gone else "; it had no DNS record here"))
+        elif args.cmd == "rotate":
+            rotate(cf, args.name, args.env_file, args.keep_connectors)
         elif args.cmd == "delete":
             delete(cf, args.name, args.yes)
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     return 0
