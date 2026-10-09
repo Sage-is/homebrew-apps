@@ -36,7 +36,8 @@
 #   move <Label> [--apply]                       offload one entry by label
 #   move <category> [--apply]                    offload every entry in a category
 #   relocations (alias: media-libraries)         print native-UI relocation
-#                                                steps — Docker, Photos,
+#                                                steps — Docker Desktop,
+#                                                Colima, OrbStack, Photos,
 #                                                Music.app, iMovie
 #   drain [<name>...] [--need <GiB>] [--apply]   free a full HOT drive: move
 #                                                top-level entries to
@@ -44,8 +45,10 @@
 #                                                leave a symlink. No names = a
 #                                                plan only (default --need 30);
 #                                                --apply requires names. Skips
-#                                                what offload owns, Docker's
-#                                                disk folder, media libraries
+#                                                what offload owns, the VM disk
+#                                                folders of Docker Desktop,
+#                                                Colima and OrbStack, and
+#                                                media libraries
 #   protected <Label> [--apply]                  alias for `move <Label>` that
 #                                                requires --target-home + FDA
 #
@@ -297,8 +300,10 @@ DEFAULT_OFFLOAD_TARGETS=(
   "Messages|protected|<TH>/Library/Messages|HOT/MovedProtected/<U>/Messages|symlink|yes|-"
   "iOS-Backups|protected|<TH>/Library/Application Support/MobileSync/Backup|HOT/MovedProtected/<U>/iOS-Backups|symlink|yes|-"
 
-  # --- VM disk image (Docker Desktop manages relocation in its own UI) ---
+  # --- VM disk images (moved by hand or in the runtime's own UI) --------
   "Docker|vm|<TH>/Library/Containers/com.docker.docker|HOT/Docker|native-ui|no|-"
+  "Colima|vm|<TH>/.colima/_lima/_disks|HOT/Colima/_disks|native-ui|no|-"
+  "OrbStack|vm|<TH>/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data|HOT/OrbStack|native-ui|no|-"
 
   # --- Media libraries (native UI; tool never auto-moves these) ----------
   "Photos-Library|media-lib|<TH>/Pictures/Photos Library.photoslibrary|HOT/Photos Library.photoslibrary|native-ui|no|-"
@@ -355,6 +360,18 @@ die()  { printf '[%s] FATAL: %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&
 mode() { [[ $DRY -eq 1 ]] && echo DRY-RUN || echo APPLY; }
 
 target_user() { basename "$TARGET_HOME"; }
+
+# The folder that holds Colima's VM disks: _disks in Lima's home, which Colima
+# 0.10.3 sets to $LIMA_HOME, else _lima in Colima's home. That is $COLIMA_HOME,
+# else ~/.colima, or $XDG_CONFIG_HOME/colima while ~/.colima is missing.
+colima_disks() {
+  local h="$HOME/.colima"
+  if [[ ! -e "$h" && -n "${XDG_CONFIG_HOME:-}" ]]; then h="$XDG_CONFIG_HOME/colima"; fi
+  echo "${LIMA_HOME:-${COLIMA_HOME:-$h}/_lima}/_disks"
+}
+
+# The physical path of $1, with every link resolved; $1 itself if it does not resolve.
+physical_path() { (cd -P "$1" && pwd -P) 2>/dev/null || echo "$1"; }
 
 # Expand <TH>, <U>, <DATE>, HOT/, COLD/ tokens in a path.
 expand_tokens() {
@@ -911,16 +928,18 @@ FOOTER
 # ----------------------------------------------------------------------------
 
 cmd_relocations() {
+  local disks dest="${OFFLOAD_HOT:-<HOT>}/Colima/_disks"; disks="$(colima_disks)"
   cat <<EOS
 === Native-UI relocations (the script never auto-moves these) ===
 Some apps cache the absolute path to their data internally. A
 symlink works most of the time, but the native UIs handle the
 transition cleanly including index rebuilds and metadata fixups.
-Use these for: Docker, Photos, Music, iMovie, Final Cut.
+Use these for: Docker Desktop, Colima, OrbStack, Photos, Music, iMovie,
+Final Cut.
 
 Suggested destinations (HOT drive: ${OFFLOAD_HOT:-<not configured>}):
 
-Docker disk image (typically the biggest single win)
+Docker Desktop disk image (typically the biggest single win)
   1. Quit any running containers.
   2. Docker Desktop > Settings > Resources > Advanced > Disk image location.
   3. Change to ${OFFLOAD_HOT:-<HOT>}/Docker/
@@ -930,6 +949,44 @@ Docker disk image (typically the biggest single win)
      'docker run --rm hello-world' should succeed.
   6. The original ~/Library/Containers/com.docker.docker can then be
      deleted from Docker's UI prompt (or manually after verification).
+
+Colima VM disks (Colima has no setting for this; a symlink does it)
+EOS
+  if [[ "$(physical_path "$disks")" == "$(physical_path "$dest")" ]]; then
+    cat <<EOS
+  Already done: "$disks" resolves to "$dest".
+  That folder holds the live VM disks. Keep it.
+EOS
+  else
+    cat <<EOS
+  1. Stop every Colima VM: 'colima list' names them, then
+     'colima stop --profile NAME' for each.
+  2. mkdir -p "${OFFLOAD_HOT:-<HOT>}/Colima"
+     cp -aH "$disks" "${OFFLOAD_HOT:-<HOT>}/Colima/"
+     cp keeps the disks sparse on an APFS drive; rsync writes each one
+     out at full size. -H copies the disks, not the link, when _disks
+     already links to another drive. If cp fails, stop here.
+  3. mv "$disks" "$disks.old"
+     ln -s "$dest" "$disks"
+  4. Start each VM: 'docker ps' should list your containers and
+     'docker run --rm hello-world' should succeed.
+  5. Then delete "$disks.old".
+     If it was a link to a folder other than "$dest",
+     that folder holds the old disks: delete it too.
+EOS
+  fi
+  cat <<EOS
+
+OrbStack data
+  1. OrbStack > Settings > Storage > Data location.
+  2. Change to ${OFFLOAD_HOT:-<HOT>}/OrbStack/
+  3. OrbStack starts empty there: it does not copy your containers,
+     images or volumes. The old disk stays in
+     ~/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data
+     until you delete it.
+  4. Quit OrbStack before you unplug the drive. OrbStack 2.2.3 replaced
+     an external disk with an empty one after an unplug
+     (orbstack/orbstack#2723).
 
 Photos Library
   1. Quit Photos.
@@ -1037,22 +1094,46 @@ cmd_protected() {
 # One scan gives every top-level entry a size, a last-touched age, and a
 # status with its reason: cold (safe to suggest), warm (touched recently),
 # live (a sync app, an active git repo, or a file open right now), or skip
-# (owned by offload, Docker's disk, a media library, drained already).
+# (owned by offload, a VM disk, a media library, drained already).
 # Loose files in the drive root are grouped by kind (@loose-archives ...).
 
 DRAIN_WARM_DAYS="${DRAIN_WARM_DAYS:-30}"
 
-# Top-level names on HOT that offload itself owns, plus Docker's disk folder.
+# Prints key $2 of the JSON object in file $1, if both exist.
+json_key() {
+  [[ -f "$1" ]] || return 0
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$1" "$2" 2>/dev/null || true
+}
+
+# The folders that hold Docker Desktop's, Colima's and OrbStack's VM disks,
+# as each runtime is set up. A drain must never take one: rsync writes a sparse
+# disk out at full size, and the size check cannot see a VM that wrote to its
+# disk mid-copy, since a disk image keeps its size.
+vm_disk_dirs() {
+  json_key "$HOME/Library/Group Containers/group.com.docker/settings-store.json" DataFolder
+  colima_disks
+  # Colima may run without the environment this shell has.
+  echo "$HOME/.colima/_lima/_disks"
+  echo "$HOME/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data"
+  json_key "$HOME/.orbstack/vmconfig.json" data_dir
+}
+
+# Top-level names on HOT that offload itself owns, plus the VM disk folders.
 drain_protected() {
-  local rel df settings="$HOME/Library/Group Containers/group.com.docker/settings-store.json"
+  local rel dir hot
   while IFS='|' read -r _ _ _ dest _ _ _; do
     [[ "$dest" == "$OFFLOAD_HOT"/* ]] || continue
     rel="${dest#"$OFFLOAD_HOT"/}"; echo "${rel%%/*}"
   done < <(iter_targets)
-  if [[ -f "$settings" ]]; then
-    df="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("DataFolder") or "")' "$settings" 2>/dev/null || true)"
-    if [[ "$df" == "$OFFLOAD_HOT"/* ]]; then rel="${df#"$OFFLOAD_HOT"/}"; echo "${rel%%/*}"; fi
-  fi
+  # Compare physical paths: _disks is often a symlink into HOT. A VM folder
+  # that is the HOT root itself keeps every entry, since its disks sit loose.
+  # A glob, not ls: CLICOLOR_FORCE makes ls wrap names in colour codes.
+  hot="$(cd -P "$OFFLOAD_HOT" && pwd -P)"
+  while IFS= read -r dir; do
+    dir="$(physical_path "$dir")"
+    if [[ "$dir" == "$hot"/* ]]; then rel="${dir#"$hot"/}"; echo "${rel%%/*}"
+    elif [[ "$dir" == "$hot" ]]; then (cd "$hot" && printf '%s\n' *); fi
+  done < <(vm_disk_dirs)
 }
 
 # Scan HOT. Prints, tab-separated:
@@ -1144,7 +1225,7 @@ for name in sorted(os.listdir(hot)):
     if name.endswith(MEDIA):
         row(name, 0, 0, "skip", "media library: use 'offload relocations'"); continue
     if name in protected:
-        row(name, 0, 0, "skip", "owned by offload or Docker's disk image"); continue
+        row(name, 0, 0, "skip", "owned by offload or a VM disk"); continue
     if os.path.isfile(path):
         groups.setdefault("@loose-" + KIND.get(os.path.splitext(name)[1].lower(), "other"), []).append(name)
         continue

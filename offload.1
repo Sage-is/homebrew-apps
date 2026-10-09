@@ -1,5 +1,5 @@
 .\" offload(1) manpage — mdoc format
-.Dd September 26, 2026
+.Dd October 9, 2026
 .Dt OFFLOAD 1
 .Os
 .Sh NAME
@@ -100,10 +100,27 @@ Print native-UI relocation steps for everything in
 .Va OFFLOAD_TARGETS
 with strategy
 .Cm native-ui :
-Docker disk image, Photos Library, Music.app library, iMovie / Final
-Cut libraries. We never auto-move these because the apps cache
-absolute paths internally and the native UIs handle the transition
-cleanly. Docker is typically the biggest single win.
+the VM disks of Docker Desktop, Colima and OrbStack, Photos Library,
+Music.app library, iMovie / Final Cut libraries. We never auto-move
+these because the apps cache absolute paths internally and the native
+UIs handle the transition cleanly.
+Colima has no such setting: its steps stop every VM, copy Colima's
+.Pa _disks
+folder with
+.Ic cp -aH
+and link the copy into place.
+.Xr cp 1
+keeps the disks sparse on an APFS drive, and
+.Fl H
+copies the disks themselves when
+.Pa _disks
+already links to another drive.
+When
+.Pa _disks
+already resolves to
+.Pa $OFFLOAD_HOT/Colima/_disks ,
+it prints no Colima steps: that folder holds the live disks.
+A VM disk is typically the biggest single win.
 .It Cm protected Ar Label Op Fl -apply
 Move a target flagged
 .Va admin?=yes .
@@ -121,9 +138,26 @@ fewest moves that reach
 .Fl -need
 (default 30 GiB free);
 .Fl -apply
-requires names. Never offers what offload owns on HOT, Docker Desktop's
-disk image folder, or media libraries. A full host volume makes Docker
-Desktop's sparse
+requires names. Never offers what offload owns on HOT, media libraries,
+or a folder that holds a VM disk: Docker Desktop's data folder, Colima's
+.Pa _disks
+folder or the folder it links to, and OrbStack's data folder
+.Pq its Va data_dir No setting, or where its default folder links .
+Colima's
+.Pa _disks
+sits in
+.Pa ~/.colima/_lima ,
+or where
+.Ev LIMA_HOME , COLIMA_HOME
+or
+.Ev XDG_CONFIG_HOME
+moves it; the drain keeps
+.Pa ~/.colima/_lima/_disks
+too.
+The physical path decides, so a symlink into HOT counts.
+When a VM's folder is the HOT root itself, the drain keeps every entry
+there.
+A full host volume makes a sparse VM disk such as Docker Desktop's
 .Pa Docker.raw
 fail every VM write with an input/output error.
 .El
