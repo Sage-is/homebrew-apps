@@ -7,6 +7,19 @@ set -euo pipefail
 # a network with AI-UI. `trellis-crm boot` starts Colima at power-on.
 
 PROG="trellis-crm"
+# The runtime code it shares with sage-runtime and ai-ui lives in lib/ beside
+# this script, in a checkout and in the formula's libexec alike. A link to it,
+# such as one in ~/bin, leads there.
+here="${BASH_SOURCE[0]}"
+while [[ -L "$here" ]]; do
+  target="$(readlink "$here")"
+  if [[ "$target" == /* ]]; then here="$target"; else here="$(dirname "$here")/$target"; fi
+done
+here="$(dirname "$here")"
+[[ -f "$here/lib/sage-runtime.sh" ]] || { echo "Error: $here/lib/sage-runtime.sh is missing. Reinstall the formula (brew reinstall $PROG), or run $PROG from a checkout of the tap, which has lib/." >&2; exit 1; }
+# shellcheck source=lib/sage-runtime.sh
+source "$here/lib/sage-runtime.sh"
+
 IMAGE_REGISTRY="ghcr.io/sage-is/trellis"
 # The formula pins this to its own version at install; a checkout runs latest.
 DEFAULT_TAG="latest"
@@ -17,8 +30,11 @@ VOLUME="trellis-crm-data"
 NETWORK="sage-net"
 AI_UI_CONTAINER="sage-ai"
 DEFAULT_PORT=8030
+# Containers reach this machine by name on every runtime: Colima resolves it
+# only through Lima's DNS, and Linux not at all. host-gateway is the machine's
+# address as the engine sees it (192.168.5.2 in a Colima VM).
+HOST_ENTRY="--add-host=host.docker.internal:host-gateway"
 
-SAGE_CONFIG_DIR="${HOME}/.sage-is"
 ENV_FILE="${SAGE_CONFIG_DIR}/trellis-crm.env"
 BACKUP_DIR="${SAGE_CONFIG_DIR}/backups/trellis-crm"
 BOOT_LABEL="is.sage.colima"
@@ -76,55 +92,17 @@ set_tag() {
 }
 
 # ---------------------------------------------------------------------------
-# Container runtime. The same block as AI-UI's cli/ai-ui: both CLIs share the
-# choice in ~/.sage-is/runtime, so change the two together.
+# Container runtime. The code lives in lib/sage-runtime.sh; ai-ui and
+# sage-runtime share the choice in ~/.sage-is/runtime.
 # ---------------------------------------------------------------------------
-RUNTIMES="colima docker-desktop orbstack"
-RUNTIME_FILE="${SAGE_CONFIG_DIR}/runtime"
 RUNTIME_FLAG=""
 RUNTIME=""
-APPLICATIONS_DIR="${APPLICATIONS_DIR:-/Applications}"
-
-# The docker context each runtime creates for itself.
-runtime_context() {
-  case "$1" in
-    colima)         echo colima ;;
-    docker-desktop) echo desktop-linux ;;
-    orbstack)       echo orbstack ;;
-  esac
-}
-
-runtime_installed() {
-  case "$1" in
-    colima)         command -v colima &>/dev/null ;;
-    docker-desktop) [[ -d "$APPLICATIONS_DIR/Docker.app" ]] ;;
-    orbstack)       [[ -d "$APPLICATIONS_DIR/OrbStack.app" ]] ;;
-    *)              return 1 ;;
-  esac
-}
-
-runtime_install_command() {
-  case "$1" in
-    colima)         echo "brew install colima" ;;
-    docker-desktop) echo "brew install --cask docker-desktop" ;;
-    orbstack)       echo "brew install --cask orbstack" ;;
-  esac
-}
-
-# The runtime this Mac used last: each one makes its own context docker's current one.
-last_used_runtime() {
-  case "$(docker context show 2>/dev/null)" in
-    desktop-linux) echo docker-desktop ;;
-    orbstack)      echo orbstack ;;
-    *)             echo colima ;;
-  esac
-}
 
 # The first start on a Mac with more than one runtime asks which to use.
 # The question goes to stderr; the answer is printed.
 ask_runtime() {
   local default runtime answer="" installed=() n=0
-  default="$(last_used_runtime)"
+  default="$(current_runtime)"
   runtime_installed "$default" || default=colima
   for runtime in $RUNTIMES; do
     if runtime_installed "$runtime"; then installed+=("$runtime"); fi
@@ -156,17 +134,12 @@ ask_runtime() {
 select_runtime() {
   if [[ -n "$RUNTIME_FLAG" ]]; then
     RUNTIME="$RUNTIME_FLAG"
-  elif [[ -f "$RUNTIME_FILE" ]]; then
-    RUNTIME="$(cat "$RUNTIME_FILE")"
-  elif [[ "${1:-}" == ask ]]; then
+  elif [[ ! -f "$RUNTIME_FILE" && "${1:-}" == ask ]]; then
     RUNTIME="$(ask_runtime)"
   else
-    RUNTIME="$(last_used_runtime)"
+    RUNTIME="$(current_runtime)"
   fi
-  if [[ -z "$(runtime_context "$RUNTIME")" ]]; then
-    echo "Error: unknown runtime '$RUNTIME'. Use one of: $RUNTIMES"
-    exit 1
-  fi
+  check_runtime "$RUNTIME"
   if [[ -n "$RUNTIME_FLAG" || "${1:-}" == ask ]]; then
     mkdir -p "$SAGE_CONFIG_DIR"
     echo "$RUNTIME" > "$RUNTIME_FILE"
@@ -175,85 +148,23 @@ select_runtime() {
   export DOCKER_CONTEXT
 }
 
-# A desktop app that has run before starts in the background, hidden. Its very
-# first start stays in view: it shows terms or setup screens that need a click.
-open_app() {
-  local app="$1" set_up_marker="$2"
-  if [[ -e "$set_up_marker" ]]; then
-    open -g -j -a "$app"
-  else
-    echo "$app's first start shows its own setup screens. Sign-in is optional."
-    open -a "$app"
-  fi
-}
-
-start_runtime() {
-  if ! runtime_installed "$RUNTIME"; then
-    echo "Error: $RUNTIME is not installed."
-    echo "  Install it:    $(runtime_install_command "$RUNTIME")"
-    [[ "$RUNTIME" == colima ]] || echo "  Or use Colima: $PROG start --runtime colima"
-    exit 1
-  fi
-
-  echo "Starting $RUNTIME..."
-  case "$RUNTIME" in
-    colima)
-      if [[ "$(colima list --json 2>/dev/null)" == *'"name":"default"'* ]]; then
-        colima start
-      else
-        # The first start creates the VM. vz is Apple's own hypervisor, so there is
-        # no QEMU to install; Colima's default 2 GiB of memory is too small for Sage.
-        colima start --vm-type vz --memory 4
-      fi
-      ;;
-    docker-desktop) open_app Docker "$HOME/Library/Group Containers/group.com.docker/settings-store.json" ;;
-    orbstack)       open_app OrbStack "$HOME/.orbstack" ;;
-  esac
-}
-
-wait_for_runtime() {
-  echo "Waiting for $RUNTIME..."
-  for _ in $(seq 1 180); do
-    if docker info &>/dev/null; then
-      echo "$RUNTIME is ready."
-      return 0
-    fi
-    sleep 1
-  done
-  echo "Error: $RUNTIME did not answer within 3 minutes."
-  [[ "$RUNTIME" == colima ]] || echo "  Finish any setup screen it shows and run this again, or use Colima: --runtime colima"
-  exit 1
-}
-
-# Docker Desktop writes "credsStore": "desktop" into docker's config. Once Docker
-# Desktop is gone, so is its docker-credential-desktop helper, and every pull fails
-# with "error getting credentials". Drop a credsStore whose helper is missing.
-drop_missing_credential_helper() {
-  local config="${DOCKER_CONFIG:-$HOME/.docker}/config.json" store backup
-  store="$(plutil -extract credsStore raw -o - "$config" 2>/dev/null)" || return 0
-  command -v "docker-credential-$store" &>/dev/null && return 0
-  backup="$config.$(date +%Y%m%d-%H%M%S).bak"
-  cp "$config" "$backup"
-  plutil -remove credsStore "$config"
-  echo "Removed \"credsStore\": \"$store\" from $config: docker-credential-$store is not installed."
-  echo "  The previous file is at $backup"
-}
-
-# Make sure the chosen runtime answers, starting it if needed.
+# Make sure the chosen runtime answers, starting it if needed. Colima's must
+# keep Docker on the VM's data disk, however the VM came up (launchd starts it
+# at power-on): on the root disk, start would pull the image again and make an
+# empty volume, so Trellis would come up without its record. A new Colima VM
+# on Apple Silicon is krunkit, which has no Rosetta; Trellis's image is built
+# for arm64 as well.
 ensure_docker() {
   if [[ "$(uname)" == Darwin ]]; then
-    drop_missing_credential_helper
+    fix_credentials "$RUNTIME"
+    start_runtime "$RUNTIME"
+    return 0
   fi
   if docker info &>/dev/null; then
     return 0
   fi
 
   case "$(uname)" in
-    Darwin)
-      start_runtime
-      wait_for_runtime
-      ;;
-
     Linux)
       if ! command -v docker &>/dev/null; then
         echo "Error: Docker is not installed."
@@ -492,6 +403,7 @@ cmd_start() {
   docker run -d --name "$CONTAINER" \
     --restart unless-stopped \
     --network "$NETWORK" \
+    "$HOST_ENTRY" \
     -p "$bind:$port:8000" \
     -v "$VOLUME:/data" \
     --env-file "$ENV_FILE" \
@@ -583,6 +495,7 @@ cmd_dev() {
   # and a dev copy must never post into a real Space or reach real mailboxes.
   echo "Starting dev mode from $repo_dir..."
   docker run -d --name "$DEV_CONTAINER" \
+    "$HOST_ENTRY" \
     -p "127.0.0.1:$port:8000" \
     -v "$repo_dir:/app" \
     -v "$DEV_VOLUME:/data" \
@@ -724,7 +637,12 @@ cmd_restore() {
 # back by their restart policy. At shutdown launchd stops Colima, which stops
 # the VM cleanly; ExitTimeOut gives it two minutes.
 boot_plist() {
-  local colima="$1"
+  local colima="$1" var env_keys=""
+  # Colima finds its VMs through these (config/files.go). The daemon needs the
+  # ones this shell sets, or it starts a new VM in ~/.colima.
+  for var in COLIMA_HOME LIMA_HOME XDG_CONFIG_HOME; do
+    [[ -z "${!var:-}" ]] || env_keys+=$'\n'"    <key>$var</key><string>${!var}</string>"
+  done
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -741,7 +659,7 @@ boot_plist() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>$HOME</string>
-    <key>PATH</key><string>$(dirname "$colima"):/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PATH</key><string>$(dirname "$colima"):/usr/bin:/bin:/usr/sbin:/sbin</string>$env_keys
   </dict>
   <key>WorkingDirectory</key><string>$HOME</string>
   <key>RunAtLoad</key><true/>
@@ -790,6 +708,18 @@ cmd_boot() {
     return 0
   fi
 
+  # launchd restarts the VM below and at every power-on, so a krunkit VM needs
+  # the boot step that mounts its data disk first: fix_lima_override's, or one
+  # added by hand. An override with its own provision list gets it printed
+  # instead, and launchd must not take the VM over until it is there.
+  if krunkit_vm; then
+    fix_lima_override
+    if ! grep -qF '/dev/disk/by-label/lima-' "$LIMA_OVERRIDE"; then
+      echo "Error: launchd would restart the krunkit VM now and at every power-on with Docker on its root disk (abiosoft/colima#1614)."
+      echo "  Add the step above to $LIMA_OVERRIDE, then run this again."
+      exit 1
+    fi
+  fi
   mkdir -p "$SAGE_CONFIG_DIR/logs"
   tmp="$(mktemp)"
   boot_plist "$colima" > "$tmp"

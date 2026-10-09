@@ -13,10 +13,22 @@ class TrellisCrm < Formula
   depends_on "docker-credential-helper"
   depends_on :macos
 
+  # krunkit, the default Colima VM on Apple Silicon, refuses Intel. Homebrew 7
+  # neither taps nor trusts a dependency's tap, and krunkit's own dependencies
+  # come from that tap too: tap and trust libkrun/krun before installing.
+  on_arm do
+    depends_on "libkrun/krun/krunkit"
+  end
+
   def install
-    # A checkout runs the latest image; an install runs the image of its own version.
-    inreplace "trellis-crm", 'DEFAULT_TAG="latest"', "DEFAULT_TAG=\"#{version}\""
-    bin.install "trellis-crm"
+    # A checkout runs the latest image; an install runs the image of its own
+    # version. A --HEAD install runs latest too: HEAD-<commit> tags no image.
+    inreplace "trellis-crm", 'DEFAULT_TAG="latest"', "DEFAULT_TAG=\"#{version}\"" unless build.head?
+    # trellis-crm sources the runtime code it shares with sage-runtime and
+    # ai-ui from lib/ beside it.
+    libexec.install "trellis-crm"
+    (libexec/"lib").install "lib/sage-runtime.sh"
+    bin.write_exec_script libexec/"trellis-crm"
   end
 
   def caveats
@@ -27,6 +39,20 @@ class TrellisCrm < Formula
 
       Then start it (settings and secrets go to ~/.sage-is/trellis-crm.env):
         trellis-crm start
+
+      On Apple Silicon, trellis-crm depends on krunkit. krunkit and its
+      libraries come from the libkrun/krun tap, and Homebrew installs them
+      only after you tap and trust it:
+        brew tap libkrun/krun && brew trust libkrun/krun && brew install krunkit
+      A first start with no Colima VM makes a krunkit VM, which gives the
+      memory it frees back to macOS. That start adds two settings to
+      Lima's override file and prints its path,
+      ~/.colima/_lima/_config/override.yaml by default:
+      "mountType: virtiofs" (abiosoft/colima#1607), and a boot step that
+      mounts the VM's data disk, where Docker keeps Trellis's image and
+      record (abiosoft/colima#1614). Every Colima VM on this Mac reads that
+      file, so a QEMU Colima profile will not start. While Docker runs on
+      the VM's root disk instead, trellis-crm stops and prints the repair.
 
       On a Mac that stays on, start Colima at power-on:
         trellis-crm boot
@@ -39,7 +65,8 @@ class TrellisCrm < Formula
   end
 
   test do
-    assert_match(/^trellis-crm #{version} /, shell_output("#{bin}/trellis-crm version"))
+    tag = build.head? ? "latest" : version
+    assert_match(/^trellis-crm #{tag} \(image \S+:#{tag}\)$/, shell_output("#{bin}/trellis-crm version"))
     assert_match "dev    [--dir DIR]", shell_output("#{bin}/trellis-crm --help")
   end
 end
