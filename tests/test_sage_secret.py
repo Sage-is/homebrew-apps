@@ -11,7 +11,8 @@ from pathlib import Path
 TOOL = Path(__file__).resolve().parent.parent / "sage-secret"
 CF_TOKEN = "cf-token-value-123"
 SESSION = "session-key-xyz"
-SECRETS = (CF_TOKEN, SESSION, "agent-master-pw", "client-secret-val", "the-user", "a note", "field-val")
+NEW_SECRET = "freshly-made-token-789"
+SECRETS = (CF_TOKEN, SESSION, "agent-master-pw", "client-secret-val", "the-user", "a note", "field-val", NEW_SECRET)
 
 # Each item is a JSON file in $STATE/items; "late" items appear only after `bw sync`.
 STUBS = {
@@ -27,9 +28,18 @@ case "$1" in
   get)     [[ "$*" == *"--session session-key-xyz"* ]] || exit 1
            f="$STATE/items/$3.json"; [[ -e "$f" ]] || { echo "Not found." >&2; exit 1; }; cat "$f" ;;
   sync)    cp "$STATE"/late/*.json "$STATE/items/" 2>/dev/null; true ;;
-  list)    if [[ "$2" == organizations ]]; then echo '[{"name":"Sage.is"}]'; exit 0; fi
+  list)    if [[ "$2" == organizations ]]; then echo '[{"id":"org-ro","name":"Agents"},{"id":"org-rw","name":"Agents-edit"}]'; exit 0; fi
+           if [[ "$2" == collections && "$3" == --organizationid ]]; then
+             if [[ "$4" == org-rw ]]; then cat "$STATE/rw-collections" 2>/dev/null || echo '[{"id":"col-rw","name":"Default collection"}]'
+             else echo '[{"id":"col-ro","name":"Default collection"}]'; fi; exit 0; fi
            if [[ "$2" == collections ]]; then echo '[{"name":"Agents"}]'; exit 0; fi
            printf '['; first=1; for f in "$STATE"/items/*.json; do [[ $first == 1 ]] || printf ','; first=0; cat "$f"; done; printf ']' ;;
+  create|edit)
+           [[ "$*" == *"--session session-key-xyz"* ]] || exit 1
+           python3 -c 'import base64, json, sys
+d = json.loads(base64.b64decode(sys.stdin.read()))
+d.setdefault("id", "id-" + d["name"])
+open(sys.argv[1] + "/" + d["name"] + ".json", "w").write(json.dumps(d))' "$STATE/items" ;;
   lock)    touch "$STATE/locked" ;;
   config)  echo "$3" > "$STATE/server" ;;
 esac""",
@@ -151,6 +161,80 @@ class Run(Base):
         result = self.run_tool("run", *cmd, X="bw:cloudflare-tunnel-startr")
         self.assertEqual(result.returncode, 1)
         self.assertIn("brew install bitwarden-cli", result.stderr)
+
+
+class Put(Base):
+    """Values the agent makes go into the organization it may edit, by stdin, never on screen."""
+
+    def stored(self, name):
+        return json.loads((self.state / "items" / f"{name}.json").read_text())
+
+    def test_a_value_from_the_environment_lands_in_agents_edit_and_nowhere_visible(self):
+        result = self.run_tool("put", "yt-tunnel-token", "--from-env", "NEW_TOKEN", NEW_TOKEN=NEW_SECRET)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        item = self.stored("yt-tunnel-token")
+        self.assertEqual(item["login"]["password"], NEW_SECRET)
+        self.assertEqual((item["organizationId"], item["collectionIds"]), ("org-rw", ["col-rw"]))
+        self.assertIn("Stored yt-tunnel-token (password) in Agents-edit / Default collection. Use it as bw:yt-tunnel-token", result.stdout)
+        self.assertNotIn(NEW_SECRET, (self.state / "calls").read_text(), "the value reached a command line")
+        self.assertTrue((self.state / "locked").exists())
+
+    def test_a_file_or_stdin_works_and_a_custom_field_is_hidden(self):
+        secret_file = self.work / "token"
+        secret_file.write_text(NEW_SECRET + "\n")
+        self.assertEqual(self.run_tool("put", "ghcr", "--from-file", str(secret_file), "--field", "api_token",
+                                       "--username", "opencoca").returncode, 0)
+        item = self.stored("ghcr")
+        self.assertEqual(item["fields"], [{"name": "api_token", "value": NEW_SECRET, "type": 1}])
+        self.assertEqual(item["login"]["username"], "opencoca")
+        result = subprocess.run([TOOL, "put", "piped", "--stdin"], env=self.env, input=NEW_SECRET,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(NEW_SECRET, result.stdout + result.stderr)
+        self.assertEqual(self.stored("piped")["login"]["password"], NEW_SECRET)
+
+    def test_what_it_stores_reads_back_through_run(self):
+        self.run_tool("put", "made-here", "--from-env", "V", V=NEW_SECRET)
+        cmd, out = self.child_saw("X")
+        self.assertEqual(self.run_tool("run", *cmd, X="bw:made-here").returncode, 0)
+        self.assertEqual(json.loads(out.read_text()), {"X": NEW_SECRET})
+
+    def test_a_name_used_outside_the_write_organization_is_refused(self):
+        result = self.run_tool("put", "cloudflare-tunnel-startr", "--from-env", "V", V=NEW_SECRET)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("already exists outside Agents-edit", result.stderr)
+        self.assertEqual(self.stored("cloudflare-tunnel-startr")["login"]["password"], CF_TOKEN)
+        self.assertTrue((self.state / "locked").exists())
+
+    def test_changing_an_existing_item_needs_replace_and_keeps_its_other_fields(self):
+        self.run_tool("put", "rotating", "--from-env", "V", "--username", "svc", V="first-value-111")
+        self.run_tool("put", "rotating", "--from-env", "V", "--field", "notes", "--replace", V="a kept note")
+        result = self.run_tool("put", "rotating", "--from-env", "V", V=NEW_SECRET)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Add --replace", result.stderr)
+        self.assertEqual(self.run_tool("put", "rotating", "--from-env", "V", "--replace", V=NEW_SECRET).returncode, 0)
+        item = self.stored("rotating")
+        self.assertEqual((item["login"]["password"], item["login"]["username"], item["notes"]),
+                         (NEW_SECRET, "svc", "a kept note"))
+        self.assertTrue(any(c.startswith("bw edit item id-rotating") for c in self.calls()))
+
+    def test_sources_and_destinations_are_checked_before_anything_is_written(self):
+        for args, env, message in (
+                (("--from-env", "V", "--stdin"), {"V": NEW_SECRET}, "exactly one source"),
+                ((), {}, "exactly one source"),
+                (("--from-env", "EMPTY"), {"EMPTY": ""}, "the value is empty"),
+                (("--from-env", "V", "--org", "Nope"), {"V": NEW_SECRET}, "no organization named Nope"),
+                (("--from-env", "V", "--collection", "Other"), {"V": NEW_SECRET}, "has no collection named Other")):
+            with self.subTest(args=args):
+                result = self.run_tool("put", "x", *args, **env)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+        (self.state / "rw-collections").write_text('[]')
+        self.assertIn("sees no collection in Agents-edit", self.run_tool("put", "x", "--from-env", "V", V=NEW_SECRET).stderr)
+        (self.state / "rw-collections").write_text('[{"id":"a","name":"One"},{"id":"b","name":"Two"}]')
+        result = self.run_tool("put", "x", "--from-env", "V", V=NEW_SECRET)
+        self.assertIn("name one with --collection", result.stderr)
+        self.assertFalse((self.state / "items" / "x.json").exists())
 
 
 class Isolation(Base):
