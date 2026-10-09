@@ -9,21 +9,24 @@ set -euo pipefail
 # it, saves the choice where ai-ui and trellis-crm read it (~/.sage-is/runtime)
 # and stops the others, since they all forward published ports to localhost.
 # `copy-volume` and `copy-image` move data across, so nothing has to be
-# migrated up front and Docker Desktop is never required.
+# migrated up front and Docker Desktop is never required. `build-vm` runs a
+# second Colima VM, with Rosetta, for linux/amd64 and multi-arch builds.
+# `convert` makes a vz Colima VM a krunkit one on the same data disk.
 
 VERSION="0.1.0"
 PROG="sage-runtime"
-SAGE_CONFIG_DIR="${HOME}/.sage-is"
-RUNTIME_FILE="${SAGE_CONFIG_DIR}/runtime"
-RUNTIMES="colima docker-desktop orbstack"
-APPLICATIONS_DIR="${APPLICATIONS_DIR:-/Applications}"
-BREW_PLUGINS="${HOMEBREW_PREFIX:-/opt/homebrew}/lib/docker/cli-plugins"
-DOCKER_CONFIG_FILE="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
-COPY_IMAGE="alpine:3"
-# Folders both runtimes mount (the Sprig registry, backups, caches). Two VMs
-# never share file locks, so two runtimes writing here at once lose data with
-# no error (measured 2026-10-06). One runtime uses it at a time.
-SAGE_DATA="${SAGE_DATA:-$HOME/SageData}"
+# The runtime code lives in lib/ beside this script, in a checkout and in the
+# formula's libexec alike. A link to it, such as one in ~/bin, leads there.
+here="${BASH_SOURCE[0]}"
+while [[ -L "$here" ]]; do
+  target="$(readlink "$here")"
+  if [[ "$target" == /* ]]; then here="$target"; else here="$(dirname "$here")/$target"; fi
+done
+here="$(dirname "$here")"
+[[ -f "$here/lib/sage-runtime.sh" ]] || { echo "Error: $here/lib/sage-runtime.sh is missing. Reinstall the formula (brew reinstall sage-runtime), or run sage-runtime from a checkout of the tap, which has lib/." >&2; exit 1; }
+# shellcheck source=lib/sage-runtime.sh
+source "$here/lib/sage-runtime.sh"
+trap_cleanup
 
 usage() {
   cat <<EOF
@@ -31,255 +34,121 @@ Usage: $PROG <command> [options]
 
 Commands:
   status                  Which runtimes are installed and running, which one
-                          docker uses, and anything in ~/.docker that will break
+                          docker uses, anything in ~/.docker that will break,
+                          and what Docker Desktop left behind
   use RUNTIME [--keep-other]
-                          Start RUNTIME, point docker at it, remember it, and
-                          stop the other runtimes (unless --keep-other)
+                          Stop the other runtimes (unless --keep-other), then
+                          start RUNTIME, point docker at it and remember it
   copy-volume NAME [--from RUNTIME] [--to RUNTIME] [--force]
                           Copy a named volume between runtimes (default: from
                           the one not in use to the one in use)
   copy-image REF [--from RUNTIME] [--to RUNTIME]
                           Copy an image between runtimes
+  migrate [--from RUNTIME] [--images] [--dry-run]
+                          Move to Colima: copy every named volume but buildx
+                          caches (and with --images every tagged image) that
+                          Colima lacks from RUNTIME (default docker-desktop),
+                          then use colima. Anonymous volumes stay behind, and
+                          RUNTIME keeps its copy. --dry-run starts nothing,
+                          copies nothing and lists what the running side shows
+  convert [--dry-run] [--yes]
+                          Make the vz Colima VM a krunkit VM on the same data
+                          disk, with every image and volume. Without --yes,
+                          or with --dry-run, print the plan and change nothing
+  build-vm [--stop]       Start (or stop) the build VM, for linux/amd64 and
+                          multi-arch builds
   version                 Show the version
 
 Runtimes: $RUNTIMES
 
 \$SAGE_DATA (default ~/SageData) holds folders both runtimes mount, such as the
 Sprig registry. Two runtimes writing there at once lose data, so use stops
-the others before starting one, and --keep-other and the copy commands
-refuse while containers on both sides use it.
+the others before starting one. The build VM keeps running for its builds,
+so use, build-vm, convert and the copy commands refuse while containers in
+two runtimes, or in a runtime and the build VM, use it. An OrbStack engine
+that runs with its app closed (orb start) counts as running: use stops it
+with orb stop.
 
-A new Colima VM gets a development profile: vz with Rosetta, virtiofs mounts
-with file events, a third of the Mac's memory (4 to 8 GiB) and half its cores
-(2 to 8). Override with SAGE_RUNTIME_MEMORY, SAGE_RUNTIME_CPU and
-SAGE_RUNTIME_DISK (GiB, default 100). An existing VM keeps its own settings.
+Docker Desktop is optional. With Colima in use, docker keeps its logins with
+the Keychain helper, which Docker Desktop's helper only wraps: use colima
+switches credsStore to osxkeychain, with a dated backup of config.json. use
+also removes plugin links into Docker.app that lead nowhere. status names
+what else Docker Desktop leaves behind, each with the line that mends it:
+/var/run/docker.sock, its plugin hooks, its links in /usr/local/bin that
+lead nowhere or block Homebrew's own and, with Colima in use, its Login
+Item. $PROG never changes those itself.
+Going back stays one line: $PROG use docker-desktop
+
+Stop your apps before a copy: copy-volume and migrate refuse while running
+containers on either side use the volume. A volume or image that will not fit
+on the Mac or in the VM is refused; migrate --images names such an image and
+goes on. A copy that fails or is interrupted leaves no half-made volume, and
+each finished one is noted in ~/.sage-is/migrated. migrate never copies over
+data Colima holds; while a volume there holds data no note vouches for,
+migrate copies the rest but does not switch.
+
+A new Colima VM gets virtiofs mounts with file events, half the Mac's cores
+(2 to 8) and a 100 GiB disk. On Apple Silicon it is a krunkit VM: memory the
+VM frees goes back to macOS, so it may take half the Mac's memory (4 to 12
+GiB), and containers reach the GPU through Vulkan with
+docker run --device /dev/dri, from an image whose Mesa Venus driver is
+patched for krunkit, such as ghcr.io/unsuman/fedora-vgpu-llama. krunkit has
+no Rosetta: linux/amd64 runs there only under QEMU emulation, so amd64 builds
+belong on the build VM. Before $PROG makes a krunkit VM, it adds two
+settings to Lima's override file, which every Colima VM reads:
+  $LIMA_OVERRIDE
+"mountType: virtiofs" (abiosoft/colima#1607) forces virtiofs mounts,
+so a QEMU Colima profile will not start while it is there. A boot step
+mounts the VM's data disk, which krunkit leaves unmounted after its first
+boot (abiosoft/colima#1614). Docker keeps images and volumes on that disk:
+on a krunkit VM, colima ssh -- findmnt /var/lib/docker shows /dev/vdc1,
+and $PROG stops while Docker runs on the VM's root disk instead.
+Without krunkit, Apple Silicon warns and uses vz with Rosetta. Get krunkit:
+  $KRUNKIT_INSTALL
+An Intel Mac uses vz without Rosetta. vz keeps memory it has touched, so a
+vz VM gets a third of the Mac's memory (4 to 8 GiB). Override the sizes with
+SAGE_RUNTIME_MEMORY (GiB), SAGE_RUNTIME_CPU and SAGE_RUNTIME_DISK (GiB). An
+existing VM keeps its own settings.
+
+convert turns a vz VM, made before krunkit was the default, into a krunkit
+VM with the same memory, CPUs, disk and mounts (SAGE_RUNTIME_MEMORY and
+SAGE_RUNTIME_CPU override the first two). colima delete takes the VM's root
+disk, so convert goes on only while the VM shows Docker's data on its data
+disk, and no container or volume keeps data in a folder of the root disk,
+such as /srv/pg from docker run -v /srv/pg:... (the system's own folders do
+not count). It records the VM's volumes, images and running containers in
+~/.sage-is/convert, deletes the VM but never its data disk (no --data),
+makes the krunkit VM on that disk, and compares. The delete also removes the
+VM's Colima settings; a copy stays in ~/.sage-is. A mount it cannot carry
+across, such as a key colima start has no flag for, keeps the VM vz.
+Containers started with --rm go as the VM stops, with their anonymous
+volumes, as they would at any stop. When anything is missing, it stops and
+prints the way back to vz; once the cause is mended, convert --yes
+finishes from the record. It refuses while containers in Colima and in
+another runtime or the build VM use \$SAGE_DATA.
+
+The build VM is a vz profile, with Rosetta on Apple Silicon, and a third of
+the Mac's memory (9 to 12 GiB, room for AI-UI's multi-arch release), made
+the first time build-vm runs. It never becomes docker's context: build on
+it with DOCKER_CONTEXT=colima-$BUILD_PROFILE in front of the build command, and stop
+it when done, since it keeps the memory a build touched.
 EOF
-}
-
-die() {
-  echo "Error: $*" >&2
-  exit 1
 }
 
 need_docker() {
   command -v docker &>/dev/null || die "the docker CLI is missing. Install it: brew install docker"
 }
 
-# --- the runtimes -------------------------------------------------------------
-
-# The docker context each runtime creates for itself.
-runtime_context() {
-  case "$1" in
-    colima)         echo colima ;;
-    docker-desktop) echo desktop-linux ;;
-    orbstack)       echo orbstack ;;
-  esac
-}
-
-check_runtime() {
-  [[ -n "$(runtime_context "${1:-}")" ]] || die "unknown runtime '${1:-}'. Use one of: $RUNTIMES"
-}
-
-runtime_installed() {
-  case "$1" in
-    colima)         command -v colima &>/dev/null ;;
-    docker-desktop) [[ -d "$APPLICATIONS_DIR/Docker.app" ]] ;;
-    orbstack)       [[ -d "$APPLICATIONS_DIR/OrbStack.app" ]] ;;
-  esac
-}
-
-runtime_install_command() {
-  case "$1" in
-    colima)         echo "brew install colima docker docker-buildx docker-credential-helper" ;;
-    docker-desktop) echo "brew install --cask docker-desktop" ;;
-    orbstack)       echo "brew install --cask orbstack" ;;
-  esac
-}
-
-runtime_running() {
-  docker --context "$(runtime_context "$1")" info &>/dev/null
-}
-
-installed_runtimes() {
-  local rt
-  for rt in $RUNTIMES; do
-    if runtime_installed "$rt"; then echo "$rt"; fi
-  done
-}
-
-# The runtime in use: the saved choice, else the one docker's context names.
-current_runtime() {
-  if [[ -f "$RUNTIME_FILE" ]]; then
-    cat "$RUNTIME_FILE"
-    return
-  fi
-  case "$(docker context show 2>/dev/null)" in
-    desktop-linux) echo docker-desktop ;;
-    orbstack)      echo orbstack ;;
-    *)             echo colima ;;
-  esac
-}
-
-clamp() {
-  local value="$1" low="$2" high="$3"
-  if (( value < low )); then value=$low; fi
-  if (( value > high )); then value=$high; fi
-  echo "$value"
-}
-
-# A new Colima VM for development work. vz is Apple's hypervisor and Rosetta
-# runs linux/amd64 images and buildx stages at near native speed, as Docker
-# Desktop's own setting did. Image builds need more than Colima's 2 GiB
-# default: AI-UI's Vite build alone takes a 4 GiB heap. The ceiling stays at
-# 8 GiB because a vz VM may keep memory it has touched; a release build can
-# borrow more for a while with `colima stop; colima start --memory 10`.
-create_colima() {
-  local ram_gib cores
-  ram_gib=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-  cores=$(sysctl -n hw.ncpu)
-  local memory="${SAGE_RUNTIME_MEMORY:-$(clamp $(( ram_gib / 3 )) 4 8)}"
-  local cpu="${SAGE_RUNTIME_CPU:-$(clamp $(( cores / 2 )) 2 8)}"
-  local disk="${SAGE_RUNTIME_DISK:-100}"
-  echo "Creating the Colima VM: ${memory} GiB memory, ${cpu} CPUs, ${disk} GiB disk."
-  colima start --vm-type vz --vz-rosetta --mount-type virtiofs --mount-inotify \
-    --memory "$memory" --cpu "$cpu" --disk "$disk"
-}
-
-colima_exists() {
-  [[ "$(colima list --json 2>/dev/null)" == *'"name":"default"'* ]]
-}
-
-# A desktop app that has run before starts in the background, hidden. Its very
-# first start stays in view: it shows terms or setup screens that need a click.
-open_app() {
-  local app="$1" set_up_marker="$2"
-  if [[ -e "$set_up_marker" ]]; then
-    open -g -j -a "$app"
-  else
-    echo "$app's first start shows its own setup screens. Sign-in is optional."
-    open -a "$app"
-  fi
-}
-
-start_runtime() {
-  local rt="$1"
-  runtime_running "$rt" && return 0
-  runtime_installed "$rt" || die "$rt is not installed. Install it: $(runtime_install_command "$rt")"
-  echo "Starting $rt..."
-  case "$rt" in
-    colima)
-      if colima_exists; then colima start; else create_colima; fi
-      ;;
-    docker-desktop) open_app Docker "$HOME/Library/Group Containers/group.com.docker/settings-store.json" ;;
-    orbstack)       open_app OrbStack "$HOME/.orbstack" ;;
-  esac
-  local _
-  for _ in $(seq 1 180); do
-    runtime_running "$rt" && return 0
-    sleep 1
-  done
-  die "$rt did not answer within 3 minutes. Finish any setup screen it shows and run this again."
-}
-
-stop_runtime() {
-  local rt="$1"
-  runtime_running "$rt" || return 0
-  echo "Stopping $rt..."
-  case "$rt" in
-    colima)         colima stop ;;
-    docker-desktop) osascript -e 'quit app "Docker"' >/dev/null ;;
-    orbstack)       osascript -e 'quit app "OrbStack"' >/dev/null ;;
-  esac
-}
-
-# --- docker's own config ------------------------------------------------------
-
-# Docker Desktop writes "credsStore": "desktop". Its helper leaves with the app,
-# and then every pull and login fails with "error getting credentials". The
-# keychain helper serves every runtime, Docker Desktop included.
-fix_credentials() {
-  local store backup
-  [[ -f "$DOCKER_CONFIG_FILE" ]] || return 0
-  store="$(plutil -extract credsStore raw -o - "$DOCKER_CONFIG_FILE" 2>/dev/null)" || return 0
-  command -v "docker-credential-$store" &>/dev/null && return 0
-  backup="$DOCKER_CONFIG_FILE.$(date +%Y%m%d-%H%M%S).bak"
-  cp "$DOCKER_CONFIG_FILE" "$backup"
-  if command -v docker-credential-osxkeychain &>/dev/null; then
-    plutil -replace credsStore -string osxkeychain "$DOCKER_CONFIG_FILE"
-    echo "credsStore: $store has no helper here; now osxkeychain (backup: $backup)"
-  else
-    plutil -remove credsStore "$DOCKER_CONFIG_FILE"
-    echo "credsStore: removed $store, which has no helper here (backup: $backup)"
-    echo "  Keep logins in the keychain: brew install docker-credential-helper"
-  fi
-}
-
-# Homebrew's buildx and compose live outside docker's own plugin folder.
-fix_plugin_dirs() {
-  [[ -d "$BREW_PLUGINS" ]] || return 0
-  if [[ ! -f "$DOCKER_CONFIG_FILE" ]]; then
-    mkdir -p "$(dirname "$DOCKER_CONFIG_FILE")"
-    echo '{}' > "$DOCKER_CONFIG_FILE"
-  fi
-  local i=0 dir
-  while dir="$(plutil -extract "cliPluginsExtraDirs.$i" raw -o - "$DOCKER_CONFIG_FILE" 2>/dev/null)"; do
-    [[ "$dir" == "$BREW_PLUGINS" ]] && return 0
-    i=$((i + 1))
-  done
-  cp "$DOCKER_CONFIG_FILE" "$DOCKER_CONFIG_FILE.$(date +%Y%m%d-%H%M%S).bak"
-  if (( i == 0 )); then
-    plutil -insert cliPluginsExtraDirs -json "[\"$BREW_PLUGINS\"]" "$DOCKER_CONFIG_FILE"
-  else
-    plutil -insert cliPluginsExtraDirs.0 -string "$BREW_PLUGINS" "$DOCKER_CONFIG_FILE"
-  fi
-  echo "cliPluginsExtraDirs: added $BREW_PLUGINS (Homebrew's buildx and compose)"
-}
-
-# A buildx builder remembers the context it was made on. One whose context is
-# gone is found by name, so `inspect || create` guards never replace it.
-stale_builders() {
-  local dir="${DOCKER_CONFIG:-$HOME/.docker}/buildx/instances" contexts file endpoint
-  [[ -d "$dir" ]] || return 0
-  contexts=" $(docker context ls -q 2>/dev/null | tr '\n' ' ') "
-  for file in "$dir"/*; do
-    [[ -f "$file" ]] || continue
-    endpoint="$(plutil -extract Nodes.0.Endpoint raw -o - "$file" 2>/dev/null)" || continue
-    [[ "$endpoint" == unix://* || "$endpoint" == tcp://* ]] && continue
-    [[ "$contexts" == *" $endpoint "* ]] || echo "$(basename "$file") $endpoint"
-  done
-}
-
-# Running containers in RUNTIME that mount something under $SAGE_DATA, one name per line.
-shared_data_users() {
-  local ctx name
-  ctx="$(runtime_context "$1")"
-  runtime_running "$1" || return 0
-  for name in $(docker --context "$ctx" ps --format '{{.Names}}'); do
-    if docker --context "$ctx" inspect -f '{{range .Mounts}}{{.Source}} {{end}}' "$name" \
-        | tr ' ' '\n' | grep -q "^$SAGE_DATA"; then
-      echo "$name"
-    fi
-  done
-}
-
-# Refuse when RUNTIME and another running runtime both have containers on $SAGE_DATA.
-guard_shared_data() {
-  local rt="$1" other mine theirs
-  mine="$(shared_data_users "$rt" | tr '\n' ' ')"
-  [[ -n "$mine" ]] || return 0
-  for other in $RUNTIMES; do
-    [[ "$other" == "$rt" ]] && continue
-    theirs="$(shared_data_users "$other" | tr '\n' ' ')"
-    if [[ -n "$theirs" ]]; then
-      die "both $rt ($mine) and $other ($theirs) are using $SAGE_DATA. Two runtimes writing there at once lose data. Stop one side first."
-    fi
-  done
+# An option that takes a runtime, such as --from, needs one after it: a bare
+# `shift 2` at the end of the line exits under set -e without a word.
+need_value() {
+  (( $# >= 2 )) || die "$1 needs a runtime: one of $RUNTIMES. See: $PROG --help"
 }
 
 # --- commands -----------------------------------------------------------------
 
 cmd_status() {
-  local rt mark current problems=0
+  local rt mark current state problems=0
   current="$(current_runtime)"
   echo "Runtimes:"
   for rt in $RUNTIMES; do
@@ -291,19 +160,36 @@ cmd_status() {
     [[ "$rt" == "$current" ]] && mark="  <- in use"
     if runtime_running "$rt"; then
       printf '  %-15s running, %s volumes%s\n' "$rt" \
-        "$(docker --context "$(runtime_context "$rt")" volume ls -q 2>/dev/null | wc -l | tr -d ' ')" "$mark"
+        "$(briefly docker --context "$(runtime_context "$rt")" volume ls -q 2>/dev/null | wc -l | tr -d ' ')" "$mark"
+    elif runtime_up "$rt"; then
+      printf '  %-15s up, but its engine does not answer%s\n' "$rt" "$mark"
+      if [[ "$rt" == "$current" ]]; then echo "  Restart $rt."; else echo "  Stop it: $PROG use $current"; fi
+      problems=1
     else
       printf '  %-15s stopped%s\n' "$rt" "$mark"
     fi
   done
+  # Colima tells whether the build VM runs: one whose docker stopped
+  # answering still holds its memory.
+  state="$(colima_state "$BUILD_PROFILE")"
+  if [[ "$state" == Running ]]; then
+    printf '  %-15s running; stop it when builds are done: %s build-vm --stop\n' "build VM" "$PROG"
+  elif [[ -n "$state" ]]; then
+    printf '  %-15s %s\n' "build VM" "$(echo "$state" | tr '[:upper:]' '[:lower:]')"
+  fi
   echo "docker context: $(docker context show 2>/dev/null || echo none)"
   [[ "$(docker context show 2>/dev/null)" == "$(runtime_context "$current")" ]] \
     || { echo "  Not the runtime in use. Run: $PROG use $current"; problems=1; }
 
-  local store
+  local store leftovers
   store="$(plutil -extract credsStore raw -o - "$DOCKER_CONFIG_FILE" 2>/dev/null)" || store=""
   if [[ -n "$store" ]] && ! command -v "docker-credential-$store" &>/dev/null; then
     echo "credsStore \"$store\" has no helper on this Mac: pulls and logins will fail. Run: $PROG use $current"
+    problems=1
+  fi
+  leftovers="$(desktop_leftovers "$current")"
+  if [[ -n "$leftovers" ]]; then
+    echo "$leftovers"
     problems=1
   fi
   if ! docker buildx version &>/dev/null; then
@@ -330,22 +216,24 @@ cmd_use() {
     esac
   done
   check_runtime "$rt"
-  fix_credentials
+  fix_credentials "$rt"
   fix_plugin_dirs
   # Stop the others before starting this one: containers with a restart policy
   # come back as soon as a runtime starts, and two runtimes must never share
-  # $SAGE_DATA or the published ports at the same moment.
+  # $SAGE_DATA or the published ports at the same moment. The build VM keeps
+  # running for its builds, so the guard asks it even then.
   if (( keep_other == 0 )); then
     for other in $RUNTIMES; do
       if [[ "$other" != "$rt" ]] && runtime_installed "$other"; then stop_runtime "$other"; fi
     done
   fi
   start_runtime "$rt"
-  (( keep_other == 0 )) || guard_shared_data "$rt"
+  guard_shared_data "$rt"
   docker context use "$(runtime_context "$rt")" >/dev/null
   mkdir -p "$SAGE_CONFIG_DIR"
   echo "$rt" > "$RUNTIME_FILE"
   echo "docker now uses $rt (context $(runtime_context "$rt")). ai-ui and trellis-crm follow."
+  if [[ "$rt" == colima ]]; then hint_convert; fi
 }
 
 # --from and --to for the copy commands: the default copies from the other
@@ -354,8 +242,8 @@ parse_copy() {
   FROM="" TO="" FORCE=0 ITEM=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --from)  FROM="${2:-}"; shift 2 ;;
-      --to)    TO="${2:-}"; shift 2 ;;
+      --from)  need_value "$@"; FROM="$2"; shift 2 ;;
+      --to)    need_value "$@"; TO="$2"; shift 2 ;;
       --force) FORCE=1; shift ;;
       -*)      die "unknown option $1" ;;
       *)       ITEM="$1"; shift ;;
@@ -379,46 +267,217 @@ parse_copy() {
 
 cmd_copy_volume() {
   parse_copy "$@"
-  local name="$ITEM" src dst
-  src="$(runtime_context "$FROM")"
-  dst="$(runtime_context "$TO")"
-  docker --context "$src" volume inspect "$name" &>/dev/null || die "$FROM has no volume $name"
-  if docker --context "$dst" volume inspect "$name" &>/dev/null \
-     && [[ -n "$(docker --context "$dst" run --rm -v "$name:/v" "$COPY_IMAGE" ls -A /v)" ]] \
-     && (( FORCE == 0 )); then
-    die "$TO already has a volume $name with data in it. Add --force to copy over it."
-  fi
-  echo "Copying volume $name from $FROM to $TO..."
-  if (( FORCE == 1 )); then  # an exact copy, not a merge with what was there
-    docker --context "$dst" run --rm -v "$name:/v" "$COPY_IMAGE" find /v -mindepth 1 -delete
-  fi
-  docker --context "$src" run --rm -v "$name:/v:ro" "$COPY_IMAGE" tar -C /v -cf - . \
-    | docker --context "$dst" run --rm -i -v "$name:/v" "$COPY_IMAGE" tar -C /v -xf -
-  local count='find /v | wc -l; du -sk /v | cut -f1'
-  local before after
-  before="$(docker --context "$src" run --rm -v "$name:/v:ro" "$COPY_IMAGE" sh -c "$count" | tr '\n' ' ')"
-  after="$(docker --context "$dst" run --rm -v "$name:/v:ro" "$COPY_IMAGE" sh -c "$count" | tr '\n' ' ')"
-  read -r n_before kb_before <<< "$before"
-  read -r n_after kb_after <<< "$after"
-  [[ "$n_before" == "$n_after" ]] || die "copy incomplete: $n_before entries in $FROM, $n_after in $TO"
-  echo "Copied $n_after files and folders (${kb_after} KiB; ${kb_before} KiB in $FROM)."
+  copy_volume "$ITEM" "$FROM" "$TO" "$FORCE"
 }
 
 cmd_copy_image() {
+  local why
   parse_copy "$@"
+  why="$(image_fits "$FROM" "$TO" "$ITEM")" || die "$why"
   echo "Copying image $ITEM from $FROM to $TO..."
-  docker --context "$(runtime_context "$FROM")" save "$ITEM" \
-    | docker --context "$(runtime_context "$TO")" load
+  copy_image "$(runtime_context "$FROM")" "$(runtime_context "$TO")" "$ITEM" || die "could not copy image $ITEM"
+}
+
+# One move from another runtime to Colima. buildx caches and anonymous
+# volumes (64 hex digits) stay behind: on Colima an app's container starts
+# with a new anonymous volume, so a copy would go unused. Each one a container
+# still holds is named, since its data stays behind. Containers stay too; each
+# app's own start command makes them anew.
+# Nothing Colima holds with data is copied over, and all of it holds back the
+# switch unless a recorded copy vouches for it, or the source's is empty. As
+# many files, even the same size, may be other data: a database a trial run
+# made, or a copy that stopped inside its last file. A dry run starts nothing,
+# so it reads only what already runs.
+cmd_migrate() {
+  local from="docker-desktop" images=0 dry=0 src listing name t tk s copied ref size users why
+  local volumes="" anonymous="" to_copy="" doubts="" failed="" verb="Copying" from_seen=1 colima_seen=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)    need_value "$@"; from="$2"; shift 2 ;;
+      --images)  images=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      *)         die "unknown option $1" ;;
+    esac
+  done
+  check_runtime "$from"
+  [[ "$from" != colima ]] || die "migrate brings data into Colima; name the runtime it comes from"
+  runtime_installed "$from" || die "$from is not installed, so there is nothing to migrate"
+  src="$(runtime_context "$from")"
+  if (( dry == 0 )); then
+    start_runtime "$from"
+    start_runtime colima
+  else
+    verb="Would copy"
+    if ! runtime_running "$from"; then
+      from_seen=0
+      echo "Would start $from."
+    fi
+    if ! runtime_running colima; then
+      colima_seen=0
+      if colima_exists; then
+        echo "Would start colima."
+      else
+        plan_colima default
+        echo "Would create the Colima VM default ($VM_TYPE): $VM_SIZE."
+      fi
+    fi
+    hint_convert
+    if (( from_seen == 0 )); then
+      echo "Dry run: $from is not running, so nothing in it was listed."
+      return 0
+    fi
+    if (( colima_seen == 0 )); then
+      echo "Colima is not running, so nothing was checked against it: a real run copies only what Colima lacks."
+    fi
+  fi
+  guard_shared_data colima
+  listing="$(briefly docker --context "$src" volume ls -q)" || die "could not list the volumes in $from"
+  for name in $listing; do
+    if [[ "$name" =~ ^[0-9a-f]{64}$ ]]; then
+      anonymous+=" $name"
+    elif [[ "$name" != buildx_buildkit_* ]]; then
+      volumes+=" $name"
+    fi
+  done
+  if [[ -n "$anonymous" ]]; then
+    listing="$(container_mounts "$from" -a)" || exit 1
+    for name in $anonymous; do
+      users="$(users_of "$listing" "$name")"
+      if [[ -n "$users" ]]; then
+        echo "Leaving anonymous volume ${name:0:12} (used by $users) in $from: on Colima, its container starts with a new, empty one."
+      fi
+    done
+  fi
+  for name in $volumes; do
+    t=0
+    if (( colima_seen == 1 )) && volume_exists colima "$name"; then measure_volume colima "$name"; t=$ENTRIES tk=$KIB; fi
+    if (( t <= 1 )); then
+      to_copy+=" $name"
+      continue
+    fi
+    measure_volume "$from" "$name"
+    s=$ENTRIES
+    copied="$(recorded_copy "$name" "$from" colima)"
+    if [[ "$copied" == "$s $KIB" ]]; then
+      echo "Skipping volume $name: copied from $from before, and its count and size there have not changed."
+      continue
+    fi
+    if (( s == 1 )); then
+      echo "Skipping volume $name: Colima has one with data, and $from's is empty."
+      continue
+    fi
+    if [[ -n "$copied" ]]; then
+      echo "Volume $name changed in $from after it was copied. Colima's copy stays as it is."
+    else
+      echo "Volume $name in Colima holds data no recorded copy vouches for: $s files and folders ($KIB KiB) in $from, $t ($tk KiB) in Colima. Colima's stays as it is."
+    fi
+    doubts+=" $name"
+    echo "  To replace Colima's copy with $from's: $PROG copy-volume $name --from $from --to colima --force"
+  done
+  # Before the first copy. In the source every volume counts, since the switch
+  # stops it under its apps; in Colima only those about to be copied.
+  refuse_in_use "$from" "$volumes" colima "$to_copy"
+  for name in $to_copy; do
+    if (( dry == 1 )); then echo "$verb volume $name"; else copy_volume "$name" "$from" colima 0; fi
+  done
+  if (( images == 1 )); then
+    listing="$(briefly docker --context "$src" images --filter dangling=false --format '{{.Repository}}:{{.Tag}}\t{{.Size}}')" \
+      || die "could not list the images in $from"
+    while IFS=$'\t' read -r ref size; do
+      [[ -n "$ref" ]] || continue
+      if [[ "$ref" == *:"<none>" ]]; then
+        echo "Skipping image ${ref%:*}: it has no tag, only a digest. A pull or build on Colima brings it back."
+        continue
+      fi
+      if (( colima_seen == 1 )) && briefly docker --context colima image inspect "$ref" &>/dev/null; then continue; fi
+      echo "$verb image $ref ($size)"
+      (( dry == 0 )) || continue
+      if ! why="$(image_fits "$from" colima "$ref")"; then
+        echo "Skipping image $ref: $why"
+        failed+=" $ref"
+      elif ! copy_image "$src" colima "$ref"; then
+        failed+=" $ref"
+      fi
+    done <<< "$listing"
+    if [[ -n "$failed" ]]; then
+      echo "Warning: these images did not come across:$failed. Copy each later: $PROG copy-image REF --from $from --to colima" >&2
+    fi
+  fi
+  if (( dry == 1 )); then
+    echo "Dry run: nothing copied. Run again without --dry-run to move."
+    if [[ -n "$doubts" ]]; then echo "A real run will not switch to Colima while these volumes may differ:$doubts"; fi
+    return 0
+  fi
+  [[ -z "$doubts" ]] || die "not switching to Colima while these volumes may differ:$doubts. Replace each with its line above, or keep Colima's and switch: $PROG use colima"
+  cmd_use colima
+  echo "$from keeps its own copy; go back any time with: $PROG use $from"
+  echo "Start your apps again on Colima (ai-ui start, trellis-crm start, docker compose up -d)."
+}
+
+# The conversion itself is the shared convert_colima.
+cmd_convert() {
+  local act=0 dry=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes)     act=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      *)         die "unknown option $1" ;;
+    esac
+  done
+  (( dry == 0 )) || act=0
+  convert_colima "$act"
+}
+
+# The build VM is a second Colima profile: vz with Rosetta, so linux/amd64
+# stages run near native speed, which a krunkit VM cannot do. It never becomes
+# docker's context, so everyday work stays put while it starts; Colima keeps
+# --activate=false with the VM, and every start passes it again for a VM made
+# by hand. Builds name it per command (DOCKER_CONTEXT); the Makefiles' buildx
+# builders follow the context, so each VM keeps its own builder. Colima tells
+# whether it runs: one whose docker stopped answering still holds its memory.
+cmd_build_vm() {
+  local stop=0 ctx="colima-$BUILD_PROFILE" state
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stop) stop=1; shift ;;
+      *)      die "unknown option $1" ;;
+    esac
+  done
+  runtime_installed colima || die "Colima is not installed. Install it: $(runtime_install_command colima)"
+  state="$(colima_state "$BUILD_PROFILE")"
+  if (( stop == 1 )); then
+    if [[ "$state" == Running ]]; then colima stop --profile "$BUILD_PROFILE"; fi
+    echo "The build VM is stopped."
+    return 0
+  fi
+  if [[ -z "$state" ]]; then
+    start_new_colima "$BUILD_PROFILE"
+  elif [[ "$state" != Running ]]; then
+    colima start --profile "$BUILD_PROFILE" --activate=false
+  fi
+  if [[ "$state" != Running ]]; then STARTED+=" $ctx"; fi
+  briefly docker --context "$ctx" info &>/dev/null \
+    || die "the build VM runs, but its docker does not answer. Restart it: colima restart --profile $BUILD_PROFILE"
+  # Restart policies bring its containers back as it starts. A Sprig registry
+  # there beside one in a runtime would write $SAGE_DATA from two VMs and
+  # claim port 5000 twice.
+  guard_shared_data "$ctx"
+  echo "The build VM is running (docker context $ctx). Build on it with:"
+  echo "  DOCKER_CONTEXT=$ctx make <target>"
+  echo "Stop it when done, since it keeps the memory a build touched: $PROG build-vm --stop"
 }
 
 case "${1:-}" in
-  status|use|copy-volume|copy-image) need_docker ;;
+  status|use|copy-volume|copy-image|migrate|convert|build-vm) need_docker ;;
 esac
 case "${1:-}" in
   status)              shift; cmd_status ;;
   use)                 shift; cmd_use "$@" ;;
   copy-volume)         shift; cmd_copy_volume "$@" ;;
   copy-image)          shift; cmd_copy_image "$@" ;;
+  migrate)             shift; cmd_migrate "$@" ;;
+  convert)             shift; cmd_convert "$@" ;;
+  build-vm)            shift; cmd_build_vm "$@" ;;
   version|--version|-v) echo "$PROG $VERSION" ;;
   ""|help|-h|--help)   usage ;;
   *)                   usage >&2; exit 1 ;;

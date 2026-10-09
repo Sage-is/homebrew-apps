@@ -1,6 +1,6 @@
 .\" sage-runtime(1) manpage — mdoc format
 .\" Version 0.1.0
-.Dd October 6, 2026
+.Dd October 9, 2026
 .Dt SAGE-RUNTIME 1
 .Os
 .Sh NAME
@@ -17,36 +17,124 @@ runtime has its own images and volumes. Docker talks to the runtime
 named by its context.
 .Pp
 .Cm use
-starts the selected runtime, sets Docker's context, records the choice
-in
-.Pa ~/.sage-is/runtime ,
-and stops the other installed runtimes unless
+stops the other installed runtimes unless
 .Fl -keep-other
-is given. The saved choice takes precedence over Docker's context when
+is given, then starts the selected runtime, sets Docker's context, and
+records the choice in
+.Pa ~/.sage-is/runtime .
+The saved choice takes precedence over Docker's context when
 .Nm
 finds the current runtime. The
 .Cm copy-volume
 and
 .Cm copy-image
-commands move data between runtimes.
-.Pp
-A new Colima VM uses Apple's
+commands move data between runtimes, and
+.Cm migrate
+moves a whole Mac from Docker Desktop, or OrbStack, to Colima.
+.Cm convert
+makes a
 .Sy vz
-hypervisor, Rosetta, and
+Colima VM a
+.Sy krunkit
+VM on the same data disk.
+.Pp
+A new Colima VM uses
 .Sy virtiofs
-mounts with file events. Its memory is a third of the Mac's memory,
-clamped to 4 through 8 GiB. It uses half the Mac's cores, clamped to 2
-through 8, and a 100 GiB disk. The environment can override these
-values. An existing Colima VM keeps its settings.
+mounts with file events, half the Mac's cores, clamped to 2 through 8,
+and a 100 GiB disk. On Apple Silicon it is a
+.Sy krunkit
+VM, the default: memory the VM frees goes back to macOS, so it gets
+half the Mac's memory, clamped to 4 through 12 GiB, and containers
+reach the GPU through Vulkan. A container asks for the GPU with
+.Fl -device Pa /dev/dri ,
+and its image needs a Mesa Venus driver patched for
+.Sy krunkit ,
+such as the one in ghcr.io/unsuman/fedora-vgpu-llama; stock Fedora's
+mesa-vulkan-drivers fails with ERROR_OUT_OF_HOST_MEMORY. A
+.Sy krunkit
+VM has no Rosetta: linux/amd64 runs there only under QEMU emulation, so
+amd64 builds belong on the build VM.
+.Pp
+Docker keeps its images and volumes on the Colima VM's data disk. A
+.Sy krunkit
+VM leaves that disk unmounted after its first boot
+(abiosoft/colima#1614), and Docker then starts afresh on the VM's 20 GiB
+root disk, without them. Lima's override file mends this; see
+.Sx FILES .
+Every command that uses Colima stops while Docker runs on the root
+disk. For a
+.Sy krunkit
+VM it first adds the mend to the override file, so
+.Ql colima restart
+puts Docker back on its data disk. A VM made before Colima had a data
+disk keeps Docker on its root disk, as it always has.
+.Pp
+On Apple Silicon the Homebrew formula installs
+.Sy krunkit
+from the libkrun/krun tap. Homebrew 7 installs it only after that tap is
+tapped and trusted; see
+.Sx EXAMPLES .
+When
+.Sy krunkit
+is missing there,
+.Nm
+prints a warning with the command that installs it and falls back to
+Apple's
+.Sy vz
+hypervisor with Rosetta. An Intel Mac uses
+.Sy vz
+without Rosetta. A
+.Sy vz
+VM keeps the memory it has touched, so it gets a third of the Mac's
+memory, clamped to 4 through 8 GiB. The environment can override these
+values. An existing Colima VM keeps its settings, and a
+.Sy vz
+VM stays
+.Sy vz
+until
+.Cm convert
+makes it
+.Sy krunkit .
+.Pp
+The build VM is a second Colima profile,
+.Sy build ,
+on
+.Sy vz ,
+with Rosetta on Apple Silicon, for linux/amd64 and multi-arch builds.
+It gets a third
+of the Mac's memory, clamped to 9 through 12 GiB: AI-UI's multi-arch
+release wants 8 GiB in
+.Ql docker info ,
+and the VM's kernel keeps part of what it is given.
+.Cm build-vm
+creates or starts it. It never becomes Docker's context, so everyday
+work stays where it was. A build names it with
+.Ev DOCKER_CONTEXT Ns = Ns Sy colima-build .
 .Pp
 .Cm status
 reports installed and running runtimes, Docker's context, and detected
-configuration problems. It checks credential helpers, buildx, and
-buildx builders whose saved context no longer exists. When
+configuration problems. It checks credential helpers, buildx, buildx
+builders whose saved context no longer exists, and what Docker Desktop
+left behind. When
 .Cm use
-runs, it repairs an unusable Docker credential-helper setting and adds
-the Homebrew Docker plugin directory to the Docker configuration when
-needed.
+runs, it repairs an unusable Docker credential-helper setting, removes
+plugin links into Docker.app that lead nowhere, and adds the Homebrew
+Docker plugin directory to the Docker configuration when needed.
+.Pp
+Docker Desktop is optional and stays supported. Its credential helper,
+.Sy desktop ,
+wraps the Keychain helper,
+.Sy osxkeychain .
+With Colima in use, Docker keeps its logins with the Keychain helper
+itself:
+.Cm use colima
+switches
+.Sy credsStore
+to
+.Sy osxkeychain
+whenever that helper exists, even with Docker Desktop installed, and
+every login carries over. Docker Desktop puts its own helper back when
+it is the runtime again.
 .Pp
 .Fl h
 and
@@ -62,57 +150,335 @@ options print the version.
 .Bl -tag -width 28n
 .It Cm status
 Show whether each runtime is installed or running, the volume count
-for each running runtime, and which runtime is in use. Show Docker's
+for each running runtime, and which runtime is in use. A runtime whose
+app or VM is up while its engine does not answer counts as a problem.
+Colima, not Docker, tells whether the build VM runs. Show Docker's
 context and report if it differs from the selected runtime. Also report
 an unavailable credential helper, missing buildx, and buildx builders
-that point at missing contexts. Print
-.Sy No problems found.
+that point at missing contexts. The context of a Colima VM that exists
+counts as present: Colima removes it while the VM is stopped and makes
+it again at start. Links in
+.Pa ~/.docker/cli-plugins
+into Docker.app that lead nowhere count with any runtime, whether the
+app is gone or an update dropped the plugin.
+.Pp
+While another runtime is in use, also report what Docker Desktop left
+behind, each with the command that mends it:
+.Pa /var/run/docker.sock
+linked to Docker Desktop's socket, its plugin hooks in
+.Pa ~/.docker/config.json ,
+links into Docker.app in
+.Pa /usr/local/bin
+whose names start with docker, and, with Colima in use, its
+.Sy desktop
+credential helper where the Keychain helper exists and, while Docker
+Desktop is installed, a Login Item named
+.Dq Docker Desktop ,
+which opens it at login. A link in
+.Pa /usr/local/bin
+counts once it leads nowhere, or, on an Intel Mac, where Homebrew's
+prefix is
+.Pa /usr/local ,
+since it keeps Homebrew's own docker from linking there. There the line
+also names the Homebrew formulae to link once the links go, with
+.Ql brew unlink
+first, since Homebrew may count one as linked already. While Docker
+Desktop stays installed as a fallback on Apple Silicon, its working
+links there count as nothing: its credential helper among them keeps
+its logins. Login Items come from System Events, which macOS may first
+ask to let this terminal read; a question with no answer in ten seconds
+counts as no Login Item.
+.Nm
+never changes Login Items,
+.Pa /var/run/docker.sock ,
+.Pa /usr/local/bin
+or the plugin hooks itself. Print
+.Sy "No problems found."
 when none are detected.
 .It Cm use Ar RUNTIME Op Fl -keep-other
-Start
+Stop the other installed runtimes, then start
 .Ar RUNTIME ,
-set Docker's context, save the runtime choice in
-.Pa ~/.sage-is/runtime ,
-and stop other installed runtimes. With
+set Docker's context, and save the runtime choice in
+.Pa ~/.sage-is/runtime .
+With
 .Fl -keep-other ,
-leave the others running.
+leave the others running. The build VM keeps running for its builds.
+The command refuses while running containers in
+.Ar RUNTIME
+and in another runtime or the build VM use
+.Ev SAGE_DATA .
 .Pp
 A first launch of Docker Desktop or OrbStack opens its setup screens in
 view; later launches open in the background. Sign-in is optional. The
-command waits up to three minutes for the runtime to answer.
+command waits up to three minutes for the runtime to answer; see
+.Ev SAGE_RUNTIME_WAIT .
+It stops another runtime whose app or VM is up, even when its engine
+does not answer, since its containers may still run. An OrbStack engine
+started with
+.Ql orb start
+runs with the app closed; it counts as up, and the command stops it with
+.Ql orb stop .
+.Pp
+First it mends Docker's configuration; see
+.Pa ~/.docker/config.json
+in
+.Sx FILES .
+It removes each link in
+.Pa ~/.docker/cli-plugins
+into a Docker.app that no longer holds its target, which Docker lists
+as a broken plugin, and never a link that resolves.
 .It Cm copy-volume Ar NAME Oo Fl -from Ar RUNTIME Oc Oo Fl -to Ar RUNTIME Oc Oo Fl -force Oc
 Copy the named volume between runtimes. By default, the destination is
 the runtime in use, and the source is the first installed runtime other
-than the destination. The command starts both runtimes.
+than the destination. The command starts both runtimes and puts
+Docker's context back where it was. When that was the default context,
+which Colima leaves behind as its VM stops, the context goes to the
+runtime in use.
+.Pp
+Stop the apps that use the volume first. The command refuses, and names
+the containers, while running containers on either side use the volume,
+since a database copied mid-write can come out torn. It also refuses
+when the copy will not fit, with a tenth and 1 GiB to spare: in the
+staging folder, in the destination VM, and on the Mac disk that holds
+the VM's disk image, which the VM cannot see: Colima's
+.Pa _disks
+folder, Docker Desktop's data folder (its
+.Sy DataFolder
+setting) with
+.Pa Docker.raw ,
+else the home folder's disk, where Docker Desktop and OrbStack keep
+theirs by default. When the staging folder and that disk image share a
+disk, it must hold both. A
+probe that fails stops the command; it never counts as an empty volume.
 .Pp
 If the destination already has a non-empty volume with that name, the
 command refuses to copy unless
 .Fl -force
 is given. With
 .Fl -force ,
-it deletes the destination volume's contents before copying. The
+it deletes the destination volume's contents once it has read the
+source, then writes the copy. The
 command checks that the source and destination have the same number of
-files and folders after the copy.
+files and folders after the copy, and records the copy in
+.Pa ~/.sage-is/migrated .
+A copy that fails or is interrupted removes its staged file and leaves
+no half-made volume: a volume the copy created goes, and one that was
+empty, or whose data
+.Fl -force
+was replacing, is left empty, even when the clear itself fails partway.
 .It Cm copy-image Ar REF Oo Fl -from Ar RUNTIME Oc Oo Fl -to Ar RUNTIME Oc
-Copy an image between runtimes using Docker's save and load operations.
-The default source and destination are the same as for
+Copy an image between runtimes using Docker's save and load operations,
+through a file in the staging folder. For Colima, the save or load runs
+inside the VM, which reads the file through its mount of the home
+folder: a large stream through Colima's socket can stall. Like
+.Cm copy-volume ,
+it refuses an image that will not fit, by the size Docker gives for
+it. The default source and destination are the same as for
 .Cm copy-volume .
+.It Cm migrate Oo Fl -from Ar RUNTIME Oc Oo Fl -images Oc Oo Fl -dry-run Oc
+Move this Mac to Colima. Copy every named volume from
+.Ar RUNTIME ,
+which defaults to docker-desktop, into Colima, then run
+.Cm use colima .
+Anonymous volumes and buildx caches stay behind. The command names each
+anonymous volume that a container still uses, since on Colima that
+container starts with a new, empty one. Stop your apps first:
+before it copies anything, the command refuses while running containers
+use any of the volumes in
+.Ar RUNTIME ,
+or, in Colima, any it would copy.
+.Pp
+A volume Colima already holds with data is never copied over. It is
+skipped when the source's is empty, or when
+.Pa ~/.sage-is/migrated
+records a copy from
+.Ar RUNTIME
+and the source's file count and size have not changed since. Only such
+a record vouches for Colima's copy: as many files, even the same size,
+may hold other data, such as a database from a trial run or a copy cut
+off inside its last file. For any other volume the command prints both
+sides' file counts and sizes and the line that replaces Colima's copy:
+.Cm copy-volume Ar NAME Fl -from Ar RUNTIME Fl -to Cm colima Fl -force .
+While any such volume remains, the command copies the rest but does not
+switch: replace each one, or keep Colima's copies and run
+.Cm use colima .
+.Pp
+With
+.Fl -images ,
+also copy every tagged image Colima lacks. An image with no tag is
+skipped, and an image that will not fit or fails to copy is reported
+at the end; neither stops the switch. With
+.Fl -dry-run ,
+start nothing and copy nothing: say which runtime a real run would
+start and which Colima VM it would create, and list what the running
+side shows. While Colima is not running, nothing is checked against it,
+so the list can name volumes and images that Colima already holds.
+.Ar RUNTIME
+keeps its own copy, so
+.Cm use
+switches back. Containers stay behind; each app's start command makes
+them anew.
+.It Cm convert Oo Fl -dry-run Oc Oo Fl -yes Oc
+Make the everyday Colima VM, a
+.Sy vz
+VM made before
+.Sy krunkit
+was the default, a
+.Sy krunkit
+VM on the same data disk, with every image and volume. Without
+.Fl -yes ,
+or with
+.Fl -dry-run ,
+print the plan and change nothing. The plan names the old and new sizes,
+the mounts that come across, the running containers, and the ones the
+command starts again by hand. It starts nothing, so it reads only what
+already runs.
+.Pp
+The new VM keeps the old one's memory, CPUs, disk size and mounts.
+.Ev SAGE_RUNTIME_MEMORY
+and
+.Ev SAGE_RUNTIME_CPU
+override the first two.
+.Ql colima delete
+takes the VM's root disk, so the command refuses unless the VM has a data
+disk and shows Docker's data on it: Docker's root folder is
+.Pa /var/lib/docker ,
+not a
+.Sy data-root
+from the VM's Colima settings, and both that folder and
+.Pa /var/lib/containerd ,
+which holds images in Docker 29's containerd store, sit on the data
+disk. The delete takes, too, a folder of the root disk that a container
+binds or a volume is bound to, such as
+.Pa /srv/pg
+for
+.Ql docker run -v /srv/pg:... ,
+which Docker makes inside the VM. The volume names stay the same, so the
+comparison could not see the loss: the command refuses and names each
+one. The system's own folders, such as
+.Pa /etc ,
+.Pa /usr
+and
+.Pa /var/log ,
+do not count. It also refuses, before it stops anything, when Lima's
+override file cannot take both
+.Sy krunkit
+settings, when the VM's mounts hold a line it cannot carry across, and
+while running containers in Colima and in another runtime or the build
+VM use
+.Ev SAGE_DATA .
+It carries a mount's
+.Sy location ,
+then its
+.Sy mountPoint ,
+a full path, and
+.Sy writable ,
+as
+.Fl -mount Ar PATH Ns Op : Ns Ar MOUNTPOINT Ns Op :w ;
+another key, an item that does not start with its location, or a
+flow-style list keeps the VM as it is.
+.Pp
+With
+.Fl -yes ,
+the command adds the
+.Sy krunkit
+settings to Lima's override file and starts a stopped VM. It records the
+VM's size, mounts, volume names and image IDs in
+.Pa ~/.sage-is/convert .
+It stops the VM and runs
+.Ql colima delete --force ,
+never with
+.Fl -data ,
+so the data disk stays. It makes the
+.Sy krunkit
+VM on that disk and compares its volumes and images with the record.
+Docker brings back the containers whose restart policy is always or
+unless-stopped. The command starts the others that ran, and stops a VM
+that was stopped. Containers started with
+.Fl -rm
+go as the VM stops, as they would at any stop, and Docker removes their
+anonymous volumes with them; the plan names them, and the comparison
+leaves those volumes out.
+.Pp
+.Ql colima delete
+also removes the VM's Colima settings,
+.Pa ~/.colima/default/colima.yaml .
+The size and mounts come across. A dated copy of the file in
+.Pa ~/.sage-is
+keeps the rest, such as Docker's daemon settings.
+.Pp
+When anything is missing, or the run stops after the delete, the command
+prints the way on and the way back. Mend the cause and run
+.Cm convert Fl -yes
+again: it finishes from the record. Or delete the
+.Sy krunkit
+VM and start a
+.Sy vz
+VM on the same disk with the printed command.
+.It Cm build-vm Op Fl -stop
+Create or start the build VM; Docker's context stays where it was. With
+.Fl -stop ,
+stop it whenever Colima reports it running, even when its engine does
+not answer. Stop it after a build, since a
+.Sy vz
+VM keeps the memory a build touched.
+.Pp
+Restart policies bring the build VM's containers back as it starts. The
+command refuses while running containers in it and in a runtime use
+.Ev SAGE_DATA :
+a Sprig registry on each would write there from two VMs and claim port
+5000 twice. It stops the build VM again when it started it.
 .It Cm version
 Print the version number.
 .El
 .Sh ENVIRONMENT
 .Bl -tag -width 24n
 .It Ev SAGE_RUNTIME_MEMORY
-Memory in GiB for a newly created Colima VM. When unset, use a third of
-physical memory, clamped to 4 through 8 GiB.
+Memory in GiB for a newly created Colima VM. When unset, use half of
+physical memory, clamped to 4 through 12 GiB, for a
+.Sy krunkit
+VM; a third, clamped to 4 through 8 GiB, for a
+.Sy vz
+VM; and a third, clamped to 9 through 12 GiB, for the build VM.
+.Cm convert
+keeps the old VM's memory when it is unset.
 .It Ev SAGE_RUNTIME_CPU
 Number of CPUs for a newly created Colima VM. When unset, use half the
 Mac's cores, clamped to 2 through 8.
+.Cm convert
+keeps the old VM's CPUs when it is unset.
 .It Ev SAGE_RUNTIME_DISK
 Disk size in GiB for a newly created Colima VM. When unset, use 100.
+.Cm convert
+ignores it and keeps the size of the data disk.
+.It Ev SAGE_RUNTIME_WAIT
+Seconds to wait for a runtime to answer after starting it. When unset,
+use 180. Each question to an engine, such as
+.Ql docker info ,
+gets ten seconds; a half-started engine once held one open for ten
+minutes.
+.It Ev DOCKER_CONTEXT , Ev DOCKER_HOST , Ev COLIMA_PROFILE
+Ignored.
+.Nm
+reads, restores and sets Docker's saved context, the one new shells
+use, and names a context on every engine call. Colima runs without
+them too, so stopping the build VM from a shell that exports
+.Ev DOCKER_CONTEXT Ns = Ns Sy colima-build
+leaves Docker's context alone, and
+.Cm use
+starts and stops the everyday VM even where
+.Ev COLIMA_PROFILE
+names another.
 .It Ev HOMEBREW_PREFIX
 Homebrew prefix used to find Docker CLI plugins in
 .Pa lib/docker/cli-plugins .
+When unset,
+.Ql brew --prefix
+names it:
+.Pa /opt/homebrew
+on Apple Silicon,
+.Pa /usr/local
+on Intel.
 .It Ev DOCKER_CONFIG
 Docker configuration directory. When unset, the script uses
 .Pa ~/.docker .
@@ -121,40 +487,161 @@ Folder both runtimes mount, such as the Sprig registry. Default
 .Pa ~/SageData .
 Two runtimes writing there at once lose data with no error, so
 .Cm use
-stops the other runtimes before starting one, and
-.Fl -keep-other ,
-.Cm copy-volume
+stops the other runtimes before starting one. The build VM keeps
+running for its builds, so
+.Cm use ,
+.Cm copy-volume ,
+.Cm copy-image ,
+.Cm migrate ,
+.Cm convert
 and
-.Cm copy-image
-refuse while containers in both runtimes use it.
+.Cm build-vm
+refuse while running containers in two runtimes, or in the build VM and
+a runtime, use it.
+.It Ev COLIMA_HOME
+Colima's own folder. When unset,
+.Pa ~/.colima ,
+or
+.Pa $XDG_CONFIG_HOME/colima
+while
+.Pa ~/.colima
+is missing, as Colima itself finds it.
+.It Ev LIMA_HOME
+Lima's folder for Colima's VMs, which holds Lima's override file and
+the VMs' disks. When unset,
+.Pa _lima
+in Colima's folder.
 .It Ev APPLICATIONS_DIR
 Directory used to find Docker.app and OrbStack.app. When unset, the
 script uses
 .Pa /Applications .
+.It Ev SYSTEM_SOCKET , Ev SYSTEM_BIN
+Where
+.Cm status
+looks for Docker Desktop's socket link and its tool links. When unset,
+.Pa /var/run/docker.sock
+and
+.Pa /usr/local/bin .
 .El
 .Sh FILES
 .Bl -tag -width 36n
 .It Pa ~/.sage-is/runtime
 Saved runtime choice. Its value takes precedence over Docker's current
 context when the script determines which runtime is in use.
+.It Pa ~/.sage-is/migrated
+One line per verified copy: the volume, the source and destination
+runtimes, and the source's file count and size. A copy removes its line
+before it changes the destination and writes it once the counts match,
+so a copy that stopped halfway has none.
+.It Pa ~/.sage-is/convert
+What
+.Cm convert
+keeps across the VM's delete: its size and mounts, the copy of its
+settings, its volume names and image IDs, the containers to start by
+hand, and whether it was stopped. A run cut short after the delete leaves
+the file, and the next run finishes from it.
+.It Pa ~/.sage-is/colima-default.YYYYMMDD-HHMMSS.yaml
+The copy of the
+.Sy vz
+VM's Colima settings that
+.Cm convert
+makes before
+.Ql colima delete
+removes them.
+.It Pa ~/.sage-is/staging
+The file each copy passes through, one copy at a time. The file goes
+when its copy ends, whether it finished, failed or was interrupted.
+Each copy sets the folder to mode 700: a staged file holds a whole
+volume or image, and another account on the Mac can read the home
+folder.
 .It Pa ~/.docker/config.json
 Docker configuration read and updated by
 .Cm use .
-The command can repair an unavailable credential helper and register
-the Homebrew plugin directory here.
+The command can repair an unavailable credential helper, hand Docker
+Desktop's
+.Sy desktop
+helper to
+.Sy osxkeychain
+with Colima in use, and register the Homebrew plugin directory here.
 .It Pa ~/.docker/config.json.YYYYMMDD-HHMMSS.bak
 Dated backup made before
 .Cm use
-changes an unavailable credential-helper setting.
+changes the credential-helper setting or adds the plugin directory.
+.It Pa ~/.colima/_lima/_config/override.yaml
+Lima settings for every Colima VM, in Lima's folder; see
+.Ev LIMA_HOME .
+Before it creates a
+.Sy krunkit
+VM,
+.Nm
+adds two settings here, each under a comment naming its issue, and
+keeps whatever the file held. The first is
+.Sy mountType: virtiofs ,
+unless the file already sets a mount type: Colima 0.10.3 asks Lima for
+9p for a
+.Sy krunkit
+VM, and Lima 2.2 refuses it (abiosoft/colima#1607).
+.Sy vz
+and
+.Sy krunkit
+VMs both use virtiofs, but a QEMU Colima profile on the same Mac will
+not start while the line is there. The second is a provision step that
+mounts each Lima disk by its label at boot. A
+.Sy krunkit
+VM puts its data disk on vdc, where Lima 2.2 looks for vdb, so the disk
+stays unmounted after the VM's first boot (abiosoft/colima#1614). A
+.Sy vz
+VM has its disk mounted already, and the step passes it by. When the
+file has its own provision list,
+.Nm
+leaves it alone and prints the step to add to that list. On a
+.Sy krunkit
+VM,
+.Ql colima ssh \-\- findmnt /var/lib/docker
+then shows /dev/vdc1.
 .It Pa ~/.docker/buildx/instances
 Buildx builder records checked by
 .Cm status
 for endpoints that do not match an available Docker context.
+.It Pa lib/sage-runtime.sh
+The runtime code
+.Nm
+sources from beside itself, in a checkout or in the formula's
+.Pa libexec
+folder. A link to
+.Nm ,
+such as one in
+.Pa ~/bin ,
+finds it beside the file the link leads to. Without it,
+.Nm
+stops and asks for
+.Ql brew reinstall sage-runtime ,
+or a checkout of the tap.
 .El
 .Sh EXAMPLES
+.Ss Move from Docker Desktop to Colima
+.Bd -literal -offset indent
+sage-runtime migrate --dry-run
+sage-runtime migrate
+.Ed
 .Ss Switch to Colima
 .Bd -literal -offset indent
 sage-runtime use colima
+.Ed
+.Ss Make a vz Colima VM krunkit, after the plan
+.Bd -literal -offset indent
+sage-runtime convert
+sage-runtime convert --yes
+.Ed
+.Ss Tap and trust libkrun/krun, then install krunkit
+.Bd -literal -offset indent
+brew tap libkrun/krun && brew trust libkrun/krun && brew install krunkit
+.Ed
+.Ss Build an amd64 image on the build VM, in an AI-UI checkout
+.Bd -literal -offset indent
+sage-runtime build-vm
+DOCKER_CONTEXT=colima-build make it_build_amd64
+sage-runtime build-vm --stop
 .Ed
 .Ss Copy the trellis-data volume from Docker Desktop
 .Bd -literal -offset indent
@@ -171,8 +658,20 @@ sage-runtime use docker-desktop
 .Sh EXIT STATUS
 .Nm
 exits 0 on success and 1 on any error.
+.Cm status
+exits 0 even when it reports problems. A signal ends
+.Nm
+with 128 plus the signal's number, such as 130 for Ctrl-C.
 .Sh SEE ALSO
-.Xr colima 1 ,
-.Xr docker 1 ,
-.Xr ai-ui 1 ,
-.Xr trellis-crm
+.Xr docker 1
+.Pp
+These have no manual pages; run each with
+.Fl -help :
+.Sy colima ,
+.Sy ai-ui
+and
+.Sy trellis-crm .
+For
+.Sy krunkit ,
+see
+.Lk https://github.com/libkrun/krunkit .
