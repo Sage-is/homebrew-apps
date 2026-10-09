@@ -23,9 +23,17 @@
 - [ ] **sage-runtime: Docker Desktop optional for every project** (Alexander, 2026-10-06) #ux
   - [x] [WE] `sage-runtime` (status, use, copy-volume, copy-image), man page, formula depending on colima, docker, buildx, compose and the keychain helper; 20 tests, mutation-checked
   - [ ] [MANUALLY] `brew install colima docker docker-buildx docker-compose docker-credential-helper` on this Mac, then [WE] prove `use`, both copies and the switch back against real runtimes
-  - [ ] [WE] Verify on Colima: `host.docker.internal` with `host-gateway` (to the Mac and to a published port), amd64 via Rosetta, file events for hot reload
-  - [ ] [MANUALLY] Commit, then `make tool_release TOOL=sage-runtime VERSION=0.1.0 APPLY=1`
-  - [ ] [WE] ai-ui and trellis-crm source sage-runtime's runtime block instead of their own copies (`depends_on "sage-runtime"`)
+  - [x] [WE] 2026-10-09 on krunkit: `--add-host=host.docker.internal:host-gateway` resolves 192.168.5.2 and reaches a port on the Mac; amd64 on the build VM 5.4 s vs 35.4 s under QEMU on krunkit (native arm64 5.1 s); the Makefiles' buildx route built and ran a linux/amd64 image
+  - [ ] [WE] File events for hot reload on krunkit (`make reload_gate` sets `WATCHFILES_FORCE_POLLING=true`; run it once on Colima)
+  - [x] [WE] 2026-10-08: a new dev VM is `krunkit` on Apple Silicon when krunkit is installed (memory goes back to macOS; GPU through Vulkan, proven: "Virtio-GPU Venus (Apple M1 Max)" with a patched-Mesa image; footprint 1.9 GB after 4 and 3 GiB loads vs 6.8 GB for an idle vz VM), half the Mac's memory up to 12 GiB; `build-vm` runs a vz + Rosetta profile `build` for amd64; `migrate` moves every named volume (`--images`, `--dry-run`) and switches; 35 tests, mutation-checked
+  - [x] [WE] `make migrate_to_colima` (DRY=1, IMAGES=1) in Trellis and AI-UI, a thin call to `sage-runtime migrate`
+  - [ ] [WE] Remove the Lima `override.yaml` virtiofs line once a Colima release fixes abiosoft/colima#1607 (0.10.3 hands krunkit 9p)
+  - [x] [WE] This Mac (2026-10-08, Alexander's permission): `default` rebuilt as krunkit on its kept data disk, every volume and image identical; found and fixed abiosoft/colima#1614 (Docker silently on the root disk) with a mount-by-label boot step; `build-vm` proven with an amd64 build
+  - [x] [WE] 2026-10-09: `convert` (vz to krunkit, refuses unless Docker's data is on the data disk, prints the way back, resumes from `~/.sage-is/convert`); the runtime code in one shared `lib/sage-runtime.sh` that `sage-runtime` and `trellis-crm` source and AI-UI vendors (`make runtime_sync`, drift test); Docker Desktop step-away (login helper to the Keychain, dangling plugin links, Login Item note, `brew --prefix`, `$SAGE_DATA` guard on `build-vm`); 154 tests
+  - [x] [WE] 2026-10-09: `make convert_to_krunkit` in Trellis and AI-UI; one install line everywhere (`brew tap sage-is/apps && brew tap libkrun/krun && brew trust --tap sage-is/apps libkrun/krun && brew install …`); `tool-release.sh` and `check-formulae.sh` check every file a formula installs (`lib/`)
+  - [ ] [MANUALLY] `make tool_release TOOL=sage-runtime VERSION=0.1.0 APPLY=1` and `TOOL=trellis-crm`, so peers install without `--HEAD`
+  - [ ] [MANUALLY] Peer installs: the install line above, then `sage-runtime migrate` (from Docker Desktop) or `sage-runtime convert --yes` (from Colima vz)
+  - [ ] [MANUALLY] After 2026-10-16: uninstall Docker Desktop on this Mac and delete `/Volumes/Somma 01 Dock Drive/Docker/DockerDesktop/Docker.raw` (49 GB)
 
 - [ ] **Colima by default: no Docker Desktop windows on first launch** (ai-ui 3.2.0_1, 2026-09-29) #ux
   - [x] [WE] `ai-ui` runs Sage in Colima, Docker Desktop or OrbStack; the first start asks when a Mac has more than one; `--runtime NAME` picks directly, remembered in `~/.sage-is/runtime`
@@ -103,7 +111,7 @@
 ### Formula
 
 - [ ] Re-test `brew tap sage-is/apps && brew install ai-ui` after AI-UI Docker image slimming (currently ~9.7GB, targeting ~3.5-4GB)
-- [ ] Verify `ensure_docker` auto-start on clean macOS install (Docker Desktop not yet installed)
+- [ ] Verify `ensure_docker` auto-start on a clean macOS install (no Colima VM yet)
 
 ## Backlog — Unscheduled
 

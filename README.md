@@ -121,7 +121,7 @@ For the *why* behind the two-file pattern (and the poka-yoke that keeps the v1 f
 
 `ai-ui` starts the runtime when it is not running, and installs nothing at run time. A Mac that already uses Docker Desktop or OrbStack may keep it: the first `ai-ui start` asks which runtime to use when a Mac has more than one, and `--runtime colima|docker-desktop|orbstack` picks one directly. `ai-ui` remembers the choice in `~/.sage-is/runtime`, because each runtime keeps its own `sage-ai-data` volume.
 
-Colima's first start creates a small Linux VM with Apple's own hypervisor and 4 GiB of memory; later starts leave its settings alone. Docker Desktop and OrbStack start hidden in the background once they have run before. Their first start stays in view, because it shows setup screens that need a click; sign-in is optional.
+Colima's first start creates a Linux VM: `krunkit` on Apple Silicon when krunkit is installed, with half the Mac's memory (4 to 12 GiB) that it gives back to macOS when idle, or else Apple's `vz` with a third (4 to 8 GiB); later starts leave its settings alone. From the next AI-UI release, `ai-ui start` and `ai-ui update` on a Mac that runs Sage in Docker Desktop or OrbStack offer once to move it to Colima, and `ai-ui migrate` does it any time. Docker Desktop and OrbStack start hidden in the background once they have run before. Their first start stays in view, because it shows setup screens that need a click; sign-in is optional.
 
 A Mac that once ran Docker Desktop may still name its credential helper in `~/.docker/config.json` (`"credsStore": "desktop"`). Without Docker Desktop that helper is gone and every pull fails, so `ai-ui` drops the key and keeps a dated backup beside the file.
 
@@ -193,19 +193,27 @@ See `man cr-deploy`. It was called `captain` before its first release; that comm
 
 ## sage-runtime
 
-**sage-runtime** switches docker between Colima, Docker Desktop and OrbStack, so no project needs Docker Desktop. Each runtime keeps its own volumes and images; the switch starts one, points docker's context at it, remembers it for `ai-ui` and `trellis-crm`, and stops the others. Data comes across on request.
+**sage-runtime** switches docker between Colima, Docker Desktop and OrbStack, so no project needs Docker Desktop. Each runtime keeps its own volumes and images; the switch stops the others, starts one, points docker's context at it, and remembers it for `ai-ui` and `trellis-crm`. Data comes across on request.
 
 ```bash
-brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install sage-runtime
+brew tap sage-is/apps && brew tap libkrun/krun && brew trust --tap sage-is/apps libkrun/krun && brew install sage-runtime
 ```
 
 ```bash
-sage-runtime use colima                  # the first time builds a dev VM: vz, Rosetta, virtiofs, sized for this Mac
+sage-runtime migrate --dry-run           # leaving Docker Desktop: starts nothing, lists what would move
+sage-runtime migrate                     # named volumes, not buildx caches, into Colima, then use colima
+sage-runtime use colima                  # the first time builds a dev VM sized for this Mac
 sage-runtime copy-volume trellis-data    # from the other runtime into the one in use
 sage-runtime copy-image IMAGE:TAG
+sage-runtime convert                     # a vz Colima VM to krunkit: prints the plan; --yes keeps every image and volume
+sage-runtime build-vm                    # a vz VM, with Rosetta on Apple Silicon, for amd64 and multi-arch builds
 sage-runtime use docker-desktop          # and back
 sage-runtime status                      # what runs, and what in ~/.docker will break
 ```
+
+On Apple Silicon the dev VM is `krunkit`, the default. The formula installs it there from the `libkrun/krun` tap, which Homebrew 7 neither taps nor trusts for a dependency, hence the install line. Memory the VM frees goes back to macOS, and containers reach the GPU through Vulkan (`--device /dev/dri`, from an image whose Mesa Venus driver is patched for krunkit, such as `ghcr.io/unsuman/fedora-vgpu-llama`). Making the VM adds two settings to Lima's `override.yaml`. `mountType: virtiofs` (abiosoft/colima#1607) means a QEMU Colima profile on the same Mac will not start. A boot step mounts the VM's data disk, which krunkit leaves unmounted after the first boot (abiosoft/colima#1614). Docker keeps images and volumes on that disk: `colima ssh -- findmnt /var/lib/docker` shows `/dev/vdc1`, and `sage-runtime` stops while Docker runs on the VM's root disk. Without krunkit, `sage-runtime` warns and makes a `vz` VM with Rosetta; an Intel Mac gets `vz` without Rosetta. A `krunkit` VM has no Rosetta, so amd64 builds run on the build VM, which never takes over docker's context and has room for AI-UI's multi-arch release: `DOCKER_CONTEXT=colima-build make <target>`, then `sage-runtime build-vm --stop`. Project repos wrap the move as `make migrate_to_colima` and the conversion as `make convert_to_krunkit` (`YES=1` runs it).
+
+Stop your apps before you copy. `copy-volume` and `migrate` refuse while a running container on either side uses the volume. A volume or image that will not fit on the Mac or in the VM is refused; `migrate --images` names such an image and goes on. A copy that fails or is interrupted leaves no half-made volume, and each finished copy is noted in `~/.sage-is/migrated`. `migrate` never copies over data Colima holds: when a volume there holds data no note vouches for, `migrate` prints the `copy-volume` line that replaces it, copies the rest, and does not switch. As many files, even the same size, can be other data. Anonymous volumes and buildx caches stay behind; `migrate` names each anonymous volume a container still uses, since on Colima that container starts with a new, empty one.
 
 `use` also repairs Docker Desktop's leftover `credsStore` and points docker at Homebrew's buildx and compose. See `man sage-runtime`.
 
@@ -214,7 +222,7 @@ sage-runtime status                      # what runs, and what in ~/.docker will
 **trellis-crm** runs Trellis, the Sage.is CRM, on a Mac that stays on: a container that comes back with Docker, listening on 127.0.0.1, settings and secrets in one file at mode 600, on one network with AI-UI. The Trellis source is private; this tool and its tests live here, and the image comes from GHCR as a private package.
 
 ```bash
-brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install trellis-crm
+brew tap sage-is/apps && brew tap libkrun/krun && brew trust --tap sage-is/apps libkrun/krun && brew install trellis-crm
 docker login ghcr.io          # once, with a token that can only read packages
 trellis-crm start             # http://localhost:8030
 trellis-crm boot              # Colima at power-on, nobody signed in
@@ -228,12 +236,13 @@ trellis-crm backup            # the database and artifacts in one .tar.gz
 **sage-secret** runs a command with secrets from Bitwarden (a self-hosted Vaultwarden works) without writing them to files or showing them. Env files and the environment hold references such as `bw:cloudflare-tunnel-startr`; each run unlocks an agent account's vault, resolves them for the one command, and locks the vault again. The agent account's own credentials live in the login Keychain.
 
 ```bash
-brew install sage-is/apps/sage-secret
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install sage-secret
 sage-secret setup --server https://vault.example.com
 CLOUDFLARE_API_TOKEN=bw:cloudflare-tunnel-startr sage-secret run -- sage-tunnel list
+make-token | sage-secret put service-token --stdin    # store a value an agent made
 ```
 
-The command it runs still receives the real values. See `man sage-secret`.
+The command it runs still receives the real values. `put` writes only into the organization the agent account may edit (`Agents-edit` by default): the value comes from an environment variable, a file or stdin, reaches `bw` on stdin, and is never printed. A name already used elsewhere is refused, and changing an item needs `--replace`. See `man sage-secret`.
 
 ## sage-tunnel
 
