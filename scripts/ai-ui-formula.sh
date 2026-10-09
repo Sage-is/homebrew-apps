@@ -16,8 +16,10 @@ echo "  downloading $url"
 tarball="$(mktemp)"
 trap 'rm -f "$tarball"' EXIT
 curl -fsSL "$url" -o "$tarball"
-# A release from before the CLI moved has no cli/: pointing the formula at it would break every install.
-for path in cli/ai-ui cli/nuke-sage distribution.env; do
+# A release from before the CLI moved has no cli/, and one from before ai-ui
+# sourced the shared runtime code has no cli/lib/: pointing the formula at
+# either would break every install.
+for path in cli/ai-ui cli/nuke-sage cli/lib/sage-runtime.sh distribution.env; do
   tar -tzf "$tarball" "*/$path" >/dev/null 2>&1 || { echo "AI-UI v$version has no $path: release AI-UI with its cli/ first." >&2; exit 1; }
 done
 sha="$(shasum -a 256 "$tarball" | cut -d' ' -f1)"
@@ -37,15 +39,22 @@ fi
 
 for f in "$formula" "Formula/ai-ui@${major}.rb"; do
   [ -f "$f" ] || continue
-  # The CLI moved from this tap into AI-UI's cli/ on 2026-09-30. Once a formula
-  # installs from cli/, the last three edits find nothing to change.
+  # The CLI moved from this tap into AI-UI's cli/ on 2026-09-30, and ai-ui
+  # sources cli/lib/ beside it since 2026-10-09. Once a formula installs from
+  # cli/, the install edits find nothing to change. The caveat line goes, with
+  # the blank line after it, and comes back once: Homebrew shows caveats on
+  # upgrade, where a Mac on Docker Desktop or OrbStack meets it.
   sed -i '' \
     -e "s|^  url \".*\"|  url \"$url\"|" \
     -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" \
     -e '/^  version "/d' -e '/^  revision /d' \
-    -e 's|^    libexec.install "ai-ui"$|    libexec.install "cli/ai-ui", "cli/nuke-sage"|' \
+    -e 's|^    libexec.install "ai-ui"$|    libexec.install "cli/ai-ui", "cli/nuke-sage", "cli/lib"|' \
     -e '/^    # `ai-ui nuke` runs the nuke-sage beside it, in scripts\/\.$/d' \
     -e '/^    (libexec\/"scripts").install "scripts\/nuke-sage"$/d' \
+    -e '/^      On a Mac using Docker Desktop or OrbStack? /{N;d;}' \
+    -e 's|^      Pin a specific server version:$|      On a Mac using Docker Desktop or OrbStack? `ai-ui migrate` moves Sage to Colima.\
+\
+&|' \
     "$f"
   echo "  $f -> AI-UI $version"
 done

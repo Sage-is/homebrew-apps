@@ -64,9 +64,12 @@ if [ -z "$(git ls-remote --tags "$remote" "refs/tags/$tag")" ]; then
     exit 0
   fi
   echo "$tool $version: tag HEAD and push it"
-  if [ -n "$(git status --porcelain -- "$tool" "$formula")" ]; then
-    [ "$apply" = 0 ] || die "commit $tool and $formula first: the tag takes HEAD"
-    echo "  first: commit $tool and $formula (the tag takes HEAD)"
+  # Every file the formula installs rides the tag too: sage-runtime and
+  # trellis-crm install the shared lib/.
+  installs=$(sed -n 's/.*\.install \(.*\)$/\1/p' "$formula" | grep -o '"[^"]*"' | tr -d '"')
+  if [ -n "$(git status --porcelain -- "$tool" "$formula" $installs)" ]; then
+    [ "$apply" = 0 ] || die "commit $tool, $formula and the files it installs first: the tag takes HEAD"
+    echo "  first: commit $tool, $formula and the files it installs (the tag takes HEAD)"
   fi
   git rev-parse -q --verify "refs/tags/$tag" >/dev/null || step git tag -a "$tag" -m "$tool v$version"
   step git push origin "$BRANCH" "$tag"

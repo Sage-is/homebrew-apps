@@ -4,8 +4,9 @@
 # - The sha256 matches the tarball at its url.
 # - From 3.x, an ai-ui formula's version equals the SERVER_TAG in that
 #   tarball's distribution.env: the version brew shows is the AI-UI it pins.
-# - From 3.x, the tarball holds every file an ai-ui formula installs: a release
-#   from before the CLI moved into AI-UI has no cli/.
+# - The tarball holds every file the formula installs: sage-runtime and
+#   trellis-crm install the shared lib/. ai-ui is checked from 3.x only: a
+#   release from before the CLI moved into AI-UI has no cli/.
 #
 # A formula with a placeholder sha256 is not released yet: listed, not failed.
 set -euo pipefail
@@ -31,12 +32,14 @@ for formula in Formula/*.rb; do
   problem=""
   if [ "$actual" != "$sha" ]; then
     problem="sha256 is $sha, the tarball's is $actual"
-  elif [[ $name == ai-ui* ]] && [ "${version%%.*}" -ge 3 ]; then
+  elif [[ $name != ai-ui* ]] || [ "${version%%.*}" -ge 3 ]; then
     for path in $(sed -n 's/.*\.install \(.*\)$/\1/p' "$formula" | grep -o '"[^"]*"' | tr -d '"'); do
       tar -tzf "$tarball" "*/$path" >/dev/null 2>&1 || { problem="the tarball has no $path, which the formula installs"; break; }
     done
-    pinned=$(tar -xzOf "$tarball" '*/distribution.env' | sed -n 's/^SERVER_TAG=//p')
-    [ -n "$problem" ] || [ "$pinned" = "$version" ] || problem="version $version, but its distribution.env pins AI-UI $pinned"
+    if [[ $name == ai-ui* ]]; then
+      pinned=$(tar -xzOf "$tarball" '*/distribution.env' | sed -n 's/^SERVER_TAG=//p')
+      [ -n "$problem" ] || [ "$pinned" = "$version" ] || problem="version $version, but its distribution.env pins AI-UI $pinned"
+    fi
   fi
   rm -f "$tarball"
 
