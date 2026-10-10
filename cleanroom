@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# cleanroom — Sage-is tap launcher for CleanRoom (Sage-is/CleanRoom): reverse-engineer anything, locally.
+# Runs the pinned cleanroom-re release from PyPI via uv. The first run
+# resolves + builds the environment (cached); every run after is instant.
+# Nothing leaves this Mac: decompilation runs in Ghidra or Hopper, installed here.
+set -euo pipefail
+
+# The cleanroom-re release this launcher pins. Bump this line by hand before
+# `make tool_release TOOL=cleanroom VERSION=x.y.z`: tool-release.sh only pins
+# the formula, and refuses until `./cleanroom version` says the new version.
+VERSION="0.1.0"
+
+usage() {
+  cat <<EOF
+cleanroom — reverse-engineer anything, locally (cleanroom-re $VERSION via uv)
+
+  cleanroom open TARGET     detect and bind a target (binary, app, JS, APK, HAR...)
+  cleanroom close           close the target and its workers; keep the Evidence
+  cleanroom list WHAT       functions, strings, files, classes, requests, regions
+  cleanroom show REF        inspect one item in a useful default view
+  cleanroom xrefs REF       references into, out of, or both ways from an item
+  cleanroom trace START     breadth-first search over xrefs toward a goal
+  cleanroom extract T DIR   unpack ZIP, ASAR, DMG or firmware; unbundle JavaScript
+  cleanroom diff A B        keyed diff over list output: added, removed, changed
+  cleanroom run ARGV|URL    capture a local process or browser run
+  cleanroom annotate REF    apply native annotations and read them back
+  cleanroom evidence [ID]   page, export or import Evidence records
+  cleanroom doctor          installed engines, libraries and local prerequisites
+
+  cleanroom mcp             serve MCP over stdio:  claude mcp add cleanroom -- cleanroom mcp
+  cleanroom setup           print each agent's MCP registration (--write edits Claude Code's)
+  cleanroom version         this launcher and the cleanroom-re release it pins (no network)
+  cleanroom help            this message; \`cleanroom VERB --help\` has each verb's options
+
+Runs cleanroom-re==$VERSION through uv (cached after the first run). Run
+\`cleanroom doctor\` once before registering it with an agent: MCP clients time
+out on a cold first start.
+  CLEANROOM_PYTHON=3.13  the Python uv runs it with (default 3.13)
+  CLEANROOM_EXTRAS=all   PyPI extras: web, android, ghidra or all (comma-separated)
+Native decompilation needs Ghidra (free) or Hopper installed; never a cloud decompiler.
+EOF
+}
+
+case "${1:-}" in
+  version|-v|--version) echo "cleanroom $VERSION (launcher; cleanroom-re==$VERSION)" ;;
+  help|-h|--help)       usage ;;
+  *) exec uvx -q --python "${CLEANROOM_PYTHON:-3.13}" \
+       --from "cleanroom-re${CLEANROOM_EXTRAS:+[$CLEANROOM_EXTRAS]}==$VERSION" cleanroom "$@" ;;
+esac
