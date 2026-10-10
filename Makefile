@@ -54,6 +54,7 @@ check:  ## Before a push: old CLI copies, style, tests, formula tarballs and pin
 	[ -z "$$left" ] || { echo "FAIL: the ai-ui CLI lives in AI-UI's cli/ now. Remove the old copies: git rm $$left"; exit 1; }
 	@brew style Formula Casks
 	@cd tests && python3 -B -m unittest -q
+	@python3 -c 'import ast; ast.parse(open("offload").read(), "offload")'
 	@scripts/check-formulae.sh
 	@scripts/check-ai-ui-current.sh
 	@$(MAKE) -s distribution_copies

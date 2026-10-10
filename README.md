@@ -260,18 +260,20 @@ See `man sage-tunnel`.
 
 ## offload
 
-**offload** moves heavy data from the Mac to external drives by symlink, safely.
+**offload** moves heavy data from the Mac to external drives by symlink, safely. It weighs every mounted drive (free space, backup, encryption), prices hardware and cloud options when the drives fall short, and retires cold git clones behind a verified bundle.
 
 ```bash
 brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install offload
 ```
 
 ```bash
-offload status
+offload drives      # every volume: role, backup, ownership, encryption
+offload plan        # advice only: where things could go, and what it would cost
+offload repos       # git repo verdicts: keep, synced, reclone, move
 offload drain
 ```
 
-See `man offload`.
+See `man offload` and [docs/offload.md](docs/offload.md).
 
 ## comicreel
 

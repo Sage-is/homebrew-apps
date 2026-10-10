@@ -1,948 +1,1197 @@
-#!/usr/bin/env bash
-# offload(1) — poka-yoke disk offload tool for macOS
-#
-# NAME
-#   offload — move user data to external drives via symlinks, safely
-#
-# SYNOPSIS
-#   offload [--target-home <path>] <subcommand> [args...] [--apply]
-#
-# DESCRIPTION
-#   offload moves heavy, low-velocity data out of $HOME onto an
-#   external drive. The home folder itself stays internal — we move
-#   the *contents* of specific paths inside $HOME and replace each
-#   with a symlink (or, for archive targets, leave a fresh empty
-#   directory). This is the supported pattern: iCloud, FileVault,
-#   login, and macOS updates remain untouched.
-#
-#   A guard launcher refuses to start an app whose data lives on an
-#   unmounted volume. Dry-run is the default; --apply must be
-#   explicit. Cross-volume moves verify (file count + bytes) before
-#   deleting source. Re-running is idempotent.
-#
-# SUBCOMMANDS
-#   help                print this text (script header is single source of truth)
-#   version             print the script version
-#   status              disk free + recent log + admin todo
-#   list                every entry in OFFLOAD_TARGETS with its current state
-#   checklist           generated progress checklist (live from OFFLOAD_TARGETS)
-#   drives [--benchmark]  scan /Volumes/*, classify HOT/COLD/EXCLUDED by
-#                       heuristics from `diskutil info`, print a table plus
-#                       a "Detected:" footer. Read-only: never auto-writes
-#                       ~/.config/offload/offload.conf — user copies the
-#                       suggested lines themselves. --benchmark adds a
-#                       timed dd-read speed column (~10s per drive).
-#   launch <App>        guarded launch (refuses if symlink target unmounted)
-#   move <Label> [--apply]                       offload one entry by label
-#   move <category> [--apply]                    offload every entry in a category
-#   relocations (alias: media-libraries)         print native-UI relocation
-#                                                steps — Docker Desktop,
-#                                                Colima, OrbStack, Photos,
-#                                                Music.app, iMovie
-#   drain [<name>...] [--need <GiB>] [--apply]   free a full HOT drive: move
-#                                                top-level entries to
-#                                                COLD/Drained/<HOT name>/, verify,
-#                                                leave a symlink. No names = a
-#                                                plan only (default --need 30);
-#                                                --apply requires names. Skips
-#                                                what offload owns, the VM disk
-#                                                folders of Docker Desktop,
-#                                                Colima and OrbStack, and
-#                                                media libraries
-#   protected <Label> [--apply]                  alias for `move <Label>` that
-#                                                requires --target-home + FDA
-#
-# DATA MODEL — OFFLOAD_TARGETS
-#   Every relocatable thing is a row in OFFLOAD_TARGETS. Every
-#   subcommand reads from this list; there is no parallel hardcoded
-#   knowledge. Schema (pipe-delimited):
-#
-#     label | category | source | dest | strategy | admin? | bundle
-#
-#   Tokens expanded at runtime:
-#     <TH>    -> $TARGET_HOME       (current user's $HOME by default)
-#     <U>     -> $(basename "$TARGET_HOME")
-#     <DATE>  -> YYYY-MM-DD
-#     HOT/    -> $OFFLOAD_HOT/
-#     COLD/   -> $OFFLOAD_COLD/
-#
-#   Strategies:
-#     symlink     — rsync to dest, verify, rm source, ln -s dest source
-#     archive     — rsync to dest, rm source, recreate empty source dir
-#                   (no symlink; fresh empty target for new arrivals)
-#     merge       — rsync --update into existing dest, rm source
-#                   (dest is authoritative; source is gone)
-#     sweep       — find subdirs matching internal patterns and delete
-#                   (no destination; data is rebuildable from source code)
-#     purge       — delete the entire source dir, recreate empty. For
-#                   caches and rebuild-on-demand support files (iOS
-#                   DeviceSupport, ~/.cache, ~/.npm, Homebrew cache,
-#                   simulator runtimes/caches). Apps re-populate.
-#     native-ui   — printed instructions only; the tool never auto-mutates
-#                   media libraries (Photos, Music.app, iMovie) because
-#                   those apps have safer native "Choose Library" UIs
-#
-#   Categories: app | home | cold | merge | dev | cache | sweep | protected | vm | media-lib
-#
-# OPTIONS
-#   --target-home <path>   work on a different user's home (Admin mode).
-#                          Defaults to $HOME. When set to a different user's
-#                          home, admin-mode invariants apply for move/protected:
-#                          caller must NOT be the target user, must be in the
-#                          admin group, and (for protected targets) the
-#                          Terminal must have Full Disk Access. `list` honors
-#                          --target-home without admin gating (read-only).
-#   --all-users            (list only) iterate every real macOS user account
-#                          (UID >= 500, non-underscore-prefixed) and show
-#                          each user's offload state plus a grand-total
-#                          reclaim. Useful for the Admin account auditing
-#                          which homes still have movable data. To see
-#                          actual sizes for other users (not "unreadable"),
-#                          run under sudo:
-#                            sudo offload list --all-users
-#                          List is read-only; running it under sudo does
-#                          not violate the "never sudo from inside" rule.
-#   --benchmark            (drives only) measure read throughput per drive
-#                          via a 100 MB timed dd read. ~5-10s/drive.
-#                          Opt-in; no I/O without this flag.
-#   --apply                actually mutate. Without it, every move is a
-#                          dry-run that prints intent only.
-#
-# CONFIGURATION
-#   Drive paths come from environment variables OFFLOAD_HOT and
-#   OFFLOAD_COLD, or from a config file at
-#   ${XDG_CONFIG_HOME:-$HOME/.config}/offload/offload.conf .
-#   The config file is a sourced shell snippet:
-#
-#     OFFLOAD_HOT=/Volumes/MyFastSSD
-#     OFFLOAD_COLD=/Volumes/MyArchiveHDD
-#     # optional: extend or replace OFFLOAD_TARGETS
-#     OFFLOAD_TARGETS+=(
-#       "MyCustomApp|app|<TH>/Library/Application Support/Custom|HOT/MovedAppData/<U>/Custom|symlink|no|MyCustomApp"
-#     )
-#
-# DESIGN — Poka-Yoke Discipline
-#   1. Single source of truth. OFFLOAD_TARGETS is the only list.
-#      Every subcommand (list, checklist, launch, move, protected,
-#      media-libraries) reads from it. No duplicated knowledge.
-#
-#   2. Dry-run by default. Mutation requires --apply. There is no
-#      destructive default and no "yes-to-all" alias.
-#
-#   3. Verify before delete. Cross-volume moves rsync to destination,
-#      compare file count + total bytes against source, remove
-#      source only on signature match.
-#
-#   4. Idempotent. Re-running on an already-symlinked source skips.
-#      An existing destination is never silently overwritten.
-#
-#   5. Never sudo from inside. EACCES failures append to
-#      ~/offload-admin-todo.txt; a reviewable sudo-wrapper is
-#      emitted at ~/bin/offload-admin-pass for manual execution.
-#
-#   6. Two-account workflow. Protected targets require a separate
-#      macOS Admin account whose Terminal has Full Disk Access.
-#      Admin-mode is selected via --target-home pointing at a
-#      different user's home.
-#
-#   7. Guard launcher. 'offload launch' checks the symlink target
-#      before opening the app.
-#
-#   DOES NOT
-#   The tool deliberately does NOT do any of these things:
-#
-#   - Relocate $HOME via `dscl . -change NFSHomeDirectory ...`.
-#     That changes the home-folder pointer in Directory Services
-#     and breaks iCloud Drive (which refuses to sync if $HOME is
-#     not on internal APFS), confuses FileVault login, and has been
-#     broken by macOS updates repeatedly. We move *contents*, not
-#     the pointer.
-#
-#   - Symlink Apple sandbox containers (~/Library/Containers/com.apple.*).
-#     The sandbox kit resolves the real path and refuses if it is
-#     outside the container. Mail, Messages.app's Container (not
-#     the archive), Notes, etc. are excluded.
-#
-#   - Symlink browser profiles. Chrome, Firefox, Brave, and Zen
-#     do constant SQLite writes; corruption under symlinks is
-#     common.
-#
-#   - Move media libraries (Photos / Music.app / iMovie / Final Cut)
-#     via symlinks. Those apps have safer native "Choose Library"
-#     UIs. Use 'offload media-libraries' for the steps.
-#
-# EXAMPLES
-#   First-time setup:
-#     mkdir -p ~/.config/offload
-#     cat > ~/.config/offload/offload.conf <<'EOF'
-#     OFFLOAD_HOT=/Volumes/MyFastSSD
-#     OFFLOAD_COLD=/Volumes/MyArchiveHDD
-#     EOF
-#
-#   Inspect:
-#     offload status
-#     offload list           # everything offload knows about
-#     offload checklist      # live progress checklist
-#
-#   Safe first sweep (build cruft, fully reversible by rebuild):
-#     offload move BuildCruft
-#     offload move BuildCruft --apply
-#
-#   Move one specific app:
-#     offload move Signal --apply
-#
-#   Move every entry in a category:
-#     offload move app --apply        # all Application Support entries
-#     offload move home --apply       # ~/Movies + ~/Music
-#
-#   Guarded launch:
-#     offload launch Signal
-#
-#   A full HOT drive (Docker reports input/output error):
-#     offload drain                  # plan: what could move, sizes
-#     offload drain ROMs --apply     # move ROMs to COLD, symlink back
-#
-#   Media libraries (manual, native UI):
-#     offload media-libraries
-#
-#   Admin running on another user's home (Admin account, FDA on Terminal):
-#     offload protected --target-home /Users/alice Messages --apply
-#     offload --target-home /Users/alice move Signal --apply
-#
-# FILES
-#   ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf   user config
-#   ~/offload-YYYY-MM-DD.log                             per-run log
-#   ~/offload-admin-todo.txt                             EACCES paths
-#   ~/bin/offload-admin-pass                             emitted sudo-review script
-#
-# EXIT STATUS
-#   0   success
-#   1   invariant violation, invalid input, or fatal error
-#   2   destination conflict (manual review required)
-#
-# SEE ALSO
-#   rsync(1), tmutil(8), ln(1), launchctl(1)
-#
-# AUTHOR
-#   Sage-is/homebrew-apps tap. Issues:
-#   https://github.com/Sage-is/homebrew-apps/issues
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""offload(1) — poka-yoke disk offload tool for macOS
 
-set -euo pipefail
+NAME
+  offload — move user data to external drives via symlinks, safely
 
-VERSION="0.7.0"
+SYNOPSIS
+  offload [--target-home <path>] <subcommand> [args...] [--apply]
 
-# ----------------------------------------------------------------------------
-# Defaults
-# ----------------------------------------------------------------------------
+DESCRIPTION
+  offload moves heavy, low-velocity data out of $HOME onto an
+  external drive. The home folder itself stays internal — we move
+  the *contents* of specific paths inside $HOME and replace each
+  with a symlink (or, for archive targets, leave a fresh empty
+  directory). This is the supported pattern: iCloud, FileVault,
+  login, and macOS updates remain untouched.
 
-OFFLOAD_CONF="${OFFLOAD_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/offload/offload.conf}"
+  A guard launcher refuses to start an app whose data lives on an
+  unmounted volume. Dry-run is the default; --apply must be
+  explicit. Cross-volume moves verify (file count + bytes) before
+  deleting source. Re-running is idempotent.
 
-OFFLOAD_HOT="${OFFLOAD_HOT:-}"
-OFFLOAD_COLD="${OFFLOAD_COLD:-}"
+SUBCOMMANDS
+  help                print this text (this header is the single source of truth)
+  version             print the script version
+  status              disk free + recent log + admin todo
+  list                every entry in OFFLOAD_TARGETS with its current state
+  checklist           generated progress checklist (live from OFFLOAD_TARGETS)
+  drives [--benchmark]  every mounted volume: filesystem, SSD, free space,
+                      backup (Time Machine, Backblaze), ownership, encryption,
+                      and a HOT/COLD/EXCLUDED role. Read-only: never writes
+                      ~/.config/offload/offload.conf — it prints the lines
+                      to add. --benchmark adds a timed dd-read speed column.
+  plan                advice only: how much the boot drive needs, where each
+                      target would go, what is private, backup coverage, and
+                      priced options (buy hardware, cloud) for any shortfall.
+                      Nothing moves; nothing touches the network.
+  prices [--update]   the dated price table plan uses. --update is the only
+                      network call offload makes, and only when asked.
+  repos [--synced-ok] every git repo under ~/Documents/Projects with a verdict:
+                      keep (active), synced (in a sync folder), reclone (clean,
+                      pushed, cold) or move (cold but unsafe to remove)
+  reclone <path>|all [--apply]                 restore recloned or moved repos
+  restore <Label|path> [--apply]               bring a cloud archive back
+  launch <App>        guarded launch (refuses if symlink target unmounted)
+  move <Label> [--apply] [--synced-ok] [--upload]  offload one entry by label
+  move <category> [--apply]                    offload every entry in a category
+  relocations (alias: media-libraries)         print native-UI relocation
+                                               steps — Docker Desktop,
+                                               Colima, OrbStack, Photos,
+                                               Music.app, iMovie
+  drain [<name>...] [--need <GiB>] [--apply]   free a full HOT drive: move
+                                               top-level entries to
+                                               COLD/Drained/<HOT name>/, verify,
+                                               leave a symlink. No names = a
+                                               plan only (default --need 30);
+                                               --apply requires names. Skips
+                                               what offload owns, the VM disk
+                                               folders of Docker Desktop,
+                                               Colima and OrbStack, and
+                                               media libraries
+  protected <Label> [--apply]                  alias for `move <Label>` that
+                                               requires --target-home + FDA
 
-# Built-in default OFFLOAD_TARGETS.
-# Schema: label|category|source|dest|strategy|admin?|bundle
-# Tokens: <TH>=$TARGET_HOME, <U>=target user, <DATE>=YYYY-MM-DD
-#         HOT/ and COLD/ prefix the destination with $OFFLOAD_HOT / $OFFLOAD_COLD
-DEFAULT_OFFLOAD_TARGETS=(
-  # --- Application Support symlinks --------------------------------------
-  "Signal|app|<TH>/Library/Application Support/Signal|HOT/MovedAppData/<U>/Signal|symlink|no|Signal"
-  "Obsidian|app|<TH>/Library/Application Support/obsidian|HOT/MovedAppData/<U>/Obsidian|symlink|no|Obsidian"
-  "Steam|app|<TH>/Library/Application Support/Steam|HOT/MovedAppData/<U>/Steam|symlink|no|Steam"
-  "Keybase|app|<TH>/Library/Application Support/Keybase|HOT/MovedAppData/<U>/Keybase|symlink|no|Keybase"
-  "Minecraft|app|<TH>/Library/Application Support/minecraft|HOT/MovedAppData/<U>/Minecraft|symlink|no|Minecraft"
-  "VSCode|app|<TH>/Library/Application Support/Code|HOT/MovedAppData/<U>/VSCode|symlink|no|Visual Studio Code"
-  "Epic|app|<TH>/Library/Application Support/Epic|HOT/MovedAppData/<U>/Epic|symlink|no|Epic Games Launcher"
-  "Cursor|app|<TH>/Library/Application Support/Cursor|HOT/MovedAppData/<U>/Cursor|symlink|no|Cursor"
+DATA MODEL — OFFLOAD_TARGETS
+  Every relocatable thing is a row in OFFLOAD_TARGETS. Every
+  subcommand reads from this list; there is no parallel hardcoded
+  knowledge. Schema (pipe-delimited):
 
-  # --- Home subdirectories (move contents, leave $HOME pointer alone) ----
-  "Movies|home|<TH>/Movies|HOT/MovedHome/<U>/Movies|symlink|no|-"
-  "Music|home|<TH>/Music|HOT/MovedHome/<U>/Music|symlink|no|-"
-  "Pictures|home|<TH>/Pictures|HOT/MovedHome/<U>/Pictures|symlink|no|-"
-  "Desktop|home|<TH>/Desktop|HOT/MovedHome/<U>/Desktop|symlink|no|-"
+    label | category | source | dest | strategy | admin? | bundle
 
-  # --- Hidden home dirs (toolchains and editor data; rebuilds if drive
-  # --- gone). All symlink strategy; safe-mount story: tools fail to
-  # --- launch cleanly when the dock is unplugged, no data loss. ----------
-  "LocalShare|home|<TH>/.local|HOT/MovedHome/<U>/.local|symlink|no|-"
-  "Bun|home|<TH>/.bun|HOT/MovedHome/<U>/.bun|symlink|no|-"
-  "Pyenv|home|<TH>/.pyenv|HOT/MovedHome/<U>/.pyenv|symlink|no|-"
-  "VSCodeUser|home|<TH>/.vscode|HOT/MovedHome/<U>/.vscode|symlink|no|-"
-  "VSCodeInsidersUser|home|<TH>/.vscode-insiders|HOT/MovedHome/<U>/.vscode-insiders|symlink|no|-"
-  "CursorUser|home|<TH>/.cursor|HOT/MovedHome/<U>/.cursor|symlink|no|-"
+  Tokens expanded at runtime:
+    <TH>    -> $TARGET_HOME       (current user's $HOME by default)
+    <TARGET_HOME> -> same as <TH> (older configs)
+    <U>     -> $(basename "$TARGET_HOME")
+    <DATE>  -> YYYY-MM-DD
+    HOT/    -> a HOT drive: $OFFLOAD_HOT, else an OFFLOAD_DRIVES SSD
+    COLD/   -> a COLD drive: $OFFLOAD_COLD, else an OFFLOAD_DRIVES spinner
+    CLOUD/  -> the first rclone remote in OFFLOAD_APPROVED_REMOTES
 
-  # --- Spitfire Audio sound libraries (often gigabytes; if the user has
-  # --- Spitfire installed). Harmless absent for everyone else. -----------
-  "Spitfire|home|<TH>/Spitfire|HOT/MovedHome/<U>/Spitfire|symlink|no|-"
+  For symlink and archive rows the drive is picked at move time: the
+  first mounted, eligible one that keeps OFFLOAD_HEADROOM free after
+  the move. Network mounts, ExFAT and removable sticks never qualify;
+  private labels need an encrypted volume with ownership on. An attached
+  encrypted sparsebundle counts as an encrypted drive, unless its file
+  sits on the boot drive.
 
-  # --- Cold archive (no symlink — fresh empty source) --------------------
-  "Downloads|cold|<TH>/Downloads|COLD/Archive/Downloads-<U>-<DATE>|archive|no|-"
+  Strategies:
+    symlink     — rsync to dest, verify, rm source, ln -s dest source
+    archive     — rsync to dest, rm source, recreate empty source dir
+                  (no symlink; fresh empty target for new arrivals)
+    merge       — rsync --update into existing dest, rm source
+                  (dest is authoritative; source is gone)
+    sweep       — find subdirs matching internal patterns and delete
+                  (no destination; data is rebuildable from source code)
+    purge       — delete the entire source dir, recreate empty. For
+                  caches and rebuild-on-demand support files (iOS
+                  DeviceSupport, ~/.cache, ~/.npm, Homebrew cache,
+                  simulator runtimes/caches). Apps re-populate.
+    native-ui   — printed instructions only; the tool never auto-mutates
+                  media libraries (Photos, Music.app, iMovie) because
+                  those apps have safer native "Choose Library" UIs
+    repos       — cold git repos: a clean, pushed one gets a verified
+                  `git bundle --all` on COLD, a manifest line, then goes
+                  (the remote is the archive); an unsafe one is copied
+                  whole to COLD, verified, then removed. --apply re-checks
+                  the remote first. Repos in sync folders need --synced-ok
+    cloud       — rclone copy to an approved remote, check (cryptcheck for
+                  crypt), record, remove. Only with --apply --upload
 
-  # --- Active merge (rsync --update; source removed; use dest directly) --
-  "Clones|merge|<TH>/Documents/Projects/Clones|HOT/Clones|merge|no|-"
+  Categories: app | home | cold | merge | dev | cache | sweep | repos | protected | vm | media-lib
 
-  # --- Developer caches ---------------------------------------------------
-  "CoreSimulator|dev|<TH>/Library/Developer/CoreSimulator|HOT/MovedAppData/<U>/CoreSimulator|symlink|no|-"
+OPTIONS
+  --target-home <path>   work on a different user's home (Admin mode).
+                         Defaults to $HOME. When set to a different user's
+                         home, admin-mode invariants apply for move/protected:
+                         caller must NOT be the target user, must be in the
+                         admin group, and (for protected targets) the
+                         Terminal must have Full Disk Access. `list` honors
+                         --target-home without admin gating (read-only).
+  --all-users            (list only) iterate every real macOS user account
+                         (UID >= 500, non-underscore-prefixed) and show
+                         each user's offload state plus a grand-total
+                         reclaim. Useful for the Admin account auditing
+                         which homes still have movable data. To see
+                         actual sizes for other users (not "unreadable"),
+                         run under sudo:
+                           sudo offload list --all-users
+                         List is read-only; running it under sudo does
+                         not violate the "never sudo from inside" rule.
+  --benchmark            (drives only) measure read throughput per drive
+                         via a timed dd read. ~5-10s/drive.
+                         Opt-in; no I/O without this flag.
+  --apply                actually mutate. Without it, every move is a
+                         dry-run that prints intent only.
 
-  # --- Build-cruft sweep (delete in place; rebuildable from source) ------
-  "BuildCruft|sweep|<TH>/Documents/Projects/GitHub|(in-place delete)|sweep|no|-"
+CONFIGURATION
+  Drive paths come from environment variables OFFLOAD_HOT and
+  OFFLOAD_COLD, or from a config file at
+  ${XDG_CONFIG_HOME:-$HOME/.config}/offload/offload.conf .
+  The config file is read, never run. It takes comments, KEY="value"
+  lines and KEY=( ... ) / KEY+=( ... ) lists of quoted rows:
 
-  # --- Purge: delete the source dir, recreate empty. For caches and    --
-  # --- rebuild-on-demand support files. Apps re-populate as needed.    --
-  "iOS-DeviceSupport|cache|<TH>/Library/Developer/Xcode/iOS DeviceSupport|(in-place purge)|purge|no|-"
-  "XcodeDerivedData|cache|<TH>/Library/Developer/Xcode/DerivedData|(in-place purge)|purge|no|-"
-  "XcodeArchives|cache|<TH>/Library/Developer/Xcode/Archives|(in-place purge)|purge|no|-"
-  "XdgCache|cache|<TH>/.cache|(in-place purge)|purge|no|-"
-  "NpmCache|cache|<TH>/.npm|(in-place purge)|purge|no|-"
-  "HomebrewCache|cache|<TH>/Library/Caches/Homebrew|(in-place purge)|purge|no|-"
-
-  # --- Protected (Admin account + FDA on Terminal) -----------------------
-  "Messages|protected|<TH>/Library/Messages|HOT/MovedProtected/<U>/Messages|symlink|yes|-"
-  "iOS-Backups|protected|<TH>/Library/Application Support/MobileSync/Backup|HOT/MovedProtected/<U>/iOS-Backups|symlink|yes|-"
-
-  # --- VM disk images (moved by hand or in the runtime's own UI) --------
-  "Docker|vm|<TH>/Library/Containers/com.docker.docker|HOT/Docker|native-ui|no|-"
-  "Colima|vm|<TH>/.colima/_lima/_disks|HOT/Colima/_disks|native-ui|no|-"
-  "OrbStack|vm|<TH>/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data|HOT/OrbStack|native-ui|no|-"
-
-  # --- Media libraries (native UI; tool never auto-moves these) ----------
-  "Photos-Library|media-lib|<TH>/Pictures/Photos Library.photoslibrary|HOT/Photos Library.photoslibrary|native-ui|no|-"
-  "Music-Library|media-lib|<TH>/Music/Music/Media|HOT/Music Media|native-ui|no|-"
-  "iMovie-Library|media-lib|<TH>/Movies/iMovie Library.imovielibrary|HOT/iMovie Library.imovielibrary|native-ui|no|-"
-)
-
-# Build-cruft find patterns (used by sweep strategy)
-SWEEP_DIRNAMES=(node_modules .venv venv target build dist __pycache__ .next)
-
-# Pre-seed with defaults so a config using OFFLOAD_TARGETS+=(...) extends
-# the built-in list, while OFFLOAD_TARGETS=(...) still fully replaces it.
-OFFLOAD_TARGETS=("${DEFAULT_OFFLOAD_TARGETS[@]}")
-
-# Source user config if it exists.
-if [[ -f "$OFFLOAD_CONF" ]]; then
-  # shellcheck disable=SC1090
-  source "$OFFLOAD_CONF"
-fi
-
-# Legacy compatibility: if config still uses OFFLOAD_APPS (v0.1.x schema)
-# AND nothing in the current OFFLOAD_TARGETS covers a label, append it.
-if declare -p OFFLOAD_APPS &>/dev/null; then
-  for row in "${OFFLOAD_APPS[@]}"; do
-    IFS='|' read -r label src bundle <<<"$row"
-    found=0
-    for t in "${OFFLOAD_TARGETS[@]}"; do
-      [[ "${t%%|*}" == "$label" ]] && { found=1; break; }
-    done
-    [[ $found -eq 0 ]] && OFFLOAD_TARGETS+=("$label|app|$src|HOT/MovedAppData/<U>/$label|symlink|no|$bundle")
-  done
-fi
-
-# Runtime state.
-TARGET_HOME="$HOME"
-DRY=1
-LIST_ALL_USERS=0
-BENCHMARK=0
-DATE_TAG="$(date +%Y-%m-%d)"
-LOG="$HOME/offload-$DATE_TAG.log"
-ADMIN_TODO="$HOME/offload-admin-todo.txt"
-ADMIN_PASS="$HOME/bin/offload-admin-pass"
-
-# Set by cmd_list_one for the --all-users caller to grand-total.
-LAST_TOTAL_BYTES=0
-
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
-
-log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
-warn() { printf '[%s] WARN: %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
-die()  { printf '[%s] FATAL: %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2; exit 1; }
-mode() { [[ $DRY -eq 1 ]] && echo DRY-RUN || echo APPLY; }
-
-target_user() { basename "$TARGET_HOME"; }
-
-# The folder that holds Colima's VM disks: _disks in Lima's home, which Colima
-# 0.10.3 sets to $LIMA_HOME, else _lima in Colima's home. That is $COLIMA_HOME,
-# else ~/.colima, or $XDG_CONFIG_HOME/colima while ~/.colima is missing.
-colima_disks() {
-  local h="$HOME/.colima"
-  if [[ ! -e "$h" && -n "${XDG_CONFIG_HOME:-}" ]]; then h="$XDG_CONFIG_HOME/colima"; fi
-  echo "${LIMA_HOME:-${COLIMA_HOME:-$h}/_lima}/_disks"
-}
-
-# The physical path of $1, with every link resolved; $1 itself if it does not resolve.
-physical_path() { (cd -P "$1" && pwd -P) 2>/dev/null || echo "$1"; }
-
-# Expand <TH>, <U>, <DATE>, HOT/, COLD/ tokens in a path.
-expand_tokens() {
-  local s="$1" u; u="$(target_user)"
-  s="${s//<TH>/$TARGET_HOME}"
-  s="${s//<U>/$u}"
-  s="${s//<DATE>/$DATE_TAG}"
-  if [[ "$s" == HOT/* ]];  then s="${OFFLOAD_HOT}/${s#HOT/}"; fi
-  if [[ "$s" == COLD/* ]]; then s="${OFFLOAD_COLD}/${s#COLD/}"; fi
-  echo "$s"
-}
-
-# Iterate OFFLOAD_TARGETS, yielding fully-expanded rows.
-iter_targets() {
-  for row in "${OFFLOAD_TARGETS[@]}"; do
-    IFS='|' read -r label cat src dest strat adm bundle <<<"$row"
-    src="$(expand_tokens "$src")"
-    dest="$(expand_tokens "$dest")"
-    printf '%s|%s|%s|%s|%s|%s|%s\n' "$label" "$cat" "$src" "$dest" "$strat" "$adm" "$bundle"
-  done
-}
-
-require_drive() {
-  local var="$1" path="${!1:-}"
-  [[ -n "$path" ]] || die "$var not set. Configure $OFFLOAD_CONF or export $var."
-  [[ -d "$path" ]] || die "$var not mounted: $path"
-}
-
-free_bytes() { df -k "$1" | awk 'NR==2 {print $4 * 1024}'; }
-human()      { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
-
-require_free() {
-  local p="$1" need="$2"
-  # Walk up to the nearest existing ancestor — df can only query existing paths.
-  while [[ ! -d "$p" ]]; do p="$(dirname "$p")"; [[ "$p" == "/" ]] && break; done
-  local avail; avail="$(free_bytes "$p")"
-  (( avail >= need )) || die "Not enough free on $p: have $(human $avail), need $(human $need)"
-  log "  OK: $p has $(human $avail) free (need $(human $need))"
-}
-
-manual_step() {
-  log "  [MANUALLY] $1"
-  # Guarded prompt: the if-form returns 0 when skipped (dry-run or no tty);
-  # a bare `[[ ]] && read` returns 1 there and set -e kills the script.
-  if [[ $DRY -eq 0 && -t 0 ]]; then
-    read -r -p "  Press Enter when done (Ctrl-C to abort): "
-  fi
-}
-
-do_run() {
-  log "  RUN: $*"
-  if [[ $DRY -eq 0 ]]; then
-    if ! eval "$@" 2>>"$LOG"; then
-      local rc=$?
-      if grep -q 'Permission denied' "$LOG" 2>/dev/null; then
-        warn "  EACCES — recording for admin pass"
-        printf '# from %s\n%s\n' "$(date)" "$*" >> "$ADMIN_TODO"
-        return 0
-      fi
-      die "Command failed (rc=$rc): $*"
-    fi
-  fi
-}
-
-tree_signature() {
-  local p="$1"
-  [[ -d "$p" ]] || { echo "files=0 bytes=0"; return; }
-  local f; f="$(find "$p" -type f 2>/dev/null | wc -l | tr -d ' ')"
-  # Sum logical file sizes (stat %z), NOT du allocated blocks: allocation
-  # differs across volumes (sparse files, block slack) even when the copy
-  # is byte-identical, which made verify fail on every cross-volume move.
-  local b; b="$(find "$p" -type f -exec stat -f %z {} + 2>/dev/null | awk '{s+=$1} END {print s+0}')"
-  echo "files=$f bytes=$b"
-}
-
-assert_admin_invariants() {
-  [[ "$TARGET_HOME" == "$HOME" ]] && return 0
-  local tu; tu="$(target_user)"
-  [[ "$USER" != "$tu" ]] \
-    || die "Refusing to operate on $TARGET_HOME as '$USER' — Admin mode requires a separate account."
-  id -Gn "$USER" | tr ' ' '\n' | grep -qx admin \
-    || die "Current account '$USER' is not in the admin group."
-}
-
-assert_fda_granted() {
-  local probe="$TARGET_HOME/Library/Messages"
-  if [[ -d "$probe" ]]; then
-    if ! stat "$probe" >/dev/null 2>&1; then
-      die "Cannot stat $probe — this Terminal lacks Full Disk Access.
-       Fix: System Settings -> Privacy & Security -> Full Disk Access ->
-            add this Terminal, then restart Terminal."
-    fi
-  fi
-}
-
-# ----------------------------------------------------------------------------
-# Strategy implementations
-# ----------------------------------------------------------------------------
-
-strategy_symlink() {
-  local src="$1" dst="$2" label="$3"
-  log "=== $label (strategy=symlink) ==="
-  if [[ -L "$src" ]]; then
-    [[ "$(readlink "$src")" == "$dst" ]] \
-      && { log "  SKIP: $src already symlinked to $dst"; return 0; } \
-      || die "$src is a symlink to '$(readlink "$src")', not '$dst'"
-  fi
-  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
-  [[ -e "$dst" ]] && die "Destination $dst exists — manual review required"
-
-  local need; need="$(du -sk "$src" | awk '{print $1*1024}')"
-  require_free "$(dirname "$dst")" "$need"
-
-  log "  Source sig: $(tree_signature "$src")"
-  do_run "mkdir -p \"$(dirname "$dst")\""
-  do_run "rsync -a \"$src/\" \"$dst/\""
-
-  if [[ $DRY -eq 0 ]]; then
-    local s d; s="$(tree_signature "$src")"; d="$(tree_signature "$dst")"
-    log "  Verify: src=$s dst=$d"
-    [[ "$s" == "$d" ]] || die "Signature mismatch — source preserved"
-    do_run "rm -rf \"$src\""
-    do_run "ln -s \"$dst\" \"$src\""
-    [[ "$TARGET_HOME" != "$HOME" ]] && do_run "chown -R \"$(target_user)\" \"$dst\""
-    log "  DONE: $src -> $dst"
-  fi
-}
-
-strategy_archive() {
-  local src="$1" dst="$2" label="$3"
-  log "=== $label (strategy=archive) ==="
-  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
-  if [[ "$label" == "Downloads" && -n "$OFFLOAD_HOT" && -d "$OFFLOAD_HOT" ]]; then
-    local roms_dst="$OFFLOAD_HOT/ROMs"
-    local roms=()
-    while IFS= read -r f; do roms+=("$f"); done < <(
-      find "$src" -maxdepth 1 -type f -name '*.zip' \
-        \( -iname '*Mario*' -o -iname '*Zelda*' -o -iname '*Pokemon*' \
-           -o -iname '*Sonic*' -o -iname '*Metroid*' -o -iname '*Kirby*' \
-           -o -iname '*GameCube*' -o -iname '*Nintendo*' \) 2>/dev/null
+    OFFLOAD_HOT=/Volumes/MyFastSSD
+    OFFLOAD_COLD=/Volumes/MyArchiveHDD
+    # optional: extend (+=) or replace (=) OFFLOAD_TARGETS
+    OFFLOAD_TARGETS+=(
+      "MyCustomApp|app|<TH>/Library/Application Support/Custom|HOT/MovedAppData/<U>/Custom|symlink|no|MyCustomApp"
     )
-    if (( ${#roms[@]} > 0 )); then
-      log "  Pre-filter: ${#roms[@]} ROM zip(s) -> $roms_dst"
-      do_run "mkdir -p \"$roms_dst\""
-      for f in "${roms[@]}"; do
-        local base; base="$(basename "$f")"
-        [[ -e "$roms_dst/$base" ]] && { warn "    SKIP duplicate: $base"; continue; }
-        do_run "mv -n \"$f\" \"$roms_dst/\""
-      done
-    fi
-  fi
-  do_run "mkdir -p \"$dst\""
-  do_run "rsync -a --remove-source-files \"$src/\" \"$dst/\""
-  do_run "find \"$src\" -type d -empty -delete"
-  do_run "mkdir -p \"$src\""
-  log "  DONE: $src archived to $dst (source recreated empty)"
+
+  Anything else in the file is an error, so a typo cannot run as a command.
+
+  Optional keys:
+    OFFLOAD_DRIVES=( "/Volumes/Spare" )   more drives for HOT/ or COLD/ (opt-in)
+    OFFLOAD_HEADROOM=10                   percent a drive keeps free after a move
+    OFFLOAD_BOOT_FREE_PCT=20              plan's target for the boot drive
+    OFFLOAD_PRIVATE_LABELS=( ... )        default Signal Messages Keybase iOS-Backups
+    OFFLOAD_REPO_KEEP=( "GitHub/Keep*" )  repos never recloned (glob on path or name)
+    OFFLOAD_APPROVED_REMOTES=( "team-b2-crypt:offload" )  rclone remotes for CLOUD/
+
+  Environment: OFFLOAD_HOT, OFFLOAD_COLD, OFFLOAD_HEADROOM, OFFLOAD_CONF,
+  OFFLOAD_REPO_COLD_DAYS (90), OFFLOAD_ALLOW_PLAINTEXT=1 (private data on a
+  plain drive, at your own risk), OFFLOAD_PRICES_URL; OFFLOAD_VOLUMES and
+  OFFLOAD_BZINFO point the drive scan elsewhere (tests).
+
+DESIGN — Poka-Yoke Discipline
+  1. Single source of truth. OFFLOAD_TARGETS is the only list.
+     Every subcommand (list, checklist, launch, move, protected,
+     media-libraries) reads from it. No duplicated knowledge.
+
+  2. Dry-run by default. Mutation requires --apply. There is no
+     destructive default and no "yes-to-all" alias.
+
+  3. Verify before delete. Cross-volume moves rsync to destination,
+     compare file count + total bytes against source, remove
+     source only on signature match.
+
+  4. Idempotent. Re-running on an already-symlinked source skips.
+     An existing destination is never silently overwritten.
+
+  5. Never sudo from inside. EACCES failures append to
+     ~/offload-admin-todo.txt; a reviewable sudo-wrapper is
+     emitted at ~/bin/offload-admin-pass for manual execution.
+
+  6. Two-account workflow. Protected targets require a separate
+     macOS Admin account whose Terminal has Full Disk Access.
+     Admin-mode is selected via --target-home pointing at a
+     different user's home.
+
+  7. Guard launcher. 'offload launch' checks the symlink target
+     before opening the app.
+
+  8. Every drive weighed. A move goes to a drive that is mounted,
+     fit for the data, and keeps headroom; a run never promises the
+     same free space twice. Private data never lands in plaintext.
+
+  9. Network only when asked. plan and prices are advice; the only
+     calls out are 'prices --update' and a CLOUD/ move run with
+     --apply --upload to a remote the team approved.
+
+  DOES NOT
+  The tool deliberately does NOT do any of these things:
+
+  - Relocate $HOME via `dscl . -change NFSHomeDirectory ...`.
+    That changes the home-folder pointer in Directory Services
+    and breaks iCloud Drive (which refuses to sync if $HOME is
+    not on internal APFS), confuses FileVault login, and has been
+    broken by macOS updates repeatedly. We move *contents*, not
+    the pointer.
+
+  - Symlink Apple sandbox containers (~/Library/Containers/com.apple.*).
+    The sandbox kit resolves the real path and refuses if it is
+    outside the container. Mail, Messages.app's Container (not
+    the archive), Notes, etc. are excluded.
+
+  - Symlink browser profiles. Chrome, Firefox, Brave, and Zen
+    do constant SQLite writes; corruption under symlinks is
+    common.
+
+  - Move media libraries (Photos / Music.app / iMovie / Final Cut)
+    via symlinks. Those apps have safer native "Choose Library"
+    UIs. Use 'offload media-libraries' for the steps.
+
+EXAMPLES
+  First-time setup:
+    mkdir -p ~/.config/offload
+    cat > ~/.config/offload/offload.conf <<'EOF'
+    OFFLOAD_HOT=/Volumes/MyFastSSD
+    OFFLOAD_COLD=/Volumes/MyArchiveHDD
+    EOF
+
+  Inspect:
+    offload status
+    offload list           # everything offload knows about
+    offload checklist      # live progress checklist
+
+  Safe first sweep (build cruft, fully reversible by rebuild):
+    offload move BuildCruft
+    offload move BuildCruft --apply
+
+  Move one specific app:
+    offload move Signal --apply
+
+  Move every entry in a category:
+    offload move app --apply        # all Application Support entries
+    offload move home --apply       # ~/Movies + ~/Music
+
+  Guarded launch:
+    offload launch Signal
+
+  A full HOT drive (Docker reports input/output error):
+    offload drain                  # plan: what could move, sizes
+    offload drain ROMs --apply     # move ROMs to COLD, symlink back
+
+  Media libraries (manual, native UI):
+    offload media-libraries
+
+  Where things could go, and what it would cost:
+    offload drives                 # every volume, backup, encryption
+    offload plan                   # advice only
+    offload repos                  # git repo verdicts
+    offload move Repos             # dry run; then --apply
+
+  Admin running on another user's home (Admin account, FDA on Terminal):
+    offload protected --target-home /Users/alice Messages --apply
+    offload --target-home /Users/alice move Signal --apply
+
+FILES
+  ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf   user config
+  ~/offload-YYYY-MM-DD.log                             per-run log
+  ~/offload-admin-todo.txt                             EACCES paths
+  ~/bin/offload-admin-pass                             emitted sudo-review script
+  ${XDG_CONFIG_HOME:-~/.config}/offload/prices.tsv     your price rows (override by id)
+  ${XDG_CONFIG_HOME:-~/.config}/offload/reclone.tsv    manifest: recloned, moved, cloud
+  <COLD>/offload/Repos/<user>/                         repo bundles, moved repos, manifest copy
+
+EXIT STATUS
+  0   success
+  1   invariant violation, invalid input, or fatal error
+  2   destination conflict (manual review required)
+  3   permission denied: an admin pass is needed (see ~/bin/offload-admin-pass)
+
+SEE ALSO
+  rsync(1), tmutil(8), ln(1), launchctl(1)
+
+AUTHOR
+  Sage-is/homebrew-apps tap. Issues:
+  https://github.com/Sage-is/homebrew-apps/issues
+"""
+
+from __future__ import annotations
+
+import getpass
+import json
+import math
+import os
+import plistlib
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Iterator, List, NamedTuple, Optional
+
+VERSION = "0.8.0"
+
+# Built-in targets. Schema: label|category|source|dest|strategy|admin?|bundle
+# Tokens: <TH>=target home, <U>=target user, <DATE>=YYYY-MM-DD; HOT/ and COLD/ prefix the drives.
+DEFAULT_TARGETS = [
+    # Application Support symlinks
+    "Signal|app|<TH>/Library/Application Support/Signal|HOT/MovedAppData/<U>/Signal|symlink|no|Signal",
+    "Obsidian|app|<TH>/Library/Application Support/obsidian|HOT/MovedAppData/<U>/Obsidian|symlink|no|Obsidian",
+    "Steam|app|<TH>/Library/Application Support/Steam|HOT/MovedAppData/<U>/Steam|symlink|no|Steam",
+    "Keybase|app|<TH>/Library/Application Support/Keybase|HOT/MovedAppData/<U>/Keybase|symlink|no|Keybase",
+    "Minecraft|app|<TH>/Library/Application Support/minecraft|HOT/MovedAppData/<U>/Minecraft|symlink|no|Minecraft",
+    "VSCode|app|<TH>/Library/Application Support/Code|HOT/MovedAppData/<U>/VSCode|symlink|no|Visual Studio Code",
+    "Epic|app|<TH>/Library/Application Support/Epic|HOT/MovedAppData/<U>/Epic|symlink|no|Epic Games Launcher",
+    "Cursor|app|<TH>/Library/Application Support/Cursor|HOT/MovedAppData/<U>/Cursor|symlink|no|Cursor",
+    # Home subdirectories (move contents, leave the $HOME pointer alone)
+    "Movies|home|<TH>/Movies|HOT/MovedHome/<U>/Movies|symlink|no|-",
+    "Music|home|<TH>/Music|HOT/MovedHome/<U>/Music|symlink|no|-",
+    "Pictures|home|<TH>/Pictures|HOT/MovedHome/<U>/Pictures|symlink|no|-",
+    "Desktop|home|<TH>/Desktop|HOT/MovedHome/<U>/Desktop|symlink|no|-",
+    # Hidden home dirs: toolchains and editor data; tools fail cleanly when the drive is gone
+    "LocalShare|home|<TH>/.local|HOT/MovedHome/<U>/.local|symlink|no|-",
+    "Bun|home|<TH>/.bun|HOT/MovedHome/<U>/.bun|symlink|no|-",
+    "Pyenv|home|<TH>/.pyenv|HOT/MovedHome/<U>/.pyenv|symlink|no|-",
+    "VSCodeUser|home|<TH>/.vscode|HOT/MovedHome/<U>/.vscode|symlink|no|-",
+    "VSCodeInsidersUser|home|<TH>/.vscode-insiders|HOT/MovedHome/<U>/.vscode-insiders|symlink|no|-",
+    "CursorUser|home|<TH>/.cursor|HOT/MovedHome/<U>/.cursor|symlink|no|-",
+    # Spitfire Audio sound libraries; harmless when absent
+    "Spitfire|home|<TH>/Spitfire|HOT/MovedHome/<U>/Spitfire|symlink|no|-",
+    # Cold archive (no symlink; fresh empty source)
+    "Downloads|cold|<TH>/Downloads|COLD/Archive/Downloads-<U>-<DATE>|archive|no|-",
+    # Active merge (rsync --update; source removed; use dest directly)
+    "Clones|merge|<TH>/Documents/Projects/Clones|HOT/Clones|merge|no|-",
+    # Developer caches
+    "CoreSimulator|dev|<TH>/Library/Developer/CoreSimulator|HOT/MovedAppData/<U>/CoreSimulator|symlink|no|-",
+    # Build-cruft sweep (delete in place; rebuildable from source)
+    "BuildCruft|sweep|<TH>/Documents/Projects/GitHub|(in-place delete)|sweep|no|-",
+    # Cold git clones: clean + pushed ones leave a bundle on COLD and go; the rest move whole to COLD
+    "Repos|repos|<TH>/Documents/Projects|COLD/offload/Repos/<U>|repos|no|-",
+    # Purge: delete the source dir, recreate empty; apps re-populate
+    "iOS-DeviceSupport|cache|<TH>/Library/Developer/Xcode/iOS DeviceSupport|(in-place purge)|purge|no|-",
+    "XcodeDerivedData|cache|<TH>/Library/Developer/Xcode/DerivedData|(in-place purge)|purge|no|-",
+    "XcodeArchives|cache|<TH>/Library/Developer/Xcode/Archives|(in-place purge)|purge|no|-",
+    "XdgCache|cache|<TH>/.cache|(in-place purge)|purge|no|-",
+    "NpmCache|cache|<TH>/.npm|(in-place purge)|purge|no|-",
+    "HomebrewCache|cache|<TH>/Library/Caches/Homebrew|(in-place purge)|purge|no|-",
+    # Protected (Admin account + Full Disk Access on Terminal)
+    "Messages|protected|<TH>/Library/Messages|HOT/MovedProtected/<U>/Messages|symlink|yes|-",
+    "iOS-Backups|protected|<TH>/Library/Application Support/MobileSync/Backup|HOT/MovedProtected/<U>/iOS-Backups|symlink|yes|-",
+    # VM disk images (moved by hand or in the runtime's own UI)
+    "Docker|vm|<TH>/Library/Containers/com.docker.docker|HOT/Docker|native-ui|no|-",
+    "Colima|vm|<TH>/.colima/_lima/_disks|HOT/Colima/_disks|native-ui|no|-",
+    "OrbStack|vm|<TH>/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data|HOT/OrbStack|native-ui|no|-",
+    # Media libraries (native UI; the tool never auto-moves these)
+    "Photos-Library|media-lib|<TH>/Pictures/Photos Library.photoslibrary|HOT/Photos Library.photoslibrary|native-ui|no|-",
+    "Music-Library|media-lib|<TH>/Music/Music/Media|HOT/Music Media|native-ui|no|-",
+    "iMovie-Library|media-lib|<TH>/Movies/iMovie Library.imovielibrary|HOT/iMovie Library.imovielibrary|native-ui|no|-",
+]
+
+# Build-cruft folder names (sweep strategy; repos treat them as rebuildable).
+SWEEP_DIRNAMES = ["node_modules", ".venv", "venv", "target", "build", "dist", "__pycache__", ".next"]
+
+GIB = 1 << 30
+
+
+class Target(NamedTuple):
+    label: str
+    category: str
+    source: str
+    dest: str
+    strategy: str
+    admin: str
+    bundle: str
+
+
+@dataclass
+class Settings:
+    home: str = os.path.expanduser("~")
+    target_home: str = os.path.expanduser("~")
+    conf: str = ""
+    hot: str = ""
+    cold: str = ""
+    targets: List[str] = field(default_factory=list)
+    dry: bool = True
+    all_users: bool = False
+    benchmark: bool = False
+    date_tag: str = time.strftime("%Y-%m-%d")
+    admin_needed: bool = False
+    drives: List[str] = field(default_factory=list)          # OFFLOAD_DRIVES: opt-in volumes beyond HOT/COLD
+    headroom: int = 10                                        # OFFLOAD_HEADROOM: percent kept free on a drive
+    private: List[str] = field(default_factory=lambda: ["Signal", "Messages", "Keybase", "iOS-Backups"])
+    reserved: dict = field(default_factory=dict)              # bytes promised to each drive in this run
+    boot_free_pct: int = 20                                   # OFFLOAD_BOOT_FREE_PCT: plan's target for the boot drive
+    synced_ok: bool = False                                   # --synced-ok: repos may leave a sync folder
+    upload: bool = False                                      # --upload: CLOUD/ rows may send data off this machine
+    approved_remotes: List[str] = field(default_factory=list) # OFFLOAD_APPROVED_REMOTES: rclone remotes the team approved
+    extra: dict = field(default_factory=dict)                 # other config lists, e.g. OFFLOAD_REPO_KEEP
+
+    @property
+    def log_path(self) -> str:
+        return os.path.join(self.home, f"offload-{self.date_tag}.log")
+
+    @property
+    def admin_todo(self) -> str:
+        return os.path.join(self.home, "offload-admin-todo.txt")
+
+    @property
+    def admin_pass(self) -> str:
+        return os.path.join(self.home, "bin", "offload-admin-pass")
+
+
+S = Settings()
+
+
+class Fatal(Exception):
+    """Stop the run: message to stderr, exit code `code`."""
+
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.code = code
+
+
+class PermissionDenied(Exception):
+    """A command hit EACCES: recorded for the admin pass; this target stops here."""
+
+
+# ----------------------------------------------------------------------------
+# Output
+# ----------------------------------------------------------------------------
+
+def _stamp(message: str) -> str:
+    return f"[{time.strftime('%H:%M:%S')}] {message}"
+
+
+def _append_log(line: str) -> None:
+    try:
+        with open(S.log_path, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def log(message: str) -> None:
+    line = _stamp(message)
+    print(line, flush=True)
+    _append_log(line)
+
+
+def warn(message: str) -> None:
+    line = _stamp(f"WARN: {message}")
+    print(line, file=sys.stderr, flush=True)
+    _append_log(line)
+
+
+def die(message: str, code: int = 1):
+    raise Fatal(message, code)
+
+
+def conflict(message: str):
+    die(message, 2)
+
+
+def mode() -> str:
+    return "DRY-RUN" if S.dry else "APPLY"
+
+
+def human(n: int) -> str:
+    """Bytes in numfmt's --to=iec-i style: 500B, 2.4GiB, 13GiB (rounded away from zero)."""
+    if n < 1024:
+        return f"{n}B"
+    units = ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei"]
+    value, i = float(n), 0
+    while value >= 1024 and i < len(units) - 1:
+        value, i = value / 1024, i + 1
+    if value < 10:
+        rounded = math.ceil(value * 10) / 10
+        if rounded < 10:
+            return f"{rounded:.1f}{units[i]}B"
+        value = rounded
+    rounded = math.ceil(value)
+    if rounded >= 1024 and i < len(units) - 1:
+        return f"1.0{units[i + 1]}B"
+    return f"{rounded}{units[i]}B"
+
+
+# ----------------------------------------------------------------------------
+# Configuration: read, never run
+# ----------------------------------------------------------------------------
+
+_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\+?=)(.*)$")
+
+
+def _unquote(raw: str, path: str, lineno: int) -> str:
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1]
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        return os.path.expandvars(raw[1:-1])
+    if re.search(r"[\s;&|`$()<>]", raw) and not raw.startswith("$"):
+        die(f"{path}:{lineno}: quote this value: {raw}")
+    return os.path.expandvars(raw)
+
+
+def parse_conf(path: str) -> list:
+    """Statements in order: (key, op, value), value a str or a list of rows."""
+    statements, lines = [], open(path, encoding="utf-8").read().splitlines()
+    i = 0
+    while i < len(lines):
+        lineno, line = i + 1, lines[i].strip()
+        i += 1
+        if not line or line.startswith("#"):
+            continue
+        m = _ASSIGN.match(line)
+        if not m:
+            die(f"{path}:{lineno}: not a KEY=value or KEY=( ... ) line (offload.conf is read, never run): {line}")
+        key, op, rest = m.group(1), m.group(2), m.group(3).strip()
+        if rest.startswith("("):
+            body = rest[1:]
+            while ")" not in _strip_quoted(body):
+                if i >= len(lines):
+                    die(f"{path}:{lineno}: list for {key} never closes")
+                body += "\n" + lines[i]
+                i += 1
+            inner = body[:_close_paren(body)]
+            items = []
+            for item_line in inner.splitlines():
+                item_line = item_line.strip()
+                if not item_line or item_line.startswith("#"):
+                    continue
+                items.extend(shlex.split(item_line, comments=True))
+            statements.append((key, op, items))
+        else:
+            if op == "+=":
+                die(f"{path}:{lineno}: += needs a ( ... ) list")
+            statements.append((key, op, _unquote(rest, path, lineno)))
+    return statements
+
+
+def _strip_quoted(text: str) -> str:
+    return re.sub(r'"[^"]*"|\'[^\']*\'', "", text)
+
+
+def _close_paren(text: str) -> int:
+    quote = ""
+    for pos, ch in enumerate(text):
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ")":
+            return pos
+    return len(text)
+
+
+def load_config() -> None:
+    S.conf = os.environ.get("OFFLOAD_CONF") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.join(S.home, ".config"), "offload", "offload.conf")
+    S.hot = os.environ.get("OFFLOAD_HOT", "")
+    S.cold = os.environ.get("OFFLOAD_COLD", "")
+    if os.environ.get("OFFLOAD_HEADROOM", "").isdigit():
+        S.headroom = int(os.environ["OFFLOAD_HEADROOM"])
+    S.targets = list(DEFAULT_TARGETS)
+    legacy_apps: list = []
+    if os.path.isfile(S.conf):
+        for key, op, value in parse_conf(S.conf):
+            if key == "OFFLOAD_HOT":
+                S.hot = value
+            elif key == "OFFLOAD_COLD":
+                S.cold = value
+            elif key == "OFFLOAD_TARGETS":
+                S.targets = (S.targets if op == "+=" else []) + list(value)
+            elif key == "OFFLOAD_APPS":
+                legacy_apps = (legacy_apps if op == "+=" else []) + list(value)
+            elif key == "SWEEP_DIRNAMES":
+                SWEEP_DIRNAMES[:] = (SWEEP_DIRNAMES if op == "+=" else []) + list(value)
+            elif key == "OFFLOAD_DRIVES":
+                S.drives = (S.drives if op == "+=" else []) + list(value)
+            elif key == "OFFLOAD_PRIVATE_LABELS":
+                S.private = (S.private if op == "+=" else []) + list(value)
+            elif key == "OFFLOAD_REPO_KEEP":
+                S.extra[key] = (S.extra.get(key, []) if op == "+=" else []) + list(value)
+            elif key == "OFFLOAD_APPROVED_REMOTES":
+                S.approved_remotes = (S.approved_remotes if op == "+=" else []) + list(value)
+            elif key in ("OFFLOAD_HEADROOM", "OFFLOAD_BOOT_FREE_PCT"):
+                if not str(value).isdigit() or not 0 <= int(value) < 100:
+                    die(f"{S.conf}: {key} is a whole percent from 0 to 99, not '{value}'")
+                if key == "OFFLOAD_HEADROOM":
+                    S.headroom = int(value)
+                else:
+                    S.boot_free_pct = int(value)
+    # Legacy OFFLOAD_APPS rows (label|source|bundle) join as app/symlink targets unless the label exists.
+    labels = {row.split("|", 1)[0] for row in S.targets}
+    for row in legacy_apps:
+        label, src, bundle = (row.split("|") + ["", "", ""])[:3]
+        if label not in labels:
+            S.targets.append(f"{label}|app|{src}|HOT/MovedAppData/<U>/{label}|symlink|no|{bundle}")
+
+
+# ----------------------------------------------------------------------------
+# Targets
+# ----------------------------------------------------------------------------
+
+def target_user() -> str:
+    return os.path.basename(S.target_home.rstrip("/"))
+
+
+def expand(path: str, drives: bool = True) -> str:
+    """Replace <TH> <TARGET_HOME> <U> <DATE>; with drives=True also HOT/ and COLD/ (the primary drives)."""
+    path = (path.replace("<TH>", S.target_home).replace("<TARGET_HOME>", S.target_home)
+            .replace("<U>", target_user()).replace("<DATE>", S.date_tag))
+    if drives and path.startswith("HOT/"):
+        path = f"{S.hot}/{path[4:]}"
+    elif drives and path.startswith("COLD/"):
+        path = f"{S.cold}/{path[5:]}"
+    return path
+
+
+def iter_targets(drives: bool = True) -> Iterator[Target]:
+    """Expanded rows. drives=False leaves HOT/ and COLD/ for move_one to resolve against every drive."""
+    for row in S.targets:
+        fields = (row.split("|") + [""] * 7)[:7]
+        t = Target(*fields)
+        yield t._replace(source=expand(t.source), dest=expand(t.dest, drives))
+
+
+def require_drive(name: str) -> str:
+    path = S.hot if name == "OFFLOAD_HOT" else S.cold
+    if not path:
+        die(f"{name} not set. Configure {S.conf} or export {name}.")
+    if not os.path.isdir(path):
+        die(f"{name} not mounted: {path}")
+    return path
+
+
+# ----------------------------------------------------------------------------
+# Filesystem helpers
+# ----------------------------------------------------------------------------
+
+def physical_path(path: str) -> str:
+    return os.path.realpath(path) if os.path.exists(path) else path
+
+
+def colima_disks() -> str:
+    """Colima's VM disk folder: $LIMA_HOME/_disks, else ($COLIMA_HOME or ~/.colima or $XDG_CONFIG_HOME/colima)/_lima/_disks."""
+    colima_home = os.path.join(S.home, ".colima")
+    if not os.path.lexists(colima_home) and os.environ.get("XDG_CONFIG_HOME"):
+        colima_home = os.path.join(os.environ["XDG_CONFIG_HOME"], "colima")
+    lima = os.environ.get("LIMA_HOME") or os.path.join(os.environ.get("COLIMA_HOME") or colima_home, "_lima")
+    return os.path.join(lima, "_disks")
+
+
+def free_bytes(path: str) -> int:
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def nearest_existing(path: str) -> str:
+    while not os.path.isdir(path) and path not in ("/", ""):
+        path = os.path.dirname(path)
+    return path or "/"
+
+
+def du_bytes(path: str) -> int:
+    out = subprocess.run(["du", "-sk", path], capture_output=True, text=True).stdout.split()
+    return int(out[0]) * 1024 if out and out[0].isdigit() else 0
+
+
+def du_human(path: str) -> str:
+    out = subprocess.run(["du", "-sh", path], capture_output=True, text=True).stdout.split()
+    return out[0] if out else "?"
+
+
+def df_avail_human(path: str) -> str:
+    lines = subprocess.run(["df", "-h", path], capture_output=True, text=True).stdout.splitlines()
+    return lines[1].split()[3] if len(lines) > 1 else "?"
+
+
+def readable_dir(path: str) -> bool:
+    return os.path.isdir(path) and os.access(path, os.R_OK | os.X_OK)
+
+
+def is_empty_dir(path: str) -> bool:
+    try:
+        return not os.listdir(path)
+    except OSError:
+        return False
+
+
+def tree_signature(path: str) -> str:
+    """File count and summed logical sizes: allocation differs across volumes, logical bytes do not."""
+    if not os.path.isdir(path):
+        return "files=0 bytes=0"
+    files = total = 0
+    for root, _dirs, names in os.walk(path):  # os.walk does not follow directory links, like find -type f
+        for name in names:
+            try:
+                st = os.lstat(os.path.join(root, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                files += 1
+                total += st.st_size
+    return f"files={files} bytes={total}"
+
+
+def require_free(path: str, need: int) -> None:
+    where = nearest_existing(path)
+    avail = free_bytes(where)
+    if avail < need:
+        die(f"Not enough free on {where}: have {human(avail)}, need {human(need)}")
+    log(f"  OK: {where} has {human(avail)} free (need {human(need)})")
+
+
+def sweep_dirs(root: str) -> Iterator[str]:
+    """Folders named in SWEEP_DIRNAMES under root, not descending into a match."""
+    for here, dirs, _ in os.walk(root):
+        keep = []
+        for name in dirs:
+            full = os.path.join(here, name)
+            if name in SWEEP_DIRNAMES:
+                yield full
+            elif not os.path.islink(full):
+                keep.append(name)
+        dirs[:] = keep
+
+
+# ----------------------------------------------------------------------------
+# Running commands
+# ----------------------------------------------------------------------------
+
+def run(cmd: list) -> None:
+    """Log the command; under --apply run it. EACCES is recorded for the admin pass; other failures stop."""
+    text = shlex.join(cmd)
+    log(f"  RUN: {text}")
+    if S.dry:
+        return
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if proc.stderr:
+        _append_log(proc.stderr.rstrip())
+    if proc.returncode == 0:
+        return
+    if "Permission denied" in proc.stderr or "Operation not permitted" in proc.stderr:
+        warn("  EACCES — recording for admin pass")
+        with open(S.admin_todo, "a") as f:
+            f.write(f"# from {time.strftime('%c')}\n{text}\n")
+        S.admin_needed = True
+        raise PermissionDenied(text)
+    die(f"Command failed (rc={proc.returncode}): {text}")
+
+
+def manual_step(text: str) -> None:
+    log(f"  [MANUALLY] {text}")
+    if not S.dry and sys.stdin.isatty():
+        input("  Press Enter when done (Ctrl-C to abort): ")
+
+
+def assert_admin_invariants() -> None:
+    if S.target_home.rstrip("/") == S.home.rstrip("/"):
+        return
+    user = os.environ.get("USER") or getpass.getuser()
+    if user == target_user():
+        die(f"Refusing to operate on {S.target_home} as '{user}' — Admin mode requires a separate account.")
+    groups = subprocess.run(["id", "-Gn", user], capture_output=True, text=True).stdout.split()
+    if "admin" not in groups:
+        die(f"Current account '{user}' is not in the admin group.")
+
+
+def assert_fda_granted() -> None:
+    probe = os.path.join(S.target_home, "Library", "Messages")
+    if os.path.isdir(probe):
+        try:
+            os.listdir(probe)
+        except PermissionError:
+            die(f"Cannot read {probe} — this Terminal lacks Full Disk Access.\n"
+                "       Fix: System Settings -> Privacy & Security -> Full Disk Access ->\n"
+                "            add this Terminal, then restart Terminal.")
+
+
+# ----------------------------------------------------------------------------
+# Strategies
+# ----------------------------------------------------------------------------
+
+def strategy_symlink(src: str, dst: str, label: str) -> None:
+    log(f"=== {label} (strategy=symlink) ===")
+    if os.path.islink(src):
+        if os.readlink(src) == dst:
+            log(f"  SKIP: {src} already symlinked to {dst}")
+            return
+        conflict(f"{src} is a symlink to '{os.readlink(src)}', not '{dst}'")
+    if not os.path.isdir(src):
+        log(f"  SKIP: {src} missing")
+        return
+    if os.path.lexists(dst):
+        conflict(f"Destination {dst} exists — manual review required")
+    require_free(os.path.dirname(dst), du_bytes(src))
+    log(f"  Source sig: {tree_signature(src)}")
+    run(["mkdir", "-p", os.path.dirname(dst)])
+    run(["rsync", "-a", f"{src}/", f"{dst}/"])
+    if S.dry:
+        return
+    s, d = tree_signature(src), tree_signature(dst)
+    log(f"  Verify: src={s} dst={d}")
+    if s != d:
+        die("Signature mismatch — source preserved")
+    run(["rm", "-rf", src])
+    if os.path.lexists(src):
+        die(f"{src} is still there after rm — not linking; finish by hand")
+    run(["ln", "-s", dst, src])
+    if S.target_home.rstrip("/") != S.home.rstrip("/"):
+        run(["chown", "-R", target_user(), dst])
+    log(f"  DONE: {src} -> {dst}")
+
+
+ROM_WORDS = ("mario", "zelda", "pokemon", "sonic", "metroid", "kirby", "gamecube", "nintendo")
+
+
+def strategy_archive(src: str, dst: str, label: str) -> None:
+    log(f"=== {label} (strategy=archive) ===")
+    if not os.path.isdir(src):
+        log(f"  SKIP: {src} missing")
+        return
+    if label == "Downloads" and S.hot and os.path.isdir(S.hot):
+        roms_dst = os.path.join(S.hot, "ROMs")
+        roms = sorted(e.path for e in os.scandir(src) if e.is_file() and e.name.endswith(".zip")
+                      and any(w in e.name.lower() for w in ROM_WORDS))
+        if roms:
+            log(f"  Pre-filter: {len(roms)} ROM zip(s) -> {roms_dst}")
+            run(["mkdir", "-p", roms_dst])
+            for rom in roms:
+                if os.path.exists(os.path.join(roms_dst, os.path.basename(rom))):
+                    warn(f"    SKIP duplicate: {os.path.basename(rom)}")
+                    continue
+                run(["mv", "-n", rom, f"{roms_dst}/"])
+    if os.path.lexists(dst):
+        conflict(f"Destination {dst} exists — manual review required")
+    require_free(os.path.dirname(dst), du_bytes(src))
+    before = tree_signature(src)
+    log(f"  Source sig: {before}")
+    run(["mkdir", "-p", dst])
+    run(["rsync", "-a", "--remove-source-files", f"{src}/", f"{dst}/"])
+    if not S.dry:
+        after = tree_signature(dst)
+        log(f"  Verify: src={before} dst={after}")
+        if after != before:
+            die(f"Signature mismatch — check {dst} against what is left in {src} before anything else")
+    run(["find", src, "-type", "d", "-empty", "-delete"])
+    run(["mkdir", "-p", src])
+    log(f"  DONE: {src} archived to {dst} (source recreated empty)")
+
+
+def strategy_merge(src: str, dst: str, label: str) -> None:
+    log(f"=== {label} (strategy=merge --update) ===")
+    if not os.path.isdir(src):
+        log(f"  SKIP: {src} missing")
+        return
+    if not os.path.isdir(dst):
+        die(f"{dst} must already exist (merge target)")
+    run(["rsync", "-av", "--update", f"{src}/", f"{dst}/"])
+    if S.dry:
+        return
+    src_files = int(tree_signature(src).split()[0].split("=")[1])
+    dst_files = int(tree_signature(dst).split()[0].split("=")[1])
+    if dst_files < src_files:
+        die(f"Dest has {dst_files} files, src had {src_files} — incomplete")
+    run(["rm", "-rf", src])
+    log(f"  DONE: {src} merged into {dst} (source removed)")
+
+
+def strategy_sweep(src: str, _dst: str, label: str) -> None:
+    log(f"=== {label} (strategy=sweep) ===")
+    if not os.path.isdir(src):
+        log(f"  SKIP: {src} missing")
+        return
+    manual_step("Confirm no active builds running (npm run dev, cargo watch, etc.)")
+    total = 0
+    for folder in sweep_dirs(src):
+        size = du_bytes(folder)
+        total += size
+        log(f"  {size // 1024:>10} KB  {folder}")
+        run(["rm", "-rf", folder])
+    log(f"  Total: {human(total)}")
+
+
+def strategy_purge(src: str, _dst: str, label: str) -> None:
+    log(f"=== {label} (strategy=purge) ===")
+    if not os.path.isdir(src):
+        log(f"  SKIP: {src} missing")
+        return
+    log(f"  Source size: {du_human(src)}")
+    run(["rm", "-rf", src])
+    run(["mkdir", "-p", src])
+    log(f"  DONE: {src} purged (recreated empty)")
+
+
+def strategy_native_ui(_src: str, _dst: str, label: str) -> None:
+    log(f"=== {label} (strategy=native-ui) ===")
+    log("  This target is moved through the owning app's native UI.")
+    log("  See 'offload relocations' for the procedure.")
+
+
+STRATEGIES = {
+    "symlink": ("OFFLOAD_HOT", strategy_symlink),
+    "archive": ("OFFLOAD_COLD", strategy_archive),
+    "merge": ("OFFLOAD_HOT", strategy_merge),
+    "sweep": (None, strategy_sweep),
+    "purge": (None, strategy_purge),
+    "native-ui": (None, strategy_native_ui),
+    "repos": (None, lambda src, dest, label: strategy_repos(src, dest, label)),
+    "cloud": (None, lambda src, dest, label: strategy_cloud(src, dest, label)),
 }
 
-strategy_merge() {
-  local src="$1" dst="$2" label="$3"
-  log "=== $label (strategy=merge --update) ==="
-  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
-  [[ -d "$dst" ]] || die "$dst must already exist (merge target)"
-  do_run "rsync -av --update \"$src/\" \"$dst/\""
-  if [[ $DRY -eq 0 ]]; then
-    local sc dc
-    sc="$(find "$src" -type f | wc -l | tr -d ' ')"
-    dc="$(find "$dst" -type f | wc -l | tr -d ' ')"
-    (( dc >= sc )) || die "Dest has $dc files, src had $sc — incomplete"
-    do_run "rm -rf \"$src\""
-    log "  DONE: $src merged into $dst (source removed)"
-  fi
-}
 
-strategy_sweep() {
-  local src="$1" _dst="$2" label="$3"
-  log "=== $label (strategy=sweep) ==="
-  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
-  manual_step "Confirm no active builds running (npm run dev, cargo watch, etc.)"
+TIERED = ("symlink", "archive")   # strategies whose drive is picked at move time
 
-  local find_args=("-type" "d" "(")
-  local first=1
-  for n in "${SWEEP_DIRNAMES[@]}"; do
-    [[ $first -eq 0 ]] && find_args+=("-o")
-    find_args+=("-name" "$n")
-    first=0
-  done
-  find_args+=(")" "-prune")
 
-  local total_kb=0
-  while IFS= read -r d; do
-    local kb; kb="$(du -sk "$d" 2>/dev/null | awk '{print $1}')"
-    total_kb=$((total_kb + kb))
-    log "  $(printf '%10s KB  %s' "$kb" "$d")"
-    do_run "rm -rf \"$d\""
-  done < <(find "$src" "${find_args[@]}" 2>/dev/null)
-  log "  Total: $(human $((total_kb * 1024)))"
-}
+def split_tier(dest: str) -> tuple:
+    for tier in ("HOT", "COLD", "CLOUD"):
+        if dest.startswith(tier + "/"):
+            return tier, dest[len(tier) + 1:]
+    return "", dest
 
-strategy_native_ui() {
-  local _src="$1" _dst="$2" label="$3"
-  log "=== $label (strategy=native-ui) ==="
-  log "  This target is moved through the owning app's native UI."
-  log "  See 'offload relocations' for the procedure."
-}
 
-strategy_purge() {
-  local src="$1" _dst="$2" label="$3"
-  log "=== $label (strategy=purge) ==="
-  [[ -d "$src" ]] || { log "  SKIP: $src missing"; return 0; }
-  log "  Source size: $(du -sh "$src" 2>/dev/null | awk '{print $1}')"
-  do_run "rm -rf \"$src\""
-  do_run "mkdir -p \"$src\""
-  log "  DONE: $src purged (recreated empty)"
-}
+def same_place(anchor: str, vol: str) -> bool:
+    """anchor sits on vol's device and is reached without a symlink below vol."""
+    if os.stat(anchor).st_dev != os.stat(vol).st_dev:
+        return False
+    expected = os.path.normpath(os.path.join(os.path.realpath(vol), os.path.relpath(anchor, vol)))
+    return os.path.realpath(anchor) == expected
 
-move_one() {
-  local row="$1"
-  IFS='|' read -r label cat src dest strat adm bundle <<<"$row"
 
-  if [[ "$adm" == "yes" && "$TARGET_HOME" == "$HOME" ]]; then
-    warn "  SKIP: $label requires Admin mode. Re-run with --target-home <path> from a separate Admin account whose Terminal has Full Disk Access."
+def resolve_dest(t: Target) -> Optional[str]:
+    """The destination for a tiered move, picked now; None when the row is already done."""
+    tier, rest = split_tier(t.dest)
+    src, vols = t.source, candidates(tier)
+    if os.path.islink(src):
+        target = os.readlink(src)
+        if any(target == f"{v}/{rest}" for v in vols):
+            log(f"=== {t.label} (strategy={t.strategy}) ===")
+            log(f"  SKIP: {src} already symlinked to {target}")
+            return None
+        conflict(f"{src} is a symlink to '{target}', not to {tier}/{rest} on a configured drive")
+    if not os.path.isdir(src):
+        return f"{(vols or [''])[0]}/{rest}"          # the strategy reports it missing
+    if os.stat(os.path.realpath(src)).st_dev != os.stat(S.target_home).st_dev:
+        conflict(f"{src} is not on the boot drive (it resolves to {os.path.realpath(src)}) — manual review required")
+    for v in vols:
+        if os.path.isdir(v) and os.path.lexists(f"{v}/{rest}"):
+            conflict(f"Destination {v}/{rest} exists — manual review required")
+    vol = pick_dest(tier, du_bytes(src), t.label)
+    dest = f"{vol}/{rest}"
+    if not same_place(nearest_existing(os.path.dirname(dest)), vol):
+        conflict(f"{dest} would leave {vol} through a symlink or another device — manual review required")
+    log(f"  Drive: {vol} ({tier})")
+    return dest
+
+
+def move_one(t: Target) -> None:
+    if t.admin == "yes" and S.target_home.rstrip("/") == S.home.rstrip("/"):
+        warn(f"  SKIP: {t.label} requires Admin mode. Re-run with --target-home <path> from a separate "
+             "Admin account whose Terminal has Full Disk Access.")
+        return
+    if t.admin == "yes":
+        assert_admin_invariants()
+        assert_fda_granted()
+    if t.strategy not in STRATEGIES:
+        die(f"unknown strategy '{t.strategy}' for {t.label}")
+    drive, strategy = STRATEGIES[t.strategy]
+    tier, _ = split_tier(t.dest)
+    try:
+        if t.strategy in TIERED and tier:
+            dest = resolve_dest(t)
+            if dest is None:
+                return
+        elif t.strategy in ("repos", "cloud"):
+            dest = t.dest                      # repos picks a drive per repo; cloud resolves CLOUD/ itself
+        else:
+            if drive:
+                require_drive(drive)
+            dest = expand(t.dest)
+        strategy(t.source, dest, t.label)
+    except PermissionDenied:
+        warn(f"  STOPPED: {t.label} needs the admin pass; nothing more is done to it this run")
+
+
+# ----------------------------------------------------------------------------
+# Per-row state
+# ----------------------------------------------------------------------------
+
+def row_bytes(t: Target) -> int:
+    """Bytes offloading this row would reclaim; 0 when done or absent."""
+    src, strat = t.source, t.strategy
+    if strat in ("symlink", "native-ui"):
+        return du_bytes(src) if os.path.isdir(src) and not os.path.islink(src) else 0
+    if strat == "archive":
+        return du_bytes(src) if os.path.isdir(src) and not is_empty_dir(src) else 0
+    if strat == "merge":
+        return du_bytes(src) if os.path.isdir(src) else 0
+    if strat == "sweep":
+        return sum(du_bytes(d) for d in sweep_dirs(src)) if os.path.isdir(src) else 0
+    if strat == "purge":
+        return du_bytes(src) if readable_dir(src) else 0
     return 0
-  fi
-  if [[ "$adm" == "yes" ]]; then
-    assert_admin_invariants
-    assert_fda_granted
-  fi
 
-  case "$strat" in
-    symlink)   require_drive OFFLOAD_HOT;  strategy_symlink "$src" "$dest" "$label" ;;
-    archive)   require_drive OFFLOAD_COLD; strategy_archive "$src" "$dest" "$label" ;;
-    merge)     require_drive OFFLOAD_HOT;  strategy_merge   "$src" "$dest" "$label" ;;
-    sweep)                                 strategy_sweep   "$src" "$dest" "$label" ;;
-    purge)                                 strategy_purge   "$src" "$dest" "$label" ;;
-    native-ui)                             strategy_native_ui "$src" "$dest" "$label" ;;
-    *) die "unknown strategy '$strat' for $label" ;;
-  esac
-}
 
-# ----------------------------------------------------------------------------
-# Per-row state assessment
-# ----------------------------------------------------------------------------
+def row_state(t: Target) -> str:
+    src, strat = t.source, t.strategy
+    if strat == "symlink":
+        if os.path.islink(src):
+            return "symlinked" if os.path.isdir(src) else "broken-symlink"
+        if readable_dir(src):
+            return f"on-disk ({du_human(src)})"
+        return "unreadable" if os.path.isdir(src) else "absent"
+    if strat in ("archive", "purge"):
+        if not os.path.isdir(src):
+            return "absent"
+        if not readable_dir(src):
+            return "unreadable"
+        if is_empty_dir(src):
+            return "empty (likely already archived)" if strat == "archive" else "purged (empty)"
+        return f"on-disk ({du_human(src)})"
+    if strat == "merge":
+        if readable_dir(src):
+            return f"on-disk ({du_human(src)})"
+        return "unreadable" if os.path.isdir(src) else "absent"
+    if strat == "sweep":
+        return f"{sum(1 for _ in sweep_dirs(src))} cruft dirs" if os.path.isdir(src) else "absent"
+    if strat == "native-ui":
+        if os.path.islink(src):
+            return "symlinked (via native UI)"
+        return f"on-disk ({du_human(src)})" if os.path.exists(src) else "absent"
+    if strat == "repos":
+        if not os.path.isdir(src):
+            return "absent"
+        repos = repo_find(src)
+        cold = sum(repo_age_days(p) >= REPO_COLD_DAYS for p in repos)
+        return f"{len(repos)} repos, {cold} cold (see 'offload repos')"
+    return "unknown"
 
-# Bytes that would be reclaimed by offloading this row.
-# 0 if the row is already done (symlinked/archived/merged) or absent.
-# Subshell + set +o pipefail so EACCES on another user's home returns 0
-# instead of crashing the script.
-row_bytes() (
-  set +o pipefail
-  local src="$1" dest="$2" strat="$3"
-  case "$strat" in
-    symlink|native-ui)
-      # On-disk and not yet a symlink -> reclaim = size of source
-      if [[ -d "$src" && ! -L "$src" ]]; then
-        du -sk "$src" 2>/dev/null | awk '{print $1*1024}'
-      else
-        echo 0
-      fi
-      ;;
-    archive)
-      # Source still has content -> reclaim = its size
-      if [[ -d "$src" ]] && [[ -n "$(ls -A "$src" 2>/dev/null)" ]]; then
-        du -sk "$src" 2>/dev/null | awk '{print $1*1024}'
-      else
-        echo 0
-      fi
-      ;;
-    merge)
-      if [[ -d "$src" ]]; then
-        du -sk "$src" 2>/dev/null | awk '{print $1*1024}'
-      else
-        echo 0
-      fi
-      ;;
-    sweep)
-      # Sum sizes of matching subdirs.
-      [[ -d "$src" ]] || { echo 0; return; }
-      local find_args=("-type" "d" "(")
-      local first=1
-      for n in "${SWEEP_DIRNAMES[@]}"; do
-        [[ $first -eq 0 ]] && find_args+=("-o")
-        find_args+=("-name" "$n")
-        first=0
-      done
-      find_args+=(")" "-prune")
-      find "$src" "${find_args[@]}" 2>/dev/null \
-        | xargs -I{} du -sk "{}" 2>/dev/null \
-        | awk '{sum += $1} END {print sum*1024+0}'
-      ;;
-    purge)
-      if [[ -d "$src" && -r "$src" && -x "$src" ]]; then
-        du -sk "$src" 2>/dev/null | awk '{print $1*1024+0}'
-      else
-        echo 0
-      fi
-      ;;
-    *) echo 0 ;;
-  esac
-)
-
-# Real macOS users (UID >= 500, < 10000, non-underscore-prefixed).
-list_real_users() {
-  dscl . -list /Users UniqueID 2>/dev/null \
-    | awk '$2 >= 500 && $2 < 10000 {print $1}' \
-    | grep -v '^_'
-}
-
-row_state() (
-  set +o pipefail
-  local src="$1" dest="$2" strat="$3"
-  case "$strat" in
-    symlink)
-      if [[ -L "$src" ]]; then
-        local tgt; tgt="$(readlink "$src")"
-        if [[ -d "$tgt" ]]; then echo "symlinked"
-        else                    echo "broken-symlink"
-        fi
-      elif [[ -d "$src" && -r "$src" && -x "$src" ]]; then
-        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
-      elif [[ -d "$src" ]]; then
-        echo "unreadable"
-      else
-        echo "absent"
-      fi
-      ;;
-    archive)
-      if [[ ! -d "$src" ]]; then
-        echo "absent"
-      elif [[ ! -r "$src" || ! -x "$src" ]]; then
-        echo "unreadable"
-      elif [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then
-        echo "empty (likely already archived)"
-      else
-        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
-      fi
-      ;;
-    merge)
-      # Dest is intentionally shared across users for merge (single
-      # canonical Clones repo). Only report "merged" when the
-      # caller's own source is gone AND the caller actually owns
-      # data merged in. Without a per-user marker we keep this
-      # conservative: source missing => absent.
-      if [[ -d "$src" ]] && [[ -r "$src" && -x "$src" ]]; then
-        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
-      elif [[ -d "$src" ]]; then
-        echo "unreadable"
-      else
-        echo "absent"
-      fi
-      ;;
-    sweep)
-      if [[ -d "$src" ]]; then
-        local find_args=("-type" "d" "(")
-        local first=1
-        for n in "${SWEEP_DIRNAMES[@]}"; do
-          [[ $first -eq 0 ]] && find_args+=("-o")
-          find_args+=("-name" "$n")
-          first=0
-        done
-        find_args+=(")" "-prune")
-        local count; count="$(find "$src" "${find_args[@]}" 2>/dev/null | wc -l | tr -d ' ')"
-        echo "$count cruft dirs"
-      else
-        echo "absent"
-      fi
-      ;;
-    native-ui)
-      if [[ -L "$src" ]]; then echo "symlinked (via native UI)"
-      elif [[ -e "$src" ]];  then echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
-      else                        echo "absent"
-      fi
-      ;;
-    purge)
-      if [[ ! -d "$src" ]]; then
-        echo "absent"
-      elif [[ ! -r "$src" || ! -x "$src" ]]; then
-        echo "unreadable"
-      elif [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then
-        echo "purged (empty)"
-      else
-        echo "on-disk ($(du -sh "$src" 2>/dev/null | awk '{print $1}'))"
-      fi
-      ;;
-    *) echo "unknown" ;;
-  esac
-)
 
 # ----------------------------------------------------------------------------
-# Subcommand: list
+# list / status / checklist
 # ----------------------------------------------------------------------------
 
-cmd_list_one() {
-  printf '%-16s %-10s %-9s %-7s %-10s %s\n' LABEL CATEGORY STRATEGY ADMIN RECLAIM STATE
-  printf '%-16s %-10s %-9s %-7s %-10s %s\n' ---- -------- -------- ----- ------- -----
-  local prev_cat="" total=0 unreadable=0
-  while IFS='|' read -r label cat src dest strat adm bundle; do
-    if [[ "$cat" != "$prev_cat" && -n "$prev_cat" ]]; then echo ""; fi
-    prev_cat="$cat"
-    local state bytes
-    state="$(row_state "$src" "$dest" "$strat")"
-    bytes="$(row_bytes "$src" "$dest" "$strat")"
-    total=$((total + bytes))
-    case "$state" in unreadable*) unreadable=$((unreadable + 1)) ;; esac
-    local rec="-"
-    (( bytes > 0 )) && rec="$(human $bytes)"
-    printf '%-16s %-10s %-9s %-7s %-10s %s\n' "$label" "$cat" "$strat" "$adm" "$rec" "$state"
-  done < <(iter_targets)
-  echo ""
-  printf 'Potential reclaim from offloading remaining items: %s\n' "$(human $total)"
-  if (( unreadable > 0 )) && [[ "$TARGET_HOME" != "$HOME" ]]; then
-    echo ""
-    echo "Note: $unreadable row(s) marked 'unreadable' — POSIX permissions block"
-    echo "      this account from reading $TARGET_HOME. For a full audit:"
-    echo "        sudo offload --target-home $TARGET_HOME list"
-  fi
-  LAST_TOTAL_BYTES=$total
-}
+LIST_ROW = "{:<16} {:<10} {:<9} {:<7} {:<10} {}"
 
-cmd_list() {
-  if [[ "$LIST_ALL_USERS" -eq 1 ]]; then
-    local grand=0
-    local users; users="$(list_real_users)"
-    [[ -n "$users" ]] || die "no real users found (dscl returned nothing)"
-    for u in $users; do
-      local uh="/Users/$u"
-      [[ -d "$uh" ]] || continue
-      TARGET_HOME="$uh"
-      echo "════════════════════════════════════════════════════════"
-      echo "  /Users/$u   (TARGET_HOME=$TARGET_HOME)"
-      echo "════════════════════════════════════════════════════════"
-      cmd_list_one
-      grand=$((grand + LAST_TOTAL_BYTES))
-      echo
-    done
-    echo "═══════════════════════════════════════════════════════════"
-    printf 'GRAND TOTAL potential reclaim across all users: %s\n' "$(human $grand)"
-    echo "═══════════════════════════════════════════════════════════"
-  else
-    cmd_list_one
-  fi
-}
 
-# ----------------------------------------------------------------------------
-# Subcommand: launch
-# ----------------------------------------------------------------------------
+def cmd_list_one() -> int:
+    print(LIST_ROW.format("LABEL", "CATEGORY", "STRATEGY", "ADMIN", "RECLAIM", "STATE"))
+    print(LIST_ROW.format("----", "--------", "--------", "-----", "-------", "-----"))
+    prev, total, unreadable = "", 0, 0
+    for t in iter_targets():
+        if prev and t.category != prev:
+            print()
+        prev = t.category
+        state, size = row_state(t), row_bytes(t)
+        total += size
+        unreadable += state.startswith("unreadable")
+        print(LIST_ROW.format(t.label, t.category, t.strategy, t.admin, human(size) if size else "-", state))
+    print()
+    print(f"Potential reclaim from offloading remaining items: {human(total)}")
+    if unreadable and S.target_home.rstrip("/") != S.home.rstrip("/"):
+        print()
+        print(f"Note: {unreadable} row(s) marked 'unreadable' — POSIX permissions block")
+        print(f"      this account from reading {S.target_home}. For a full audit:")
+        print(f"        sudo offload --target-home {S.target_home} list")
+    return total
 
-cmd_launch() {
-  local bundle="${1:?usage: offload launch <BundleName>}"
-  local src=""
-  while IFS='|' read -r label cat r_src dest strat adm r_bundle; do
-    if [[ "$bundle" == "$r_bundle" || "$bundle" == "$label" ]]; then
-      src="$r_src"; break
-    fi
-  done < <(iter_targets)
-  if [[ -n "$src" && -L "$src" ]]; then
-    local tgt; tgt="$(readlink "$src")"
-    if [[ ! -d "$tgt" ]]; then
-      osascript -e "display dialog \"Cannot launch $bundle: its data lives at\n\n$tgt\n\nThat volume is not mounted. Plug in the drive and try again.\" buttons {\"OK\"} default button \"OK\" with icon stop" >/dev/null
-      exit 1
-    fi
-  fi
-  exec open -a "$bundle"
-}
 
-# ----------------------------------------------------------------------------
-# Subcommand: status
-# ----------------------------------------------------------------------------
+def real_users() -> List[str]:
+    out = subprocess.run(["dscl", ".", "-list", "/Users", "UniqueID"], capture_output=True, text=True).stdout
+    users = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit() and 500 <= int(parts[1]) < 10000 and not parts[0].startswith("_"):
+            users.append(parts[0])
+    return users
 
-cmd_status() {
-  echo "=== offload v$VERSION  TARGET_HOME=$TARGET_HOME ==="
-  echo "Config: $OFFLOAD_CONF $([[ -f "$OFFLOAD_CONF" ]] && echo '(loaded)' || echo '(not found — using defaults)')"
-  echo
-  echo "=== Disk space ==="
-  local paths=(/)
-  [[ -n "$OFFLOAD_HOT"  && -d "$OFFLOAD_HOT"  ]] && paths+=("$OFFLOAD_HOT")
-  [[ -n "$OFFLOAD_COLD" && -d "$OFFLOAD_COLD" ]] && paths+=("$OFFLOAD_COLD")
-  df -h "${paths[@]}" 2>/dev/null
-  echo
-  echo "=== Targets summary ==="
-  local total=0 symlinked=0 on_disk=0 absent=0 admin_required=0
-  while IFS='|' read -r label cat src dest strat adm bundle; do
-    total=$((total + 1))
-    local s; s="$(row_state "$src" "$dest" "$strat")"
-    case "$s" in
-      symlinked*)            symlinked=$((symlinked + 1)) ;;
-      on-disk*)              on_disk=$((on_disk + 1)) ;;
-      absent)                absent=$((absent + 1)) ;;
-    esac
-    [[ "$adm" == "yes" ]] && admin_required=$((admin_required + 1))
-  done < <(iter_targets)
-  echo "  total: $total | on-disk: $on_disk | symlinked: $symlinked | absent: $absent | admin-only: $admin_required"
-  echo
-  echo "=== Recent log ==="
-  if [[ -f "$LOG" ]]; then tail -n 15 "$LOG"; else echo "(no log yet)"; fi
-  echo
-  echo "=== Admin todo ==="
-  if [[ -s "$ADMIN_TODO" ]]; then cat "$ADMIN_TODO"; else echo "(empty)"; fi
-}
 
-# ----------------------------------------------------------------------------
-# Subcommand: checklist
-# ----------------------------------------------------------------------------
+def cmd_list(_args: list) -> None:
+    if not S.all_users:
+        cmd_list_one()
+        return
+    users = real_users()
+    if not users:
+        die("no real users found (dscl returned nothing)")
+    grand, bar = 0, "═" * 56
+    for user in users:
+        if not os.path.isdir(f"/Users/{user}"):
+            continue
+        S.target_home = f"/Users/{user}"
+        print(bar)
+        print(f"  /Users/{user}   (TARGET_HOME={S.target_home})")
+        print(bar)
+        grand += cmd_list_one()
+        print()
+    print("═" * 59)
+    print(f"GRAND TOTAL potential reclaim across all users: {human(grand)}")
+    print("═" * 59)
 
-cmd_checklist() {
-  cat <<HEADER
-# Offload checklist (live — generated by \`offload checklist\`)
-# Target home: $TARGET_HOME
-# HOT  drive:  ${OFFLOAD_HOT:-<not configured>}
-# COLD drive:  ${OFFLOAD_COLD:-<not configured>}
+
+def cmd_status(_args: list) -> None:
+    print(f"=== offload v{VERSION}  TARGET_HOME={S.target_home} ===")
+    print(f"Config: {S.conf} {'(loaded)' if os.path.isfile(S.conf) else '(not found — using defaults)'}")
+    print()
+    print("=== Disk space ===")
+    paths = ["/"] + [p for p in (S.hot, S.cold) if p and os.path.isdir(p)]
+    sys.stdout.write(subprocess.run(["df", "-h", *paths], capture_output=True, text=True).stdout)
+    print()
+    print("=== Targets summary ===")
+    total = symlinked = on_disk = absent = admin = 0
+    for t in iter_targets():
+        total += 1
+        state = row_state(t)
+        symlinked += state.startswith("symlinked")
+        on_disk += state.startswith("on-disk")
+        absent += state == "absent"
+        admin += t.admin == "yes"
+    print(f"  total: {total} | on-disk: {on_disk} | symlinked: {symlinked} | absent: {absent} | admin-only: {admin}")
+    print()
+    print("=== Recent log ===")
+    if os.path.isfile(S.log_path):
+        print("\n".join(open(S.log_path).read().splitlines()[-15:]))
+    else:
+        print("(no log yet)")
+    print()
+    print("=== Admin todo ===")
+    if os.path.isfile(S.admin_todo) and os.path.getsize(S.admin_todo):
+        sys.stdout.write(open(S.admin_todo).read())
+    else:
+        print("(empty)")
+
+
+def cmd_checklist(_args: list) -> None:
+    print(f"""# Offload checklist (live — generated by `offload checklist`)
+# Target home: {S.target_home}
+# HOT  drive:  {S.hot or '<not configured>'}
+# COLD drive:  {S.cold or '<not configured>'}
 
 ## Pre-flight
-- [ ] HOT mounted (\`ls "$OFFLOAD_HOT"\` works)
-- [ ] COLD mounted (\`ls "$OFFLOAD_COLD"\` works)
+- [ ] HOT mounted (`ls "{S.hot}"` works)
+- [ ] COLD mounted (`ls "{S.cold}"` works)
 - [ ] No active builds running
 - [ ] Time Machine has a recent backup
 
-## Targets (live state)
-HEADER
-  local prev_cat=""
-  while IFS='|' read -r label cat src dest strat adm bundle; do
-    if [[ "$cat" != "$prev_cat" ]]; then
-      echo ""
-      echo "### $cat"
-      prev_cat="$cat"
-    fi
-    local s; s="$(row_state "$src" "$dest" "$strat")"
-    local mark="[ ]"
-    case "$s" in
-      symlinked*|merged|archived*) mark="[x]" ;;
-    esac
-    printf -- '- %s %-16s %-9s %s\n' "$mark" "$label" "$strat" "$s"
-    if [[ "$adm" == "yes" ]]; then
-      printf -- '      Admin only: offload protected --target-home %s %s --apply\n' "$TARGET_HOME" "$label"
-    elif [[ "$strat" == "native-ui" ]]; then
-      printf -- '      See: offload media-libraries\n'
-    else
-      printf -- '      offload move %s --apply' "$label"
-      [[ -n "$bundle" && "$bundle" != "-" ]] && printf -- '  &&  offload launch "%s"' "$bundle"
-      printf -- '\n'
-    fi
-  done < <(iter_targets)
-
-  cat <<'FOOTER'
-
+## Targets (live state)""")
+    prev = ""
+    for t in iter_targets():
+        if t.category != prev:
+            print()
+            print(f"### {t.category}")
+            prev = t.category
+        state = row_state(t)
+        done = state.startswith(("symlinked", "archived")) or state == "merged"
+        print(f"- {'[x]' if done else '[ ]'} {t.label:<16} {t.strategy:<9} {state}")
+        if t.admin == "yes":
+            print(f"      Admin only: offload protected --target-home {S.target_home} {t.label} --apply")
+        elif t.strategy == "native-ui":
+            print("      See: offload media-libraries")
+        else:
+            launch = f'  &&  offload launch "{t.bundle}"' if t.bundle and t.bundle != "-" else ""
+            print(f"      offload move {t.label} --apply{launch}")
+    print("""
 ## Final
 - [ ] Boot drive has comfortable headroom (offload status)
-- [ ] If ~/offload-admin-todo.txt non-empty: review then `sudo bash ~/bin/offload-admin-pass`
-FOOTER
-}
+- [ ] If ~/offload-admin-todo.txt non-empty: review then `sudo bash ~/bin/offload-admin-pass`""")
+
 
 # ----------------------------------------------------------------------------
-# Subcommand: media-libraries
+# relocations
 # ----------------------------------------------------------------------------
 
-cmd_relocations() {
-  local disks dest="${OFFLOAD_HOT:-<HOT>}/Colima/_disks"; disks="$(colima_disks)"
-  cat <<EOS
-=== Native-UI relocations (the script never auto-moves these) ===
+def cmd_relocations(_args: list) -> None:
+    hot = S.hot or "<HOT>"
+    disks, dest = colima_disks(), f"{hot}/Colima/_disks"
+    print(f"""=== Native-UI relocations (the script never auto-moves these) ===
 Some apps cache the absolute path to their data internally. A
 symlink works most of the time, but the native UIs handle the
 transition cleanly including index rebuilds and metadata fixups.
 Use these for: Docker Desktop, Colima, OrbStack, Photos, Music, iMovie,
 Final Cut.
 
-Suggested destinations (HOT drive: ${OFFLOAD_HOT:-<not configured>}):
+Suggested destinations (HOT drive: {S.hot or '<not configured>'}):
 
 Docker Desktop disk image (typically the biggest single win)
   1. Quit any running containers.
   2. Docker Desktop > Settings > Resources > Advanced > Disk image location.
-  3. Change to ${OFFLOAD_HOT:-<HOT>}/Docker/
+  3. Change to {hot}/Docker/
   4. Apply & Restart. Docker copies the image to the new location
      and keeps the old until you confirm.
   5. After it boots cleanly: 'docker ps' should work and
@@ -950,36 +1199,29 @@ Docker Desktop disk image (typically the biggest single win)
   6. The original ~/Library/Containers/com.docker.docker can then be
      deleted from Docker's UI prompt (or manually after verification).
 
-Colima VM disks (Colima has no setting for this; a symlink does it)
-EOS
-  if [[ "$(physical_path "$disks")" == "$(physical_path "$dest")" ]]; then
-    cat <<EOS
-  Already done: "$disks" resolves to "$dest".
-  That folder holds the live VM disks. Keep it.
-EOS
-  else
-    cat <<EOS
-  1. Stop every Colima VM: 'colima list' names them, then
+Colima VM disks (Colima has no setting for this; a symlink does it)""")
+    if physical_path(disks) == physical_path(dest):
+        print(f"""  Already done: "{disks}" resolves to "{dest}".
+  That folder holds the live VM disks. Keep it.""")
+    else:
+        print(f"""  1. Stop every Colima VM: 'colima list' names them, then
      'colima stop --profile NAME' for each.
-  2. mkdir -p "${OFFLOAD_HOT:-<HOT>}/Colima"
-     cp -aH "$disks" "${OFFLOAD_HOT:-<HOT>}/Colima/"
+  2. mkdir -p "{hot}/Colima"
+     cp -aH "{disks}" "{hot}/Colima/"
      cp keeps the disks sparse on an APFS drive; rsync writes each one
      out at full size. -H copies the disks, not the link, when _disks
      already links to another drive. If cp fails, stop here.
-  3. mv "$disks" "$disks.old"
-     ln -s "$dest" "$disks"
+  3. mv "{disks}" "{disks}.old"
+     ln -s "{dest}" "{disks}"
   4. Start each VM: 'docker ps' should list your containers and
      'docker run --rm hello-world' should succeed.
-  5. Then delete "$disks.old".
-     If it was a link to a folder other than "$dest",
-     that folder holds the old disks: delete it too.
-EOS
-  fi
-  cat <<EOS
-
+  5. Then delete "{disks}.old".
+     If it was a link to a folder other than "{dest}",
+     that folder holds the old disks: delete it too.""")
+    print(f"""
 OrbStack data
   1. OrbStack > Settings > Storage > Data location.
-  2. Change to ${OFFLOAD_HOT:-<HOT>}/OrbStack/
+  2. Change to {hot}/OrbStack/
   3. OrbStack starts empty there: it does not copy your containers,
      images or volumes. The old disk stays in
      ~/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data
@@ -990,7 +1232,7 @@ OrbStack data
 
 Photos Library
   1. Quit Photos.
-  2. Move ~/Pictures/Photos\ Library.photoslibrary to ${OFFLOAD_HOT:-<HOT>}/
+  2. Move ~/Pictures/Photos\\ Library.photoslibrary to {hot}/
   3. Hold Option (⌥) while launching Photos.
   4. Click "Other Library..." and pick the moved bundle.
   5. Photos > Settings > General > Use as System Photo Library.
@@ -998,617 +1240,1406 @@ Photos Library
 Music.app Library
   1. Quit Music.
   2. Music > Settings > Files > Music Media folder location > Change…
-  3. Point at ${OFFLOAD_HOT:-<HOT>}/Music\ Media (creates folder).
+  3. Point at {hot}/Music\\ Media (creates folder).
   4. File > Library > Organize Library… > Consolidate files.
-  5. Move ~/Music/Music/Music\ Library.musiclibrary to the new location
+  5. Move ~/Music/Music/Music\\ Library.musiclibrary to the new location
      via File > Library > Choose Library… if you also want metadata external.
 
 iMovie / Final Cut Pro Library
   1. Quit iMovie / Final Cut.
-  2. Move ~/Movies/iMovie\ Library.imovielibrary to ${OFFLOAD_HOT:-<HOT>}/
+  2. Move ~/Movies/iMovie\\ Library.imovielibrary to {hot}/
   3. Double-click the moved .imovielibrary bundle to relaunch from new location.
-  4. (Final Cut: File > Open Library… > select the moved .fcpbundle.)
-EOS
-}
+  4. (Final Cut: File > Open Library… > select the moved .fcpbundle.)""")
 
-# Backward compatibility — 'media-libraries' was the v0.2.x name.
-cmd_media_libraries() { cmd_relocations; }
 
 # ----------------------------------------------------------------------------
-# Reporting
+# launch / move / protected
 # ----------------------------------------------------------------------------
 
-report_space() {
-  log "--- Space ($(mode)) ---"
-  log "  Boot:       $(df -h / | awk 'NR==2 {print $4}') free"
-  [[ -n "$OFFLOAD_HOT"  ]] && log "  HOT  ($OFFLOAD_HOT):  $(df -h "$OFFLOAD_HOT" 2>/dev/null | awk 'NR==2 {print $4}') free"
-  [[ -n "$OFFLOAD_COLD" ]] && log "  COLD ($OFFLOAD_COLD): $(df -h "$OFFLOAD_COLD" 2>/dev/null | awk 'NR==2 {print $4}') free"
-}
+def cmd_launch(args: list) -> None:
+    if not args:
+        die("usage: offload launch <BundleName>")
+    bundle = args[0]
+    src = next((t.source for t in iter_targets() if bundle in (t.bundle, t.label)), "")
+    if src and os.path.islink(src) and not os.path.isdir(os.readlink(src)):
+        target = os.readlink(src)
+        subprocess.run(["osascript", "-e", f'display dialog "Cannot launch {bundle}: its data lives at\\n\\n{target}'
+                        '\\n\\nThat volume is not mounted. Plug in the drive and try again." buttons {"OK"} '
+                        'default button "OK" with icon stop'], stdout=subprocess.DEVNULL)
+        sys.exit(1)
+    sys.stdout.flush()
+    os.execvp("open", ["open", "-a", bundle])
 
-emit_admin_pass() {
-  [[ -s "$ADMIN_TODO" ]] || return 0
-  log "  Admin items found; emitting $ADMIN_PASS"
-  {
-    echo '#!/usr/bin/env bash'
-    echo '# offload-admin-pass — REVIEW EVERY LINE before running.'
-    echo '# Then: sudo bash '"$ADMIN_PASS"
-    echo '# Generated by offload on '"$(date)"
-    echo 'set -euo pipefail'
-    echo ''
-    cat "$ADMIN_TODO"
-  } > "$ADMIN_PASS"
-  chmod +x "$ADMIN_PASS"
-  warn "Admin-pass script at $ADMIN_PASS — REVIEW EVERY LINE before sudo'ing"
-}
+
+def report_space() -> None:
+    log(f"--- Space ({mode()}) ---")
+    log(f"  Boot:       {df_avail_human('/')} free")
+    if S.hot:
+        log(f"  HOT  ({S.hot}):  {df_avail_human(S.hot)} free")
+    if S.cold:
+        log(f"  COLD ({S.cold}): {df_avail_human(S.cold)} free")
+    for drive in S.drives:
+        log(f"  DRIVE ({drive}): {df_avail_human(drive)} free")
+
+
+def emit_admin_pass() -> None:
+    if not (os.path.isfile(S.admin_todo) and os.path.getsize(S.admin_todo)):
+        return
+    log(f"  Admin items found; emitting {S.admin_pass}")
+    os.makedirs(os.path.dirname(S.admin_pass), exist_ok=True)
+    with open(S.admin_pass, "w") as f:
+        f.write("#!/usr/bin/env bash\n# offload-admin-pass — REVIEW EVERY LINE before running.\n"
+                f"# Then: sudo bash {S.admin_pass}\n# Generated by offload on {time.strftime('%c')}\n"
+                "set -euo pipefail\n\n" + open(S.admin_todo).read())
+    os.chmod(S.admin_pass, 0o755)
+    warn(f"Admin-pass script at {S.admin_pass} — REVIEW EVERY LINE before sudo'ing")
+
+
+def cmd_move(args: list) -> None:
+    if not args or args[0] == "--apply":
+        die("usage: offload move <Label-or-category> [--apply]")
+    needle = args[0]
+    if "--apply" in args[1:]:
+        S.dry = False
+    S.synced_ok = "--synced-ok" in args[1:]
+    S.upload = "--upload" in args[1:]
+    assert_admin_invariants()
+    log("=============================================")
+    log(f"offload v{VERSION} move  needle={needle}  mode={mode()}  TARGET_HOME={S.target_home}")
+    log("=============================================")
+    report_space()
+    matched = [t for t in iter_targets(drives=False) if needle in (t.label, t.category)]
+    if not matched:
+        die(f"no targets matched '{needle}' — see 'offload list'")
+    for t in matched:
+        move_one(t)
+    report_space()
+    emit_admin_pass()
+    log(f"Done. Log: {S.log_path}")
+    if S.admin_needed:
+        sys.exit(3)
+
+
+def cmd_protected(args: list) -> None:
+    if not args:
+        die("usage: offload protected --target-home <path> <Label> [--apply]")
+    if S.target_home.rstrip("/") == S.home.rstrip("/"):
+        die("'protected' requires --target-home pointing at a DIFFERENT user's home.")
+    cmd_move(args)
+
 
 # ----------------------------------------------------------------------------
-# Subcommand: move <Label-or-category>
-# ----------------------------------------------------------------------------
-
-cmd_move() {
-  local needle="${1:?usage: offload move <Label-or-category> [--apply]}"; shift || true
-  for a in "$@"; do
-    case "$a" in --apply) DRY=0 ;; esac
-  done
-
-  assert_admin_invariants
-
-  log "============================================="
-  log "offload v$VERSION move  needle=$needle  mode=$(mode)  TARGET_HOME=$TARGET_HOME"
-  log "============================================="
-  report_space
-
-  local matched=0
-  while IFS='|' read -r label cat src dest strat adm bundle; do
-    if [[ "$needle" == "$label" || "$needle" == "$cat" ]]; then
-      move_one "$label|$cat|$src|$dest|$strat|$adm|$bundle"
-      matched=$((matched + 1))
-    fi
-  done < <(iter_targets)
-
-  [[ $matched -gt 0 ]] || die "no targets matched '$needle' — see 'offload list'"
-
-  report_space
-  emit_admin_pass
-  log "Done. Log: $LOG"
-}
-
-# ----------------------------------------------------------------------------
-# Subcommand: protected (move with admin gating reinforced)
-# ----------------------------------------------------------------------------
-
-cmd_protected() {
-  local needle="${1:?usage: offload protected --target-home <path> <Label> [--apply]}"; shift || true
-  [[ "$TARGET_HOME" != "$HOME" ]] \
-    || die "'protected' requires --target-home pointing at a DIFFERENT user's home."
-  cmd_move "$needle" "$@"
-}
-
-# ----------------------------------------------------------------------------
-# Subcommand: drain — make room on a full HOT drive by moving to COLD
+# drain — make room on a full HOT drive by moving to COLD
 # ----------------------------------------------------------------------------
 # A full HOT drive breaks whatever grows on it: Docker Desktop's sparse
 # Docker.raw turns every VM write into "input/output error" once the host
 # volume is out of space (the 3.2.0 AI-UI release died this way, 2026-09-26).
-#
 # One scan gives every top-level entry a size, a last-touched age, and a
 # status with its reason: cold (safe to suggest), warm (touched recently),
 # live (a sync app, an active git repo, or a file open right now), or skip
 # (owned by offload, a VM disk, a media library, drained already).
-# Loose files in the drive root are grouped by kind (@loose-archives ...).
 
-DRAIN_WARM_DAYS="${DRAIN_WARM_DAYS:-30}"
-
-# Prints key $2 of the JSON object in file $1, if both exist.
-json_key() {
-  [[ -f "$1" ]] || return 0
-  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$1" "$2" 2>/dev/null || true
-}
-
-# The folders that hold Docker Desktop's, Colima's and OrbStack's VM disks,
-# as each runtime is set up. A drain must never take one: rsync writes a sparse
-# disk out at full size, and the size check cannot see a VM that wrote to its
-# disk mid-copy, since a disk image keeps its size.
-vm_disk_dirs() {
-  json_key "$HOME/Library/Group Containers/group.com.docker/settings-store.json" DataFolder
-  colima_disks
-  # Colima may run without the environment this shell has.
-  echo "$HOME/.colima/_lima/_disks"
-  echo "$HOME/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data"
-  json_key "$HOME/.orbstack/vmconfig.json" data_dir
-}
-
-# Top-level names on HOT that offload itself owns, plus the VM disk folders.
-drain_protected() {
-  local rel dir hot
-  while IFS='|' read -r _ _ _ dest _ _ _; do
-    [[ "$dest" == "$OFFLOAD_HOT"/* ]] || continue
-    rel="${dest#"$OFFLOAD_HOT"/}"; echo "${rel%%/*}"
-  done < <(iter_targets)
-  # Compare physical paths: _disks is often a symlink into HOT. A VM folder
-  # that is the HOT root itself keeps every entry, since its disks sit loose.
-  # A glob, not ls: CLICOLOR_FORCE makes ls wrap names in colour codes.
-  hot="$(cd -P "$OFFLOAD_HOT" && pwd -P)"
-  while IFS= read -r dir; do
-    dir="$(physical_path "$dir")"
-    if [[ "$dir" == "$hot"/* ]]; then rel="${dir#"$hot"/}"; echo "${rel%%/*}"
-    elif [[ "$dir" == "$hot" ]]; then (cd "$hot" && printf '%s\n' *); fi
-  done < <(vm_disk_dirs)
-}
-
-# Scan HOT. Prints, tab-separated:
-#   E <name> <bytes> <days-since-touched> <status> <reason>   one per entry or @group
-#   M <@group> <file>                                        one per group member
-drain_scan() {
-  DRAIN_PROTECTED="$(drain_protected | sort -u)" python3 - "$OFFLOAD_HOT" "$DRAIN_WARM_DAYS" <<'PY'
-import os, subprocess, sys, time
-
-hot, warm_days = sys.argv[1], int(sys.argv[2])
-protected = set(filter(None, os.environ.get("DRAIN_PROTECTED", "").split("\n")))
-now = time.time()
-MEDIA = (".photoslibrary", ".musiclibrary", ".imovielibrary", ".fcpbundle")
-SYNC = {".stfolder": "Syncthing", ".stignore": "Syncthing", ".sync": "Resilio Sync",
-        ".dropbox": "Dropbox", ".dropbox.cache": "Dropbox", ".owncloudsync.log": "Nextcloud",
-        ".SynologyWorkingDirectory": "Synology Drive"}
+DRAIN_WARM_DAYS = int(os.environ.get("DRAIN_WARM_DAYS", "30"))
+MEDIA_SUFFIXES = (".photoslibrary", ".musiclibrary", ".imovielibrary", ".fcpbundle")
+SYNC_MARKERS = {".stfolder": "Syncthing", ".stignore": "Syncthing", ".sync": "Resilio Sync",
+                ".dropbox": "Dropbox", ".dropbox.cache": "Dropbox", ".owncloudsync.log": "Nextcloud",
+                ".SynologyWorkingDirectory": "Synology Drive"}
 KINDS = {"archives": ".7z .zip .rar .tar .gz .tgz .xz .bz2 .iso .dmg .pkg",
          "videos": ".mp4 .mov .m4v .mkv .avi .webm",
          "audio": ".mp3 .wav .aif .aiff .flac .m4a .mid .midi",
          "images": ".jpg .jpeg .png .heic .tif .tiff .gif .psd .raw .dng",
          "documents": ".pdf .doc .docx .ppt .pptx .key .pages .numbers .xls .xlsx"}
-KIND = {ext: k for k, exts in KINDS.items() for ext in exts.split()}
+KIND_OF = {ext: kind for kind, exts in KINDS.items() for ext in exts.split()}
 
-# Files open right now, by top-level entry: one lsof call for the whole system.
-open_by = {}
-try:
-    out = subprocess.run(["lsof", "-w", "-Fcn"], capture_output=True, text=True, timeout=60).stdout
+
+class Entry(NamedTuple):
+    name: str
+    size: int
+    days: int
+    status: str
+    reason: str
+
+
+def json_key(path: str, key: str) -> str:
+    try:
+        return str(json.load(open(path)).get(key) or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def vm_disk_dirs() -> List[str]:
+    """Folders that hold Docker Desktop's, Colima's and OrbStack's VM disks, as each runtime is set up."""
+    dirs = [json_key(os.path.join(S.home, "Library/Group Containers/group.com.docker/settings-store.json"), "DataFolder"),
+            colima_disks(), os.path.join(S.home, ".colima/_lima/_disks"),
+            os.path.join(S.home, "Library/Group Containers/HUAQ24HBR6.dev.orbstack/data"),
+            json_key(os.path.join(S.home, ".orbstack/vmconfig.json"), "data_dir")]
+    return [d for d in dirs if d]
+
+
+def drain_protected() -> set:
+    """Top-level names on HOT that offload owns, plus the folders holding VM disks."""
+    names = set()
+    for t in iter_targets():
+        if t.dest.startswith(S.hot + "/"):
+            names.add(t.dest[len(S.hot) + 1:].split("/", 1)[0])
+    hot = os.path.realpath(S.hot)
+    for folder in vm_disk_dirs():
+        real = physical_path(folder)
+        if real.startswith(hot + "/"):
+            names.add(real[len(hot) + 1:].split("/", 1)[0])
+        elif real == hot:
+            names.update(n for n in os.listdir(hot) if not n.startswith("."))
+    return names
+
+
+def open_files_by_entry(hot: str) -> dict:
+    """Top-level entry -> command holding a file open there: one lsof call for the whole system."""
+    found = {}
+    try:
+        out = subprocess.run(["lsof", "-w", "-Fcn"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return found
     cmd = "?"
     for line in out.splitlines():
-        if line[:1] == "c": cmd = line[1:]
-        elif line[:1] == "n" and line.startswith("n" + hot + "/"):
-            top = line[len(hot) + 2:].split("/", 1)[0]
-            open_by.setdefault(top, cmd)
-except (OSError, subprocess.SubprocessError):
-    pass
+        if line[:1] == "c":
+            cmd = line[1:]
+        elif line.startswith("n" + hot + "/"):
+            found.setdefault(line[len(hot) + 2:].split("/", 1)[0], cmd)
+    return found
 
-def walk(path):
-    """bytes, newest mtime, live reason ('' if none), for a file or a tree."""
+
+def walk_entry(path: str, now: float) -> tuple:
+    """Allocated bytes, newest mtime, live reason ('' if none), for a file or a tree."""
     try:
         st = os.lstat(path)
     except OSError:
-        return 0, 0, ""
+        return 0, 0.0, ""
     size, newest, live = st.st_blocks * 512, st.st_mtime, ""
     stack = [(path, 0)] if os.path.isdir(path) and not os.path.islink(path) else []
     while stack:
-        d, depth = stack.pop()
+        folder, depth = stack.pop()
         try:
-            it = os.scandir(d)
+            entries = list(os.scandir(folder))
         except OSError:
             continue
-        with it:
-            for e in it:
-                try:
-                    s = e.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                size += s.st_blocks * 512
-                newest = max(newest, s.st_mtime)
-                if not live and depth <= 3:
-                    if e.name in SYNC or (e.name.startswith((".sync_", "._sync_")) and e.name.endswith(".db")):
-                        live = SYNC.get(e.name, "Nextcloud") + " folder"
-                    elif e.name == ".git" and e.is_dir(follow_symlinks=False):
-                        for probe in ("index", "logs/HEAD", "FETCH_HEAD"):
-                            try:
-                                age = (now - os.stat(os.path.join(e.path, probe)).st_mtime) / 86400
-                            except OSError:
-                                continue
-                            if age < warm_days:
-                                live = f"git repo active {int(age)} d ago"
-                                break
-                if e.is_dir(follow_symlinks=False):
-                    stack.append((e.path, depth + 1))
+        for e in entries:
+            try:
+                s = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            size += s.st_blocks * 512
+            newest = max(newest, s.st_mtime)
+            if not live and depth <= 3:
+                if e.name in SYNC_MARKERS or (e.name.startswith((".sync_", "._sync_")) and e.name.endswith(".db")):
+                    live = SYNC_MARKERS.get(e.name, "Nextcloud") + " folder"
+                elif e.name == ".git" and e.is_dir(follow_symlinks=False):
+                    for probe in ("index", "logs/HEAD", "FETCH_HEAD"):
+                        try:
+                            age = (now - os.stat(os.path.join(e.path, probe)).st_mtime) / 86400
+                        except OSError:
+                            continue
+                        if age < DRAIN_WARM_DAYS:
+                            live = f"git repo active {int(age)} d ago"
+                            break
+            if e.is_dir(follow_symlinks=False):
+                stack.append((e.path, depth + 1))
     return size, newest, live
 
-def row(name, size, newest, status, reason):
-    days = int((now - newest) / 86400) if newest else -1
-    print(f"E\t{name}\t{size}\t{days}\t{status}\t{reason}")
 
-def files(n):
-    return f"{n} file" + ("" if n == 1 else "s")
+def drain_scan(hot: str) -> tuple:
+    """Entries (one per top-level item or @loose group) and group members."""
+    now, protected, open_by = time.time(), drain_protected(), open_files_by_entry(hot)
+    entries, groups = [], {}
 
-groups = {}
-for name in sorted(os.listdir(hot)):
-    if name.startswith("."):
-        continue
-    path = os.path.join(hot, name)
-    if os.path.islink(path):
-        row(name, 0, 0, "skip", "drained already: " + os.readlink(path)); continue
-    if name.endswith(MEDIA):
-        row(name, 0, 0, "skip", "media library: use 'offload relocations'"); continue
-    if name in protected:
-        row(name, 0, 0, "skip", "owned by offload or a VM disk"); continue
-    if os.path.isfile(path):
-        groups.setdefault("@loose-" + KIND.get(os.path.splitext(name)[1].lower(), "other"), []).append(name)
-        continue
-    size, newest, live = walk(path)
-    days = (now - newest) / 86400
-    if name in open_by:
-        row(name, size, newest, "live", f"open by {open_by[name]}")
-    elif live:
-        row(name, size, newest, "live", live)
-    elif days < warm_days:
-        row(name, size, newest, "warm", f"touched {int(days)} d ago")
+    def add(name, size, newest, status, reason):
+        entries.append(Entry(name, size, int((now - newest) / 86400) if newest else -1, status, reason))
+
+    for name in sorted(os.listdir(hot)):
+        if name.startswith("."):
+            continue
+        path = os.path.join(hot, name)
+        if os.path.islink(path):
+            add(name, 0, 0, "skip", "drained already: " + os.readlink(path))
+        elif name.endswith(MEDIA_SUFFIXES):
+            add(name, 0, 0, "skip", "media library: use 'offload relocations'")
+        elif name in protected:
+            add(name, 0, 0, "skip", "owned by offload or a VM disk")
+        elif os.path.isfile(path):
+            groups.setdefault("@loose-" + KIND_OF.get(os.path.splitext(name)[1].lower(), "other"), []).append(name)
+        else:
+            size, newest, live = walk_entry(path, now)
+            days = (now - newest) / 86400
+            if name in open_by:
+                add(name, size, newest, "live", f"open by {open_by[name]}")
+            elif live:
+                add(name, size, newest, "live", live)
+            elif days < DRAIN_WARM_DAYS:
+                add(name, size, newest, "warm", f"touched {int(days)} d ago")
+            else:
+                add(name, size, newest, "cold", "")
+    for group, members in sorted(groups.items()):
+        size, newest = 0, 0.0
+        for m in members:
+            s, n, _ = walk_entry(os.path.join(hot, m), now)
+            size, newest = size + s, max(newest, n)
+        files = f"{len(members)} file" + ("" if len(members) == 1 else "s")
+        opened = [m for m in members if m in open_by]
+        days = (now - newest) / 86400
+        if opened:
+            add(group, size, newest, "live", f"{opened[0]} open by {open_by[opened[0]]}")
+        elif days < DRAIN_WARM_DAYS:
+            add(group, size, newest, "warm", f"{files}, newest touched {int(days)} d ago")
+        else:
+            add(group, size, newest, "cold", files)
+    return entries, groups
+
+
+def drain_age(days: int) -> str:
+    if days < 0:
+        return "-"
+    if days < 14:
+        return f"{days} d"
+    if days < 90:
+        return f"{days // 7} wk"
+    if days < 730:
+        return f"{days // 30} mo"
+    return f"{days // 365} yr"
+
+
+def drain_sig(path: str) -> str:
+    return tree_signature(path) if os.path.isdir(path) else f"files=1 bytes={os.lstat(path).st_size}"
+
+
+def drain_one(name: str, dest_root: str) -> None:
+    src, dst = os.path.join(S.hot, name), os.path.join(dest_root, name)
+    log(f"=== drain {name} ===")
+    if not os.path.lexists(src):
+        die(f"{src} does not exist")
+    if os.path.lexists(dst):
+        conflict(f"Destination {dst} exists — manual review required")
+    log(f"  Source sig: {drain_sig(src)}")
+    run(["mkdir", "-p", dest_root])
+    run(["rsync", "-a", f"{src}/", f"{dst}/"] if os.path.isdir(src) else ["rsync", "-a", src, dst])
+    if S.dry:
+        return
+    s, d = drain_sig(src), drain_sig(dst)
+    log(f"  Verify: src={s} dst={d}")
+    if s != d:
+        die("Signature mismatch — source preserved")
+    run(["rm", "-rf", src])
+    if os.path.lexists(src):
+        die(f"{src} is still there after rm — not linking; finish by hand")
+    run(["ln", "-s", dst, src])
+    log(f"  DONE: {src} -> {dst}")
+
+
+UNSAFE_NAME = re.compile(r'["$`\\]')
+
+
+def cmd_drain(args: list) -> None:
+    need_gib, names = 30, []
+    i = 0
+    while i < len(args):
+        if args[i] == "--apply":
+            S.dry = False
+        elif args[i] == "--need":
+            if i + 1 >= len(args):
+                die("--need takes a number of GiB")
+            need_gib, i = args[i + 1], i + 1
+        else:
+            names.append(args[i])
+        i += 1
+    if not str(need_gib).isdigit():
+        die("--need takes a whole number of GiB")
+    need_gib = int(need_gib)
+    if not S.dry and not names:
+        die("drain --apply needs the names to move. Run 'offload drain' for a plan.")
+    hot, cold = require_drive("OFFLOAD_HOT"), require_drive("OFFLOAD_COLD")
+    dest_root = os.path.join(cold, "Drained", os.path.basename(hot.rstrip("/")))
+
+    log("=============================================")
+    log(f"offload v{VERSION} drain  mode={mode()}  need={need_gib}GiB free on HOT")
+    log("=============================================")
+    report_space()
+    log(f"  Scanning {hot}: sizes, ages, sync apps, git repos, open files (big drives take minutes)...")
+    entries, groups = drain_scan(hot)
+    by_name = {e.name: e for e in entries}
+
+    plan, total = [], 0
+    if names:
+        for name in names:
+            if "/" in name or UNSAFE_NAME.search(name):
+                die(f"unsafe name: {name}")
+            e = by_name.get(name)
+            if not e:
+                die(f"'{name}' is not on {hot} (see 'offload drain')")
+            if e.status == "skip":
+                die(f"'{name}' is not movable: {e.reason}")
+            if e.status == "live":
+                die(f"'{name}' is live ({e.reason}). Stop that first, then drain it.")
+            if e.status == "warm":
+                warn(f"  {name} was {e.reason}; moving it anyway, as named")
+            plan.append(name)
+            total += e.size
     else:
-        row(name, size, newest, "cold", "")
+        gap = need_gib * GIB - free_bytes(hot)
+        for e in sorted((e for e in entries if e.status == "cold"), key=lambda e: (-e.days, -e.size, e.name)):
+            if total >= gap:
+                break
+            if UNSAFE_NAME.search(e.name):
+                continue
+            plan.append(e.name)
+            total += e.size
 
-for group, members in sorted(groups.items()):
-    size = newest = 0
-    opened = [m for m in members if m in open_by]
-    for m in members:
-        s, n, _ = walk(os.path.join(hot, m))
-        size, newest = size + s, max(newest, n)
-        print(f"M\t{group}\t{m}")
-    days = (now - newest) / 86400
-    if opened:
-        row(group, size, newest, "live", f"{opened[0]} open by {open_by[opened[0]]}")
-    elif days < warm_days:
-        row(group, size, newest, "warm", f"{files(len(members))}, newest touched {int(days)} d ago")
+    log(f"--- {hot} (* = in this plan) ---")
+    log(f"    {'SIZE':>10}  {'TOUCHED':<7} {'STATE':<5} NAME")
+    for status in ("cold", "warm", "live", "skip"):
+        for e in sorted((e for e in entries if e.status == status), key=lambda e: (-e.size, e.name)):
+            mark = "*" if e.name in plan else " "
+            size = "-" if e.status == "skip" else human(e.size)
+            reason = f"  ({e.reason})" if e.reason else ""
+            log(f"  {mark} {size:>10}  {drain_age(e.days):<7} {e.status:<5} {e.name}{reason}")
+
+    if not plan:
+        if not names:
+            log(f"  Nothing to suggest: HOT has {need_gib}GiB free, or nothing cold is left.")
+        return
+    log(f"--- Plan: {human(total)} to {dest_root}; each entry leaves a symlink ---")
+    require_free(cold, total)
+    if not names:
+        log("  A suggestion: coldest first, cold entries only. Then:")
+        log("    offload drain " + " ".join(shlex.quote(n) for n in plan) + " --apply")
+        return
+    for name in plan:
+        for member in (groups.get(name, []) if name.startswith("@") else [name]):
+            try:
+                drain_one(member, dest_root)
+            except PermissionDenied:
+                warn(f"  STOPPED: {member} needs the admin pass")
+    report_space()
+    if S.dry:
+        log("Dry run. Add --apply to move.")
+    log(f"Done. Log: {S.log_path}")
+    if S.admin_needed:
+        emit_admin_pass()
+        sys.exit(3)
+
+
+# ----------------------------------------------------------------------------
+# Drive inventory — every mounted volume, and which one takes a move
+# ----------------------------------------------------------------------------
+
+VOLUMES_ROOT = os.environ.get("OFFLOAD_VOLUMES", "/Volumes")
+BZINFO = os.environ.get("OFFLOAD_BZINFO", "/Library/Backblaze.bzpkg/bzdata/bzinfo.xml")
+NETWORK_FS = ("nfs", "smbfs", "afpfs", "webdav", "macfuse", "osxfuse", "fuse")
+NO_UNIX_FS = ("exfat", "msdos")
+
+
+@dataclass
+class Volume:
+    mount: str
+    fs: str = ""                     # apfs, hfs, exfat, nfs ...
+    ssd: Optional[bool] = None
+    protocol: str = ""
+    size: int = 0
+    free: int = 0
+    device: int = 0
+    internal: bool = False
+    removable: bool = False
+    network: bool = False
+    readonly: bool = False
+    tm: str = "?"                    # dest | included | excluded | ?
+    backblaze: bool = False
+    owners: Optional[bool] = None
+    encrypted: Optional[bool] = None
+    image: str = ""                  # backing file, for an attached disk image
+    role: str = ""
+    reason: str = ""
+
+    @property
+    def host(self) -> str:
+        """The drive that holds this disk image's file; '' when it sits on the boot drive."""
+        prefix = VOLUMES_ROOT + "/"
+        return self.image[len(prefix):].split("/")[0] if self.image.startswith(prefix) else ""
+
+    @property
+    def backup(self) -> str:
+        if self.tm == "dest":
+            return "TM dest"
+        parts = (["TM"] if self.tm == "included" else []) + (["BB"] if self.backblaze else [])
+        return "+".join(parts) or "none"
+
+
+def capture(cmd: list, timeout: int = 30) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def mount_entries() -> dict:
+    """Mount point -> (filesystem type, options, device) from mount(8)."""
+    entries = {}
+    for line in capture(["mount"]).splitlines():
+        m = re.match(r"^(.*) on (.*) \(([^,)]+)(.*)\)$", line)
+        if m:
+            entries[m.group(2)] = (m.group(3).strip().lower(), m.group(4), m.group(1))
+    return entries
+
+
+def backblaze_dirs() -> set:
+    """Lower-cased paths Backblaze backs up in full (bzdirfilter whichfiles="all")."""
+    try:
+        text = open(BZINFO, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return set()
+    return {m.group(1) for m in re.finditer(r'<bzdirfilter\s+dir="([^"]*)"\s+whichfiles="all"', text)}
+
+
+def time_machine_mounts() -> List[str]:
+    out = capture(["tmutil", "destinationinfo"])
+    return [line.split(":", 1)[1].strip() for line in out.splitlines() if line.startswith("Mount Point")]
+
+
+def tm_status(mount: str, tm_mounts: List[str]) -> str:
+    markers = ("Backups.backupdb", ".com.apple.TimeMachine.snapshots", ".com.apple.TimeMachine.IOCheck")
+    if mount in tm_mounts or any(os.path.isdir(os.path.join(mount, m)) for m in markers):
+        return "dest"
+    out = capture(["tmutil", "isexcluded", mount])
+    return "excluded" if "[Excluded]" in out else "included" if "[Included]" in out else "?"
+
+
+def vol_info(mount: str) -> dict:
+    """`diskutil info -plist` as a dict; {} when diskutil is missing or says nothing."""
+    if not shutil.which("diskutil"):
+        return {}
+    raw = subprocess.run(["diskutil", "info", "-plist", mount], capture_output=True).stdout
+    try:
+        return plistlib.loads(raw) if raw else {}
+    except (ValueError, plistlib.InvalidFileException):
+        return {}
+
+
+def disk_images() -> dict:
+    """Mount point -> (image file, encrypted?) for attached disk images.
+
+    diskutil calls every image removable and never encrypted: the encryption
+    belongs to the image file, so only `hdiutil info` knows."""
+    try:
+        info = plistlib.loads(capture(["hdiutil", "info", "-plist"]).encode())
+    except (ValueError, plistlib.InvalidFileException):
+        return {}
+    return {e["mount-point"]: (im.get("image-path", ""), bool(im.get("image-encrypted")))
+            for im in info.get("images", []) for e in im.get("system-entities", []) if e.get("mount-point")}
+
+
+def classify(v: Volume) -> None:
+    """HOT (external SSD), COLD (external spinner) or EXCLUDED, with the reason."""
+    if v.tm == "dest":
+        v.role, v.reason = "EXCLUDED", "Time Machine destination"
+    elif v.readonly:
+        v.role, v.reason = "EXCLUDED", "read-only mount"
+    elif v.network:
+        v.role, v.reason = "EXCLUDED", "network or FUSE mount: never a move target"
+    elif v.internal:
+        v.role, v.reason = "EXCLUDED", "internal drive (not an offload target)"
+    elif v.removable:
+        v.role, v.reason = "EXCLUDED", "removable media"
+    elif v.fs in NO_UNIX_FS:
+        v.role, v.reason = "EXCLUDED", f"{v.fs}: no Unix permissions or safe symlinks"
+    elif v.image and not v.host:
+        v.role, v.reason = "EXCLUDED", "disk image stored on the boot drive"
+    elif v.image:
+        v.role, v.reason = ("HOT" if v.ssd else "COLD"), f"disk image on {v.host}"
+    elif v.ssd:
+        v.role, v.reason = "HOT", "external SSD"
     else:
-        row(group, size, newest, "cold", files(len(members)))
-PY
-}
+        v.role, v.reason = "COLD", "external spinner" + (" (HFS+)" if v.fs == "hfs" else "")
 
-drain_age() {
-  local d="$1"
-  if   (( d < 0 ));   then echo "-"
-  elif (( d < 14 ));  then echo "${d} d"
-  elif (( d < 90 ));  then echo "$(( d / 7 )) wk"
-  elif (( d < 730 )); then echo "$(( d / 30 )) mo"
-  else echo "$(( d / 365 )) yr"; fi
-}
 
-drain_sig() {
-  if [[ -d "$1" ]]; then tree_signature "$1"; else echo "files=1 bytes=$(stat -f %z "$1")"; fi
-}
+def probe_volume(mount: str, mounts: dict, tm_mounts: List[str], bz: set) -> Volume:
+    info = vol_info(mount)
+    fstype, opts, _ = mounts.get(mount, ("", "", ""))
+    st = os.statvfs(mount)
+    image, encrypted = "", (bool(info.get("Encryption") or info.get("FileVault")) if info else None)
+    if info.get("BusProtocol") == "Disk Image":
+        image, encrypted = disk_images().get(mount, ("", encrypted))
+    v = Volume(mount=mount, fs=(info.get("FilesystemType") or fstype or "").lower(), ssd=info.get("SolidState"),
+               protocol=info.get("BusProtocol", ""), size=st.f_blocks * st.f_frsize, free=st.f_bavail * st.f_frsize,
+               device=os.stat(mount).st_dev, internal=bool(info.get("Internal", False)),
+               removable=bool(info.get("Removable") or info.get("RemovableMedia")) and not image,
+               network=fstype.startswith(NETWORK_FS), readonly="read-only" in opts,
+               tm=tm_status(mount, tm_mounts), backblaze=(mount.lower().rstrip("/") + "/") in bz,
+               owners=info.get("GlobalPermissionsEnabled"), encrypted=encrypted, image=image)
+    if v.host:  # an image is backed up with the drive that holds its file, as ciphertext
+        v.backblaze = v.backblaze or (os.path.join(VOLUMES_ROOT, v.host).lower() + "/") in bz
+    classify(v)
+    return v
 
-drain_one() {
-  local name="$1" src="$OFFLOAD_HOT/$1" dst="$DRAIN_DEST/$1"
-  log "=== drain $name ==="
-  [[ -e "$src" ]] || die "$src does not exist"
-  [[ -e "$dst" || -L "$dst" ]] && die "Destination $dst exists — manual review required"
-  log "  Source sig: $(drain_sig "$src")"
-  do_run "mkdir -p \"$DRAIN_DEST\""
-  if [[ -d "$src" ]]; then do_run "rsync -a \"$src/\" \"$dst/\""; else do_run "rsync -a \"$src\" \"$dst\""; fi
-  if [[ $DRY -eq 0 ]]; then
-    local s d; s="$(drain_sig "$src")"; d="$(drain_sig "$dst")"
-    log "  Verify: src=$s dst=$d"
-    [[ "$s" == "$d" ]] || die "Signature mismatch — source preserved"
-    do_run "rm -rf \"$src\""
-    do_run "ln -s \"$dst\" \"$src\""
-    log "  DONE: $src -> $dst"
-  fi
-}
 
-cmd_drain() {
-  local need_gib=30 names=() name
-  while (( $# > 0 )); do
-    case "$1" in
-      --apply) DRY=0; shift ;;
-      --need)  need_gib="${2:?--need takes a number of GiB}"; shift 2 ;;
-      *)       names+=("$1"); shift ;;
-    esac
-  done
-  [[ "$need_gib" =~ ^[0-9]+$ ]] || die "--need takes a whole number of GiB"
-  (( DRY == 0 && ${#names[@]} == 0 )) && die "drain --apply needs the names to move. Run 'offload drain' for a plan."
-  require_drive OFFLOAD_HOT; require_drive OFFLOAD_COLD
-  DRAIN_DEST="$OFFLOAD_COLD/Drained/$(basename "$OFFLOAD_HOT")"
+def load_inventory() -> List[Volume]:
+    """Every real mount under /Volumes, once per mounted device."""
+    mounts, tm_mounts, bz = mount_entries(), time_machine_mounts(), backblaze_dirs()
+    seen, volumes = set(), []
+    for name in sorted(os.listdir(VOLUMES_ROOT)) if os.path.isdir(VOLUMES_ROOT) else []:
+        mount = os.path.join(VOLUMES_ROOT, name)
+        if not os.path.isdir(mount) or os.path.islink(mount) or mount not in mounts:
+            continue
+        device_name = mounts[mount][2]
+        if device_name not in seen:
+            seen.add(device_name)
+            volumes.append(probe_volume(mount, mounts, tm_mounts, bz))
+    return volumes
 
-  log "============================================="
-  log "offload v$VERSION drain  mode=$(mode)  need=${need_gib}GiB free on HOT"
-  log "============================================="
-  report_space
-  log "  Scanning $OFFLOAD_HOT: sizes, ages, sync apps, git repos, open files (big drives take minutes)..."
-  local scan; scan="$(drain_scan)"
-  local rows; rows="$(awk -F'\t' '$1 == "E"' <<<"$scan")"
 
-  # The plan: named entries, or the coldest cold entries until the gap closes.
-  local plan=() total=0 kb bytes days status reason
-  if (( ${#names[@]} )); then
-    for name in "${names[@]}"; do
-      [[ "$name" == */* || "$name" == *[\"\$\`\\]* ]] && die "unsafe name: $name"
-      IFS=$'\t' read -r _ _ bytes days status reason < <(awk -F'\t' -v n="$name" '$2 == n' <<<"$rows")
-      [[ -n "${status:-}" ]] || die "'$name' is not on $OFFLOAD_HOT (see 'offload drain')"
-      [[ "$status" == skip ]] && die "'$name' is not movable: $reason"
-      [[ "$status" == live ]] && die "'$name' is live ($reason). Stop that first, then drain it."
-      [[ "$status" == warm ]] && warn "  $name was $reason; moving it anyway, as named"
-      plan+=("$name"); total=$(( total + bytes )); status=""
-    done
-  else
-    local gap=$(( need_gib * 1073741824 - $(free_bytes "$OFFLOAD_HOT") ))
-    while IFS=$'\t' read -r _ name bytes days status reason; do
-      (( total >= gap )) && break
-      [[ "$name" == *[\"\$\`\\]* ]] && continue
-      plan+=("$name"); total=$(( total + bytes ))
-    done < <(awk -F'\t' '$5 == "cold"' <<<"$rows" | sort -t$'\t' -k4,4nr -k3,3nr)   # coldest first
-  fi
+_INVENTORY: Optional[List[Volume]] = None
 
-  log "--- $OFFLOAD_HOT (* = in this plan) ---"
-  log "$(printf '    %10s  %-7s %-5s %s' SIZE TOUCHED STATE NAME)"
-  local order
-  for order in cold warm live skip; do
-    while IFS=$'\t' read -r _ name bytes days status reason; do
-      local mark=" " n; for n in "${plan[@]:-}"; do [[ "$n" == "$name" ]] && mark="*"; done
-      log "$(printf '  %s %10s  %-7s %-5s %s%s' "$mark" "$([[ $status == skip ]] && echo - || human "$bytes")" "$(drain_age "$days")" "$status" "$name" "${reason:+  ($reason)}")"
-    done < <(awk -F'\t' -v s="$order" '$5 == s' <<<"$rows" | sort -t$'\t' -k3,3nr)
-  done
 
-  if (( ${#plan[@]} == 0 )); then
-    if (( ${#names[@]} == 0 )); then log "  Nothing to suggest: HOT has ${need_gib}GiB free, or nothing cold is left."; fi
-    return 0
-  fi
-  log "--- Plan: $(human "$total") to $DRAIN_DEST; each entry leaves a symlink ---"
-  require_free "$OFFLOAD_COLD" "$total"
-  if (( ${#names[@]} == 0 )); then
-    log "  A suggestion: coldest first, cold entries only. Then:"
-    log "    offload drain$(printf ' %q' "${plan[@]}") --apply"
-    return 0
-  fi
-  for name in "${plan[@]}"; do
-    if [[ "$name" == @* ]]; then
-      while IFS=$'\t' read -r _ _ member; do drain_one "$member"; done < <(awk -F'\t' -v g="$name" '$1 == "M" && $2 == g' <<<"$scan")
-    else
-      drain_one "$name"
-    fi
-  done
-  report_space
-  [[ $DRY -eq 1 ]] && log "Dry run. Add --apply to move."
-  log "Done. Log: $LOG"
-}
+def inventory() -> List[Volume]:
+    global _INVENTORY
+    if _INVENTORY is None:
+        _INVENTORY = load_inventory()
+    return _INVENTORY
 
-# ----------------------------------------------------------------------------
-# Subcommand: drives — auto-detect external drives, classify HOT/COLD
-# ----------------------------------------------------------------------------
 
-# Returns 0 if the mount-point houses a Time Machine backup.
-# Detection is filesystem-evidence + tmutil, not name-based: a drive
-# accidentally named "TM" or "backup" is NOT excluded; only macOS-
-# recognized TM destinations or backup directories are.
-is_time_machine() {
-  local mp="$1"
-  # Old-style.
-  [[ -d "$mp/Backups.backupdb" ]] && return 0
-  # APFS-era .timemachine snapshot directory.
-  [[ -d "$mp/.com.apple.TimeMachine.snapshots" ]] && return 0
-  # Modern TM creates this guard dir at the destination root.
-  [[ -d "$mp/.com.apple.TimeMachine.IOCheck" ]] && return 0
-  # tmutil is the canonical source of truth for "this is a TM destination".
-  if command -v tmutil >/dev/null 2>&1; then
-    tmutil destinationinfo 2>/dev/null \
-      | awk -F': *' '$1 ~ /^Mount Point/ {print $2}' \
-      | grep -qxF "$mp" && return 0
-  fi
-  return 1
-}
+def volume_for(path: str) -> Optional[Volume]:
+    """The mounted volume holding `path` (longest mount-point prefix), if any."""
+    path = path.rstrip("/")
+    holding = [v for v in inventory() if path == v.mount or path.startswith(v.mount + "/")]
+    return max(holding, key=lambda v: len(v.mount)) if holding else None
 
-# Read a single field from `diskutil info <mount>` output.
-# Field names are matched verbatim against diskutil's "Field Name:" prefix.
-# Subshell + `set +e` so a non-zero diskutil exit (invalid path, missing
-# attribute) cleanly yields empty output instead of crashing the script.
-diskutil_field() (
-  set +e
-  set +o pipefail
-  local mp="$1" field="$2"
-  diskutil info "$mp" 2>/dev/null \
-    | awk -F: -v f="$field" 'index($0, f":") {sub(/^[ \t]+/, "", $2); print $2; exit}'
-)
 
-# Optional throughput benchmark. Times reading 100 MB sequentially.
-# Only runs when --benchmark is set; otherwise this helper is unused.
-benchmark_read() (
-  set +e
-  set +o pipefail
-  local mp="$1"
-  # macOS BSD `dd` has no cache-bypass (no GNU iflag=direct), and `purge`
-  # needs sudo. We use a 1 GB probe so the macOS page cache can't fully
-  # hold it — first read hits disk for most of the file, subsequent reads
-  # are increasingly cache-warm. Reported speeds are rough; the *relative*
-  # ordering of drives is the meaningful signal, not absolute MB/s.
-  local probe="$mp/.offload-benchmark-probe-1g"
-  if [[ ! -f "$probe" ]]; then
-    if ! dd if=/dev/zero of="$probe" bs=1M count=1024 2>/dev/null; then
-      echo "n/a (write failed)"
-      return 0
-    fi
-  fi
-  local out bps
-  out=$(dd if="$probe" of=/dev/null bs=1M count=1024 2>&1 | tail -1)
-  bps=$(echo "$out" | sed -nE 's/.*\(([0-9]+) bytes\/sec\).*/\1/p')
-  if [[ -n "$bps" && "$bps" -gt 0 ]]; then
-    printf '%d MB/s' "$((bps / 1000000))"
-  else
-    echo "n/a"
-  fi
-)
+def candidates(tier: str) -> List[str]:
+    """The tier's primary drive first, then opted-in OFFLOAD_DRIVES of the same role."""
+    primary = S.hot if tier == "HOT" else S.cold
+    extra = [d for d in S.drives if d.rstrip("/") != primary.rstrip("/")
+             and (volume_for(d) is not None and volume_for(d).role == tier)]
+    return [p for p in [primary] + extra if p]
 
-# Classify a single mount. Outputs "ROLE|REASON" on stdout.
-# ROLE in {HOT, COLD, EXCLUDED, UNKNOWN}.
-detect_role() {
-  local mp="$1"
 
-  if is_time_machine "$mp"; then
-    echo "EXCLUDED|Time Machine backup present"
-    return 0
-  fi
+def ineligible(path: str, size: int, label: str) -> str:
+    """Why `path` cannot take `size` bytes of `label` now; '' when it can."""
+    if not os.path.isdir(path):
+        return "not mounted"
+    v = volume_for(path)
+    if path.startswith(VOLUMES_ROOT + "/") and (v is None or os.stat(path).st_dev != v.device):
+        return "not mounted (a plain folder, not a mounted drive)"
+    if v and v.network:
+        return "a network or FUSE mount"
+    if v and v.fs in NO_UNIX_FS:
+        return f"{v.fs} has no Unix permissions or safe symlinks"
+    if v and v.removable and path.rstrip("/") not in (S.hot.rstrip("/"), S.cold.rstrip("/")):
+        return "removable media"
+    if v and v.image and not v.host:
+        return "a disk image stored on the boot drive frees nothing"
+    if label in S.private and os.environ.get("OFFLOAD_ALLOW_PLAINTEXT") != "1":
+        if not (v and v.encrypted and v.owners):
+            return "private data needs an encrypted volume with ownership on (see 'offload plan')"
+    st = os.statvfs(path)
+    total, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize - S.reserved.get(path, 0)
+    if free - size < total * S.headroom // 100:
+        return f"would leave less than {S.headroom}% free ({human(max(free, 0))} free, needs {human(size)})"
+    return ""
 
-  # Read-only check via mount(8) flags.
-  if mount | grep -F " on $mp " | grep -q "read-only"; then
-    echo "EXCLUDED|read-only mount"
-    return 0
-  fi
 
-  local solid loc fs
-  solid="$(diskutil_field "$mp" "Solid State")"
-  loc="$(diskutil_field "$mp" "Device Location")"
-  fs="$(diskutil_field "$mp" "File System Personality")"
+def try_pick(tier: str, size: int, label: str) -> tuple:
+    """(first drive of the tier that can take the move, or '', reasons the others cannot). Reserves on success."""
+    why = []
+    for path in candidates(tier):
+        reason = ineligible(path, size, label)
+        if not reason:
+            S.reserved[path] = S.reserved.get(path, 0) + size
+            return path, why
+        why.append(f"{path}: {reason}")
+    return "", why or [f"OFFLOAD_{tier} not set"]
 
-  # Only consider externals for HOT/COLD; internals are the boot drive.
-  if [[ "$loc" != "External" ]]; then
-    echo "EXCLUDED|internal drive (not an offload target)"
-    return 0
-  fi
 
-  if [[ "$solid" == "Yes" ]]; then
-    echo "HOT|External SSD + $fs"
-    return 0
-  fi
+def pick_dest(tier: str, size: int, label: str) -> str:
+    path, why = try_pick(tier, size, label)
+    if not path:
+        die(f"No {tier} drive can take {label} ({human(size)}): " + "; ".join(why))
+    return path
 
-  if [[ "$solid" == "No" || "$solid" == "Info not available" ]]; then
-    if [[ "$fs" == *HFS+* ]]; then
-      echo "COLD|HFS+ + spinner + external"
-    else
-      echo "COLD|spinner + external"
-    fi
-    return 0
-  fi
 
-  echo "UNKNOWN|no Solid State info from diskutil"
-}
+def benchmark_read(mount: str) -> str:
+    """Rough 1 GB sequential read; the probe file stays so a rerun is comparable."""
+    probe = os.path.join(mount, ".offload-benchmark-probe-1g")
+    if not os.path.isfile(probe):
+        if subprocess.run(["dd", "if=/dev/zero", f"of={probe}", "bs=1m", "count=1024"],
+                          capture_output=True).returncode != 0:
+            return "n/a (write failed)"
+    out = subprocess.run(["dd", f"if={probe}", "of=/dev/null", "bs=1m", "count=1024"],
+                         capture_output=True, text=True).stderr
+    m = re.search(r"\((\d+) bytes/sec\)", out)
+    return f"{int(m.group(1)) // 1000000} MB/s" if m else "n/a"
 
-cmd_drives() {
-  local hdr_extra=""
-  (( BENCHMARK == 1 )) && hdr_extra="  SPEED"
 
-  printf '%-28s %-7s %-6s %-5s %-7s %-9s%s  %s\n' \
-    DRIVE FS SOLID PROT FREE ROLE "$hdr_extra" REASON
-  printf '%-28s %-7s %-6s %-5s %-7s %-9s%s  %s\n' \
-    ---- -- ----- ---- ---- ---- "${hdr_extra:+      }" ------
+def yes_no(value: Optional[bool], yes: str = "yes", no: str = "no") -> str:
+    return "-" if value is None else yes if value else no
 
-  local detected_hot="" detected_cold=""
 
-  # Pre-compute the mount table so we can skip pseudo-entries like
-  # /Volumes/com.apple.TimeMachine.localsnapshots (a magic directory that
-  # is not a mount point and makes `diskutil info` return non-zero).
-  local mount_table; mount_table="$(mount)"
+def cmd_drives(_args: list) -> None:
+    row = "{:<26} {:<6} {:<4} {:<4} {:>8} {:>5}  {:<8} {:<6} {:<4} {:<9}{}  {}"
+    speed_head = "  SPEED" if S.benchmark else ""
+    print(row.format("DRIVE", "FS", "SSD", "PROT", "FREE", "FREE%", "BACKUP", "OWNERS", "ENC", "ROLE", speed_head, "REASON"))
+    print(row.format("-----", "--", "---", "----", "----", "-----", "------", "------", "---", "----",
+                     "  -----" if S.benchmark else "", "------"))
+    detected = {"HOT": "", "COLD": ""}
+    for v in inventory():
+        name = os.path.basename(v.mount)
+        name = name if len(name) <= 26 else name[:25] + "…"
+        fs = {"apfs": "APFS", "hfs": "HFS+", "exfat": "ExFAT", "msdos": "FAT"}.get(v.fs, v.fs[:6])
+        pct = f"{100 * v.free // v.size}%" if v.size else "-"
+        speed = ("  -" if v.role == "EXCLUDED" else f"  {benchmark_read(v.mount)}") if S.benchmark else ""
+        proto = {"Thunderbolt": "TB"}.get(v.protocol, v.protocol[:4])
+        print(row.format(name, fs, yes_no(v.ssd), proto, human(v.free), pct, v.backup,
+                         yes_no(v.owners, "on", "off"), yes_no(v.encrypted), v.role, speed, v.reason))
+        if v.role in detected and not detected[v.role]:
+            detected[v.role] = v.mount
+    print()
+    print("Detected:")
+    print(f'  OFFLOAD_HOT="{detected["HOT"] or "<none>"}"')
+    print(f'  OFFLOAD_COLD="{detected["COLD"] or "<none>"}"')
+    print()
+    print(f"Current config ({S.conf}):")
+    if os.path.isfile(S.conf):
+        for key, value, found, pad in (("OFFLOAD_HOT", S.hot, detected["HOT"], "   "),
+                                       ("OFFLOAD_COLD", S.cold, detected["COLD"], "  ")):
+            if value:
+                verdict = "✓ matches" if value == found else "✗ differs from detection"
+                print(f'  {key}="{value}"{pad}{verdict}')
+            else:
+                print(f"  {key} not set")
+        if S.drives:
+            print("  OFFLOAD_DRIVES=(" + " ".join(f'"{d}"' for d in S.drives) + ")")
+    else:
+        print("  (config file not found — using built-in defaults)")
+    missing = [k for k, value in (("HOT", S.hot), ("COLD", S.cold)) if detected[k] and value != detected[k]]
+    if missing:
+        print()
+        print(f"To persist detection, append to {S.conf}:")
+        for key in missing:
+            print(f"  echo 'OFFLOAD_{key}=\"{detected[key]}\"' >> {S.conf}")
+    configured = {p.rstrip("/") for p in [S.hot, S.cold] + S.drives if p}
+    others = [v.mount for v in inventory() if v.role in ("HOT", "COLD") and v.mount not in configured]
+    if others:
+        print()
+        print("Other drives that could take moves (opt in; --apply only writes to configured drives):")
+        print("  OFFLOAD_DRIVES+=(" + " ".join(f'"{m}"' for m in others) + ")")
+    print()
+    print("BACKUP: TM = Time Machine includes it; BB = Backblaze backs it up; TM dest = the backup disk itself.")
+    print("Private data (" + ", ".join(S.private) + ") only goes to an encrypted volume with ownership on.")
+    if S.benchmark:
+        print("\nSPEED column is a rough 1 GB read against each drive. macOS lacks\n"
+              "a userspace cache-bypass, so absolute MB/s can be inflated by the\n"
+              "page cache — trust the *relative* ordering of drives, not absolute\n"
+              "numbers. Probe files (.offload-benchmark-probe-1g) are left on each\n"
+              "drive so a second run is reproducible; delete them when you're done.")
 
-  for mp in /Volumes/*; do
-    [[ -d "$mp" ]] || continue
-    # Only inspect real mount points.
-    grep -qF " on $mp " <<<"$mount_table" || continue
-
-    local name fs solid proto free role reason speed=""
-    name="$(basename "$mp")"
-    fs="$(diskutil_field "$mp" "File System Personality")"
-    solid="$(diskutil_field "$mp" "Solid State")"
-    proto="$(diskutil_field "$mp" "Protocol")"
-    free="$(df -h "$mp" 2>/dev/null | awk 'NR==2 {print $4}')"
-
-    IFS='|' read -r role reason < <(detect_role "$mp")
-
-    # Truncate to keep the table aligned.
-    [[ ${#name}  -gt 26 ]] && name="${name:0:25}…"
-    case "$fs" in
-      *APFS*) fs="APFS" ;;
-      *HFS+*|*"HFS Plus"*) fs="HFS+" ;;
-    esac
-    case "$solid" in Yes) solid="yes" ;; No) solid="no" ;; *) solid="-" ;; esac
-    case "$proto" in USB) proto="USB" ;; Thunderbolt) proto="TB" ;; *) proto="${proto:0:5}" ;; esac
-
-    if (( BENCHMARK == 1 )); then
-      if [[ "$role" == "EXCLUDED" ]]; then
-        speed="  -"
-      else
-        speed="  $(benchmark_read "$mp")"
-      fi
-    fi
-
-    printf '%-28s %-7s %-6s %-5s %-7s %-9s%s  %s\n' \
-      "$name" "$fs" "$solid" "$proto" "${free:--}" "$role" "$speed" "$reason"
-
-    # Track the first detected of each role for the "Detected:" footer.
-    [[ -z "$detected_hot"  && "$role" == "HOT"  ]] && detected_hot="$mp"
-    [[ -z "$detected_cold" && "$role" == "COLD" ]] && detected_cold="$mp"
-  done
-
-  echo ""
-  echo "Detected:"
-  echo "  OFFLOAD_HOT=\"${detected_hot:-<none>}\""
-  echo "  OFFLOAD_COLD=\"${detected_cold:-<none>}\""
-  echo ""
-  echo "Current config ($OFFLOAD_CONF):"
-  local cfg_status=""
-  if [[ -f "$OFFLOAD_CONF" ]]; then
-    if [[ -n "$OFFLOAD_HOT" ]]; then
-      cfg_status="$([[ "$OFFLOAD_HOT" == "$detected_hot" ]] && echo '✓ matches' || echo '✗ differs from detection')"
-      echo "  OFFLOAD_HOT=\"$OFFLOAD_HOT\"   $cfg_status"
-    else
-      echo "  OFFLOAD_HOT not set"
-    fi
-    if [[ -n "$OFFLOAD_COLD" ]]; then
-      cfg_status="$([[ "$OFFLOAD_COLD" == "$detected_cold" ]] && echo '✓ matches' || echo '✗ differs from detection')"
-      echo "  OFFLOAD_COLD=\"$OFFLOAD_COLD\"  $cfg_status"
-    else
-      echo "  OFFLOAD_COLD not set"
-    fi
-  else
-    echo "  (config file not found — using built-in defaults)"
-  fi
-  echo ""
-  echo "To persist detection, append to $OFFLOAD_CONF:"
-  [[ -n "$detected_hot"  ]] && echo "  echo 'OFFLOAD_HOT=\"$detected_hot\"' >> $OFFLOAD_CONF"
-  [[ -n "$detected_cold" ]] && echo "  echo 'OFFLOAD_COLD=\"$detected_cold\"' >> $OFFLOAD_CONF"
-  echo ""
-  if (( BENCHMARK == 1 )); then
-    echo ""
-    echo "SPEED column is a rough 1 GB read against each drive. macOS lacks"
-    echo "a userspace cache-bypass, so absolute MB/s can be inflated by the"
-    echo "page cache — trust the *relative* ordering of drives, not absolute"
-    echo "numbers. Probe files (.offload-benchmark-probe-1g) are left on each"
-    echo "drive so a second run is reproducible; delete them when you're done."
-  fi
-
-  echo ""
-  echo "Note: for cross-drive deduplication, consider installing jdupes:"
-  echo "  brew install jdupes"
-}
 
 # ----------------------------------------------------------------------------
-# help — extracted from header (no duplication)
+# repos — cold git clones: the remote is the archive, a bundle is the insurance
 # ----------------------------------------------------------------------------
 
-cmd_help() {
-  awk 'NR>1 && /^#($| )/ {sub(/^# ?/, ""); print; next} NR>1 && !/^#/ {exit}' "$0"
+REPO_COLD_DAYS = int(os.environ.get("OFFLOAD_REPO_COLD_DAYS", "90"))
+REPO_IGNORED_OK = {".DS_Store"}          # ignored files that never matter, beside SWEEP_DIRNAMES
+
+
+class Repo(NamedTuple):
+    path: str
+    rel: str
+    days: int
+    verdict: str        # keep | synced | reclone | move
+    reason: str
+
+
+def git(repo: str, *args: str, network: bool = False) -> subprocess.CompletedProcess:
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+    if network:
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    return subprocess.run(["git", "--no-optional-locks", "-C", repo, *args], capture_output=True, text=True,
+                          env=env, timeout=120 if network else 60)
+
+
+def repo_sources() -> List[str]:
+    """Folders other targets own inside the repo roots (Clones is merged, not recloned)."""
+    return [t.source for t in iter_targets() if t.strategy == "merge"]
+
+
+def repo_find(root: str) -> List[str]:
+    """Git working trees under root; never descends into a repo, build cruft, hidden or linked folders."""
+    found, skip = [], set(repo_sources())
+    for here, dirs, _files in os.walk(root):
+        if here in skip:
+            dirs[:] = []
+            continue
+        if os.path.lexists(os.path.join(here, ".git")) and here != root:
+            found.append(here)
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SWEEP_DIRNAMES
+                   and not os.path.islink(os.path.join(here, d))]
+    return sorted(found)
+
+
+def repo_age_days(path: str) -> int:
+    """Days since HEAD last moved (commit, checkout, reset, pull): the reflog's mtime, else HEAD's commit date.
+    Not the index: any plain `git status`, by an IDE or a scanner, rewrites it and makes every repo look fresh."""
+    try:
+        stamp = os.stat(os.path.join(path, ".git", "logs", "HEAD")).st_mtime
+    except OSError:
+        out = git(path, "log", "-1", "--format=%ct").stdout.strip()
+        if not out.isdigit():
+            return 10 ** 6
+        stamp = float(out)
+    return int((time.time() - stamp) / 86400)
+
+
+def sync_ancestor(path: str, root: str) -> str:
+    """The sync app whose folder holds path (checked from path up to root's parent), else ''.
+    Syncthing counts only by .stfolder, its live-folder marker: a .stignore outlives the folder it served."""
+    here = path
+    markers = {m: app for m, app in SYNC_MARKERS.items() if m != ".stignore"}
+    while True:
+        for marker, app in markers.items():
+            if os.path.lexists(os.path.join(here, marker)):
+                return app
+        if here in (os.path.dirname(root), "/") or not here.startswith(os.path.dirname(root)):
+            return ""
+        here = os.path.dirname(here)
+
+
+def repo_unsafe(path: str) -> str:
+    """Why removing this clone could lose something the remote does not have; '' when it is safe."""
+    gitdir = os.path.join(path, ".git")
+    if not os.path.isdir(gitdir):
+        return "a .git file (worktree or submodule checkout)"
+    if not git(path, "remote").stdout.strip():
+        return "no remote"
+    status = git(path, "status", "--porcelain", "--ignored").stdout.splitlines()
+    changed = [line for line in status if not line.startswith("!!")]
+    if changed:
+        return f"uncommitted changes ({len(changed)})"
+    ignored = [line[3:].rstrip("/") for line in status if line.startswith("!!")]
+    stray = [p for p in ignored if p.split("/")[0] not in SWEEP_DIRNAMES and os.path.basename(p) not in REPO_IGNORED_OK]
+    if stray:
+        return "ignored files the remote lacks: " + ", ".join(stray[:3]) + ("…" if len(stray) > 3 else "")
+    unpushed = git(path, "log", "--branches", "--not", "--remotes", "--oneline").stdout.splitlines()
+    if unpushed:
+        return f"unpushed commits ({len(unpushed)})"
+    if git(path, "stash", "list").stdout.strip():
+        return "a stash"
+    if os.path.exists(os.path.join(path, ".gitmodules")):
+        return "submodules"
+    if os.path.isdir(os.path.join(gitdir, "worktrees")) and os.listdir(os.path.join(gitdir, "worktrees")):
+        return "extra worktrees"
+    lfs = os.path.join(gitdir, "lfs", "objects")
+    if os.path.isdir(lfs) and os.listdir(lfs):
+        return "Git LFS objects"
+    hooks = os.path.join(gitdir, "hooks")
+    if os.path.isdir(hooks) and [h for h in os.listdir(hooks) if not h.endswith(".sample")]:
+        return "custom hooks"
+    return ""
+
+
+def repo_keep_listed(rel: str) -> bool:
+    import fnmatch
+    keep = S.extra.get("OFFLOAD_REPO_KEEP", [])
+    return any(fnmatch.fnmatch(rel, k) or fnmatch.fnmatch(os.path.basename(rel), k) for k in keep)
+
+
+def classify_repo(path: str, root: str) -> Repo:
+    rel, days = os.path.relpath(path, root), repo_age_days(path)
+    if repo_keep_listed(rel):
+        return Repo(path, rel, days, "keep", "in OFFLOAD_REPO_KEEP")
+    if days < REPO_COLD_DAYS:
+        return Repo(path, rel, days, "keep", f"active {days} d ago")
+    app = sync_ancestor(path, root)
+    if app and not S.synced_ok:
+        return Repo(path, rel, days, "synced", f"inside a {app} folder: removing it removes it everywhere (--synced-ok)")
+    unsafe = repo_unsafe(path)
+    if unsafe.startswith("uncommitted changes"):
+        edited = recent_edit_days(path)
+        if edited < REPO_COLD_DAYS:
+            return Repo(path, rel, edited, "keep", f"uncommitted edits {edited} d ago")
+    if unsafe:
+        return Repo(path, rel, days, "move", unsafe)
+    return Repo(path, rel, days, "reclone", "clean and pushed (as of the last fetch)")
+
+
+def recent_edit_days(path: str) -> int:
+    """Days since the newest uncommitted change in the working tree was written."""
+    newest = 0.0
+    for line in git(path, "status", "--porcelain").stdout.splitlines():
+        name = line[3:].split(" -> ")[-1].strip('"')
+        try:
+            newest = max(newest, os.lstat(os.path.join(path, name)).st_mtime)
+        except OSError:
+            pass
+    return int((time.time() - newest) / 86400) if newest else 10 ** 6
+
+
+def repos_target() -> Optional[Target]:
+    return next((t for t in iter_targets(drives=False) if t.strategy == "repos"), None)
+
+
+def manifest_path() -> str:
+    return os.path.join(os.path.dirname(S.conf), "reclone.tsv")
+
+
+def remote_holds_every_tip(path: str) -> str:
+    """'' when every local branch tip and HEAD are on the remote right now; else why not."""
+    remote = git(path, "remote").stdout.split()[0]
+    listing = git(path, "ls-remote", remote, network=True)
+    if listing.returncode != 0:
+        return f"could not reach the remote ({(listing.stderr.strip().splitlines() or ['?'])[-1]})"
+    remote_tips = {line.split()[0] for line in listing.stdout.splitlines() if line.strip()}
+    local = git(path, "for-each-ref", "--format=%(objectname)", "refs/heads").stdout.split()
+    local.append(git(path, "rev-parse", "HEAD").stdout.strip())
+    for sha in filter(None, set(local)):
+        if sha in remote_tips:
+            continue
+        held = any(git(path, "cat-file", "-e", tip).returncode == 0
+                   and git(path, "merge-base", "--is-ancestor", sha, tip).returncode == 0 for tip in remote_tips)
+        if not held:
+            return f"commit {sha[:12]} is not on the remote"
+    return ""
+
+
+def append_manifest(dest_root: Optional[str], row: list) -> None:
+    """One line in the local manifest, and a copy beside the data when it sits on a drive."""
+    line = "\t".join(row) + "\n"
+    for path in [manifest_path()] + ([os.path.join(dest_root, "reclone.tsv")] if dest_root else []):
+        if S.dry:
+            log(f"  WOULD RECORD in {path}: {line.strip()}")
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(line)
+
+
+def copy_verify(src: str, dst: str) -> None:
+    """rsync src to a new dst and compare file count + bytes; raise on mismatch, keep the source."""
+    if os.path.lexists(dst):
+        conflict(f"Destination {dst} exists — manual review required")
+    run(["mkdir", "-p", os.path.dirname(dst)])
+    run(["rsync", "-a", f"{src}/", f"{dst}/"])
+    if not S.dry:
+        s, d = tree_signature(src), tree_signature(dst)
+        log(f"  Verify: src={s} dst={d}")
+        if s != d:
+            die(f"Signature mismatch for {src} — source preserved")
+
+
+def strategy_repos(root: str, raw_dest: str, label: str) -> None:
+    log(f"=== {label} (strategy=repos) ===")
+    if not os.path.isdir(root):
+        log(f"  SKIP: {root} missing")
+        return
+    tier, rest = split_tier(raw_dest)
+    for r in (classify_repo(p, root) for p in repo_find(root)):
+        if r.verdict not in ("reclone", "move"):
+            continue
+        log(f"--- {r.rel}: {r.verdict} ({r.reason}) ---")
+        if r.verdict == "reclone" and not S.dry:
+            missing = remote_holds_every_tip(r.path)
+            if missing:
+                warn(f"  {r.rel}: {missing}; copying the whole folder instead")
+                r = r._replace(verdict="move", reason=missing)
+        vol = pick_dest(tier or "COLD", du_bytes(r.path), label)
+        dest_root = f"{vol}/{rest}"
+        if r.verdict == "reclone":
+            remote = git(r.path, "remote").stdout.split()[0]
+            url = git(r.path, "remote", "get-url", remote).stdout.strip()
+            branch = git(r.path, "branch", "--show-current").stdout.strip()
+            sha = git(r.path, "rev-parse", "HEAD").stdout.strip()
+            bundle = f"{dest_root}/{r.rel}.bundle"
+            if os.path.lexists(bundle):
+                conflict(f"Bundle {bundle} exists — manual review required")
+            run(["mkdir", "-p", os.path.dirname(bundle)])
+            run(["git", "-C", r.path, "bundle", "create", bundle, "--all"])
+            run(["git", "-C", r.path, "bundle", "verify", bundle])
+            append_manifest(dest_root, [S.date_tag, "reclone", r.path, url, branch, sha, bundle])
+        else:
+            copy_verify(r.path, f"{dest_root}/{r.rel}")
+            append_manifest(dest_root, [S.date_tag, "moved", r.path, "", "", "", f"{dest_root}/{r.rel}"])
+        run(["rm", "-rf", r.path])
+        log(f"  DONE: {r.path} ({r.verdict})")
+
+
+def cmd_repos(args: list) -> None:
+    S.synced_ok = "--synced-ok" in args
+    t = repos_target()
+    if not t:
+        die("no repos target in OFFLOAD_TARGETS")
+    root = t.source
+    if not os.path.isdir(root):
+        die(f"{root} does not exist")
+    rows = [classify_repo(p, root) for p in repo_find(root)]
+    line = "{:<8} {:>6}  {:>8}  {:<44} {}"
+    print(line.format("VERDICT", "AGE", "SIZE", "REPO", "REASON"))
+    order = {"reclone": 0, "move": 1, "synced": 2, "keep": 3}
+    totals: dict = {}
+    for r in sorted(rows, key=lambda r: (order[r.verdict], -r.days, r.rel)):
+        size = du_bytes(r.path) if r.verdict in ("reclone", "move") else 0
+        totals[r.verdict] = totals.get(r.verdict, [0, 0])
+        totals[r.verdict][0] += 1
+        totals[r.verdict][1] += size
+        age = "never" if r.days >= 10 ** 6 else drain_age(r.days)
+        print(line.format(r.verdict, age, human(size) if size else "-", r.rel[:44], r.reason))
+    print()
+    print("  " + " · ".join(f"{v}: {totals[v][0]}" + (f" ({human(totals[v][1])})" if totals[v][1] else "")
+                            for v in order if v in totals))
+    print(f"  Cold means untouched for {REPO_COLD_DAYS} days. Verdicts use the last fetch; --apply re-checks "
+          "the remote before it removes anything.")
+    print(f"  Next: offload move {t.label}            # dry run; then add --apply")
+
+
+def cmd_reclone(args: list) -> None:
+    if not args or args[0] == "--apply":
+        die("usage: offload reclone <path>|all [--apply]")
+    S.dry = "--apply" not in args
+    want = args[0]
+    if not os.path.isfile(manifest_path()):
+        die(f"no manifest at {manifest_path()}: nothing was recloned or moved from here")
+    entries = [line.rstrip("\n").split("\t") for line in open(manifest_path()) if line.strip()]
+    chosen = [e for e in entries if len(e) == 7 and (want == "all" or os.path.abspath(want) == e[2])]
+    if not chosen:
+        die(f"'{want}' is not in {manifest_path()}")
+    log(f"offload v{VERSION} reclone  {want}  mode={mode()}")
+    for _date, kind, path, url, branch, sha, copy in chosen:
+        log(f"=== {path} ({kind}) ===")
+        if os.path.lexists(path):
+            log(f"  SKIP: {path} is already there")
+            continue
+        if kind == "moved":
+            copy_verify(copy, path)
+            run(["rm", "-rf", copy])
+            continue
+        source = url
+        if not S.dry and git(os.path.dirname(path) or "/", "ls-remote", url, network=True).returncode != 0:
+            warn(f"  the remote {url} does not answer; restoring from the bundle {copy}")
+            source = copy
+        run(["git", "clone", source, path])
+        if source != url:
+            run(["git", "-C", path, "remote", "set-url", "origin", url])
+        if branch:
+            run(["git", "-C", path, "checkout", branch])
+        if not S.dry:
+            head = git(path, "rev-parse", "HEAD").stdout.strip()
+            if head != sha:
+                warn(f"  {path}: HEAD is {head[:12]}, the recorded commit was {sha[:12]} (the branch moved on)")
+        log(f"  DONE: {path} restored from {'the remote' if source == url else 'the bundle'}")
+
+
+# ----------------------------------------------------------------------------
+# cloud — opt-in archive to a remote the team approved (rclone); never by default
+# ----------------------------------------------------------------------------
+# A row whose destination starts with CLOUD/ goes to the first rclone remote in
+# OFFLOAD_APPROVED_REMOTES, and only when the run says both --apply and --upload.
+# Order: copy, check (cryptcheck for crypt remotes), record, then remove the source.
+
+def rclone_remote_types() -> dict:
+    """Configured rclone remotes -> type, from `rclone listremotes --long` (reads local config only)."""
+    types = {}
+    for line in capture(["rclone", "listremotes", "--long"]).splitlines():
+        if ":" in line:
+            name, kind = line.split(":", 1)
+            types[name.strip() + ":"] = kind.strip()
+    return types
+
+
+def cloud_dest(rest: str, label: str) -> tuple:
+    """(remote, full destination, crypt?) for a CLOUD/ row; dies unless the remote is approved and fit."""
+    if not S.approved_remotes:
+        die("CLOUD/ needs OFFLOAD_APPROVED_REMOTES in offload.conf: the rclone remotes your team approved")
+    if not shutil.which("rclone"):
+        die("rclone is not installed: brew install rclone")
+    remote = S.approved_remotes[0]
+    name = remote.split(":", 1)[0] + ":"
+    kind = rclone_remote_types().get(name)
+    if kind is None:
+        die(f"{name} is approved but not configured in rclone (rclone config)")
+    if label in S.private and kind != "crypt":
+        die(f"{label} is private: it may only go to a crypt remote, and {name} is '{kind}'")
+    base = remote if remote.endswith((":", "/")) else remote + "/"
+    return name, base + rest, kind == "crypt"
+
+
+def strategy_cloud(src: str, raw_dest: str, label: str) -> None:
+    log(f"=== {label} (strategy=cloud) ===")
+    if not os.path.isdir(src):
+        log(f"  SKIP: {src} missing")
+        return
+    if is_empty_dir(src):
+        log(f"  SKIP: {src} is empty")
+        return
+    _, rest = split_tier(raw_dest)
+    remote, dest, crypt = cloud_dest(rest, label)
+    if not S.dry and not S.upload:
+        die("uploading needs --upload as well as --apply (data leaves this machine)")
+    if S.dry:
+        log(f"  WOULD UPLOAD {human(du_bytes(src))} to {dest} (approved remote {remote}); nothing leaves without --apply --upload")
+        return
+    run(["rclone", "copy", src, dest])
+    run(["rclone", "cryptcheck" if crypt else "check", src, dest])
+    append_manifest(None, [S.date_tag, "cloud", src, dest, "", "", remote])
+    run(["rm", "-rf", src])
+    run(["mkdir", "-p", src])
+    log(f"  DONE: {src} archived to {dest} (source recreated empty)")
+
+
+def cmd_restore(args: list) -> None:
+    if not args or args[0] == "--apply":
+        die("usage: offload restore <Label|path> [--apply]")
+    S.dry = "--apply" not in args
+    want = args[0]
+    label_src = {t.label: t.source for t in iter_targets()}.get(want, os.path.abspath(want))
+    if not os.path.isfile(manifest_path()):
+        die(f"no manifest at {manifest_path()}: nothing was archived to the cloud from here")
+    entries = [line.rstrip("\n").split("\t") for line in open(manifest_path()) if line.strip()]
+    chosen = [e for e in entries if len(e) == 7 and e[1] == "cloud" and e[2] == label_src]
+    if not chosen:
+        die(f"'{want}' has no cloud archive in {manifest_path()}")
+    _date, _kind, src, dest, _b, _s, remote = chosen[-1]
+    crypt = rclone_remote_types().get(remote) == "crypt" if shutil.which("rclone") else False
+    log(f"offload v{VERSION} restore  {want}  from {dest}  mode={mode()}")
+    run(["mkdir", "-p", src])
+    run(["rclone", "copy", dest, src])
+    run(["rclone", "cryptcheck" if crypt else "check", src, dest])
+    log(f"  DONE: {src} restored; the cloud copy stays at {dest}")
+
+
+# ----------------------------------------------------------------------------
+# plan and prices — advice only: nothing moves, nothing uploads
+# ----------------------------------------------------------------------------
+
+PRICES_URL = os.environ.get("OFFLOAD_PRICES_URL",
+                            "https://raw.githubusercontent.com/Sage-is/homebrew-apps/develop/offload")
+PRICES_STALE_DAYS = 180
+
+# What a move would cost beyond space, per target, for the plan's Coverage section.
+TARGET_NOTES = {
+    "LocalShare": "LocalShare holds uv's Python installs and ~/.local/bin tools: moved, they need that drive plugged in.",
+    "Pyenv": "Pyenv holds pyenv's Pythons: moved, every pyenv shim needs that drive plugged in.",
+    "Bun": "Bun holds bun and its global packages: moved, they need that drive plugged in.",
 }
+
+# The team's price table. kind: cloud (usd_per_tb per month), buy (once), free.
+# min_usd: the smallest monthly charge (cloud) or the smallest purchase (buy). min_days: minimum storage duration.
+# 'offload prices --update' fetches this block from the tap; rows in ~/.config/offload/prices.tsv override by id.
+PRICES = """
+# @@PRICES-BEGIN@@
+id|kind|name|usd_per_tb|min_usd|unit|min_days|checked|note
+sparse|free|Encrypted sparsebundle on a drive you own|0|0|once|0|2026-10-09|built in (hdiutil); Backblaze then backs up ciphertext only
+b2|cloud|Backblaze B2|6.95|0|month|0|2026-10-09|egress free up to 3x stored; native in rclone, restic, Kopia
+r2ia|cloud|Cloudflare R2 Infrequent Access|10|0|month|30|2026-10-09|egress free; retrieval $0.01/GB
+s3|cloud|Amazon S3 Standard|23|0|month|0|2026-10-09|egress $0.09/GB after 100 GB a month
+s3gir|cloud|Amazon S3 Glacier Instant Retrieval|4|0|month|90|2026-10-09|retrieval $0.03/GB, milliseconds
+s3gfr|cloud|Amazon S3 Glacier Flexible Retrieval|3.60|0|month|90|2026-10-09|restores take minutes to 12 h; bulk is free
+s3gda|cloud|Amazon S3 Glacier Deep Archive|0.99|0|month|180|2026-10-09|restores take 12-48 h; pack into a few large files first
+gcsa|cloud|Google Cloud Archive|1.20|0|month|365|2026-10-09|retrieval $0.05/GB plus egress
+wasabi|cloud|Wasabi|7.99|7.99|month|90|2026-10-09|1 TB minimum charge
+e2|cloud|iDrive e2|6|6|month|0|2026-10-09|1 TB minimum; egress free up to 3x stored
+storj|cloud|Storj|7|5|month|30|2026-10-09|$5 minimum; egress $7/TB; encrypts by default
+hetzner|cloud|Hetzner Storage Box BX11 (1 TB)|3.46|3.46|month|0|2026-10-09|EUR 3.20 flat ex-VAT; SFTP for Borg or restic
+rsyncnet|cloud|rsync.net|15|12|month|0|2026-10-09|800 GB minimum; ZFS snapshots included
+borgbase|cloud|BorgBase Small (250 GB)|10|2.50|month|0|2026-10-09|$30 a year for 250 GB; Borg or restic
+tarsnap|cloud|Tarsnap|250|0|month|0|2026-10-09|plus $0.25/GB transfer; deduplicates and encrypts
+ipfs|cloud|IPFS pinning (Pinata)|35|0|month|0|2026-10-09|public by default: encrypt before pinning
+bbpersonal|cloud|Backblaze Personal Backup|0|8.25|month|0|2026-10-09|$99 a year, unlimited; a mirror, not an archive; drives must connect every 30 days
+nvme|buy|2 TB NVMe SSD + USB4 enclosure|131|342|once|0|2026-10-09|$125-137/TB bare plus ~$80 enclosure; NAND prices are high
+hdd|buy|22 TB external HDD|31|689|once|0|2026-10-09|WD My Book 22 TB
+nas|buy|2-bay NAS, no drives|0|365|once|0|2026-10-09|Synology DS225+ ~$365, UGREEN DXP2800 ~$430
+lto9|buy|LTO-9 tape, Thunderbolt drive|6|7000|once|0|2026-10-09|drive ~$7,000; a cartridge is ~$106 for 18 TB
+mdisc|buy|M-DISC BD-R 100 GB discs|155|10|once|0|2026-10-09|$100-210/TB; manual and slow; archival
+# @@PRICES-END@@
+"""
+
+
+class Price(NamedTuple):
+    id: str
+    kind: str
+    name: str
+    usd_per_tb: float
+    min_usd: float
+    unit: str
+    min_days: int
+    checked: str
+    note: str
+
+
+def parse_prices(text: str, source: str) -> List[Price]:
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("id|"):
+            continue
+        cells = line.split("|")
+        if len(cells) != 9:
+            die(f"{source}: a price row needs 9 cells (id|kind|name|usd_per_tb|min_usd|unit|min_days|checked|note): {line}")
+        try:
+            rows.append(Price(cells[0], cells[1], cells[2], float(cells[3]), float(cells[4]), cells[5],
+                              int(cells[6]), cells[7], cells[8]))
+        except ValueError:
+            die(f"{source}: numbers expected in usd_per_tb, min_usd, min_days: {line}")
+    return rows
+
+
+def prices_user_file() -> str:
+    return os.path.join(os.path.dirname(S.conf), "prices.tsv")
+
+
+def load_prices() -> List[Price]:
+    rows = {p.id: p for p in parse_prices(PRICES, "built-in price table")}
+    user = prices_user_file()
+    if os.path.isfile(user):
+        rows.update({p.id: p for p in parse_prices(open(user).read(), user)})
+    return list(rows.values())
+
+
+def price_for(p: Price, size: int) -> float:
+    return max(p.min_usd, p.usd_per_tb * size / 1e12)
+
+
+def days_since(date: str) -> int:
+    try:
+        return int((time.time() - time.mktime(time.strptime(date, "%Y-%m-%d"))) // 86400)
+    except ValueError:
+        return 10 ** 6
+
+
+def stale_note(prices: List[Price]) -> str:
+    oldest = max((days_since(p.checked) for p in prices), default=0)
+    if oldest <= PRICES_STALE_DAYS:
+        return ""
+    return (f"Prices were last checked {oldest} days ago: run 'offload prices --update' "
+            f"or correct rows in {prices_user_file()}.")
+
+
+def cmd_prices(args: list) -> None:
+    if "--update" in args:
+        import urllib.request
+        log(f"Fetching the team price table from {PRICES_URL}")
+        try:
+            body = urllib.request.urlopen(PRICES_URL, timeout=30).read().decode("utf-8")
+        except OSError as error:
+            die(f"could not fetch {PRICES_URL}: {error}")
+        m = re.search(r"# @@PRICES-BEGIN@@\n(.*?)# @@PRICES-END@@", body, re.S)
+        if not m:
+            die(f"{PRICES_URL} has no price table block")
+        fresh = parse_prices(m.group(1), PRICES_URL)
+        user = prices_user_file()
+        os.makedirs(os.path.dirname(user), exist_ok=True)
+        if os.path.isfile(user):
+            os.replace(user, user + ".old")
+            log(f"  previous file kept as {user}.old")
+        with open(user, "w") as f:
+            f.write("id|kind|name|usd_per_tb|min_usd|unit|min_days|checked|note\n" + m.group(1))
+        log(f"  {len(fresh)} rows written to {user}, newest check {max(p.checked for p in fresh)}")
+        return
+    prices = load_prices()
+    row = "{:<12} {:<6} {:<42} {:>10} {:>9} {:>6}  {}"
+    print(row.format("ID", "KIND", "NAME", "$/TB", "MIN $", "DAYS", "CHECKED / NOTE"))
+    for p in sorted(prices, key=lambda p: (p.kind, p.usd_per_tb)):
+        per = "-" if p.kind == "free" else f"{p.usd_per_tb:g}/{'mo' if p.kind == 'cloud' else 'once'}"
+        print(row.format(p.id, p.kind, p.name[:42], per, f"{p.min_usd:g}", p.min_days, f"{p.checked}  {p.note}"))
+    note = stale_note(prices)
+    if note:
+        print()
+        print(note)
+
+
+def tool_version(cmd: list) -> str:
+    """First line of a tool's version output, or '' when it is not installed."""
+    if not shutil.which(cmd[0]):
+        return ""
+    out = capture(cmd, timeout=15)
+    return out.splitlines()[0].strip() if out else "installed"
+
+
+def print_tools(cold: str) -> None:
+    store = cold or "<COLD>"
+    rclone, annex = tool_version(["rclone", "version"]), tool_version(["git", "annex", "version"])
+    restic, kopia = tool_version(["restic", "version"]), tool_version(["kopia", "--version"])
+    print("--- Encrypted stores and mounts (optional tools; install with brew) ---")
+    for name, version in (("rclone", rclone), ("git-annex", annex if "git-annex" in annex else ""),
+                          ("restic", restic), ("kopia", kopia)):
+        print(f"  {name:<10} {version or 'not installed: brew install ' + name}"
+              + (f"  ({shutil.which('rclone')})" if name == "rclone" and rclone else ""))
+    m = re.search(r"v(\d+)\.(\d+)", rclone)
+    if m and (int(m.group(1)), int(m.group(2))) < (1, 65):
+        print(f"  rclone at {shutil.which('rclone')} is older than 1.65: no 'nfsmount'. Homebrew's rclone is current.")
+    print(f"""
+  Built in, no install: an encrypted APFS sparsebundle on {store}. Attached, it is a drive of
+  its own that can take private data (add it to OFFLOAD_DRIVES; 'offload drives' lists it):
+    hdiutil create -type SPARSEBUNDLE -encryption AES-256 -fs APFS -size 200g -volname OffloadVault "{store}/OffloadVault.sparsebundle"
+    hdiutil attach -owners on "{store}/OffloadVault.sparsebundle"
+  rclone: an encrypted 'crypt' store over a folder on {store}; contents and names are encrypted,
+  so Backblaze sees only ciphertext. Create it with 'rclone config' and take the password from
+  the vault (sage-secret); never type it on a command line.
+    rclone copy <folder> offload-crypt:<name>              archive a cold folder
+    rclone nfsmount offload-crypt: ~/mnt/offload-crypt      browse it (rclone >= 1.65; never a symlink target)
+  git-annex: tracks which drive or remote holds each file and drops a local copy only when
+  enough copies exist elsewhere:
+    git annex initremote cold type=directory directory="{store}/annex" encryption=hybrid keyid=<your GPG key>
+  restic or Kopia: deduplicated, encrypted backups to B2, S3 or SFTP.""")
+
+
+def cmd_plan(_args: list) -> None:
+    print("=== offload plan (advice only: nothing moves, nothing uploads) ===")
+    st = os.statvfs(S.home)
+    boot_total, boot_free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+    need = max(0, boot_total * S.boot_free_pct // 100 - boot_free)
+    print(f"Boot drive: {human(boot_free)} free of {human(boot_total)} ({100 * boot_free // boot_total}%). "
+          f"Target {S.boot_free_pct}% free: " + (f"free {human(need)} more." if need else "already there."))
+    print()
+    print("--- Drives ---")
+    for v in inventory():
+        pct = f"{100 * v.free // v.size}%" if v.size else "-"
+        print(f"  {os.path.basename(v.mount):<24} {v.role:<9} {pct:>4} free  backup {v.backup:<8} "
+              f"encrypted {yes_no(v.encrypted):<3}  owners {yes_no(v.owners, 'on', 'off')}")
+    print()
+    placeable, immediate, admin, manual = [], 0, 0, 0
+    for t in iter_targets(drives=False):
+        size = row_bytes(t)
+        if not size:
+            continue
+        tier, _ = split_tier(t.dest)
+        if t.admin == "yes":
+            admin += size
+        elif t.strategy in ("sweep", "purge"):
+            immediate += size
+        elif t.strategy in TIERED and tier:
+            placeable.append((size, t, tier))
+        else:
+            manual += size
+    print("--- Fit: on-disk targets, largest first ---")
+    placed, notes, backed = 0, [], set()
+    for size, t, tier in sorted(placeable, key=lambda x: -x[0]):
+        path, why = try_pick(tier, size, t.label)
+        verdict = ""
+        if not path and t.label in S.private:
+            verdict = "keep internal: private, and no encrypted drive with ownership on"
+            if t.label in ("Signal", "Messages"):
+                verdict += " (it starts at login, so not inside a disk image either)"
+        elif not path and tier == "HOT":
+            path, _ = try_pick("COLD", size, t.label)
+            if path:
+                verdict = f"{os.path.basename(path)} (COLD: slower than HOT)"
+        elif path:
+            verdict = f"{os.path.basename(path)} ({tier})"
+        if path:
+            placed += size
+            if t.label in TARGET_NOTES:
+                notes.append(TARGET_NOTES[t.label])
+            v = volume_for(path)
+            if v:
+                backed.add(v.backup)
+                if v.backup == "none":
+                    notes.append(f"{t.label} on {os.path.basename(path)} would have no backup "
+                                 "(Time Machine excludes it and Backblaze does not cover it).")
+        if not verdict:
+            verdict = "no drive fits: " + "; ".join(why)
+        print(f"  {human(size):>8}  {t.label:<18} {verdict}")
+        if t.label == "Desktop" and os.path.isdir(os.path.join(S.home, "Library/Mobile Documents/com~apple~CloudDocs/Desktop")):
+            notes.append("iCloud Drive has a Desktop folder: confirm 'Desktop & Documents' sync is off before moving Desktop.")
+    print()
+    print(f"  placeable now: {human(placed)} · caches and build cruft to clear: {human(immediate)} · "
+          f"admin-only: {human(admin)} · manual (native UI or merge): {human(manual)}")
+    after = boot_free + placed + immediate
+    print(f"  boot drive after placing and clearing: {human(after)} free ({100 * after // boot_total}%)")
+    hot = volume_for(S.hot) if S.hot else None
+    if hot and hot.size and 100 * hot.free // hot.size < S.headroom:
+        gib = math.ceil(hot.size * S.headroom / 100 / GIB)
+        print()
+        print(f"--- HOT is below {S.headroom}% free ---")
+        print(f"  {os.path.basename(hot.mount)} has {human(hot.free)} free. Make room before buying anything:")
+        print(f"    offload drain --need {gib}       # plan: coldest entries move to COLD, each leaves a symlink")
+    if "BB" in backed:
+        notes.append("Backblaze Personal keeps deleted files 30 days by default (turn on 1-year retention), "
+                     "and drops a drive that stays unplugged for 30 days.")
+    if notes:
+        print()
+        print("--- Coverage ---")
+        for note in dict.fromkeys(notes):
+            print(f"  {note}")
+    shortfall = max(0, need - placed - immediate)
+    archive = sum(size for size, t, _ in placeable if t.strategy == "archive")
+    size = shortfall or archive
+    print()
+    if size:
+        prices = load_prices()
+        what = f"the {human(shortfall)} shortfall" if shortfall else f"cold archives ({human(archive)})"
+        print(f"--- Options for {what} ---")
+        row = "  {:<46} {:>14}  {}"
+        for p in sorted(prices, key=lambda p: (p.kind != "free", p.kind == "buy", price_for(p, size))):
+            cost = "free" if p.kind == "free" else f"${price_for(p, size):,.2f}" + ("/mo" if p.kind == "cloud" else " once")
+            extra = f"min {p.min_days} d; " if p.min_days else ""
+            print(row.format(p.name[:46], cost, extra + p.note))
+        note = stale_note(prices)
+        if note:
+            print(f"  {note}")
+    else:
+        print("--- Options --- none needed: your drives cover the plan; no purchase or cloud storage required.")
+    print()
+    print_tools(S.cold)
+
 
 # ----------------------------------------------------------------------------
 # Dispatch
 # ----------------------------------------------------------------------------
 
-main() {
-  local args=()
-  while (( $# > 0 )); do
-    case "$1" in
-      --target-home) TARGET_HOME="$2"; shift 2 ;;
-      --all-users)   LIST_ALL_USERS=1; shift ;;
-      --benchmark)   BENCHMARK=1; shift ;;
-      *)             args+=("$1"); shift ;;
-    esac
-  done
-  set -- "${args[@]}"
+def cmd_help(_args: list) -> None:
+    print(__doc__.strip("\n"))
 
-  local sub="${1:-help}"; shift || true
-  case "$sub" in
-    help|-h|--help)            cmd_help ;;
-    version|-V|--version)      echo "offload v$VERSION" ;;
-    status)                    cmd_status ;;
-    list)                      cmd_list ;;
-    checklist)                 cmd_checklist ;;
-    drives)                    cmd_drives ;;
-    relocations|media-libraries|media) cmd_relocations ;;
-    launch)                    cmd_launch "$@" ;;
-    move)                      cmd_move "$@" ;;
-    protected)                 cmd_protected "$@" ;;
-    drain)                     cmd_drain "$@" ;;
-    *) die "unknown subcommand: $sub (try 'offload help')" ;;
-  esac
+
+def cmd_version(_args: list) -> None:
+    print(f"offload v{VERSION}")
+
+
+COMMANDS = {
+    "help": cmd_help, "-h": cmd_help, "--help": cmd_help,
+    "version": cmd_version, "-V": cmd_version, "--version": cmd_version,
+    "status": cmd_status, "list": cmd_list, "checklist": cmd_checklist, "drives": cmd_drives,
+    "relocations": cmd_relocations, "media-libraries": cmd_relocations, "media": cmd_relocations,
+    "launch": cmd_launch, "move": cmd_move, "protected": cmd_protected, "drain": cmd_drain,
+    "plan": cmd_plan, "prices": cmd_prices, "repos": cmd_repos, "reclone": cmd_reclone, "restore": cmd_restore,
 }
 
-main "$@"
+
+def main(argv: list) -> int:
+    args, i = [], 0
+    while i < len(argv):
+        if argv[i] == "--target-home":
+            if i + 1 >= len(argv):
+                die("--target-home takes a path")
+            S.target_home, i = argv[i + 1], i + 1
+        elif argv[i] == "--all-users":
+            S.all_users = True
+        elif argv[i] == "--benchmark":
+            S.benchmark = True
+        else:
+            args.append(argv[i])
+        i += 1
+    sub = args[0] if args else "help"
+    if sub not in COMMANDS:
+        die(f"unknown subcommand: {sub} (try 'offload help')")
+    if sub not in ("help", "-h", "--help", "version", "-V", "--version"):
+        load_config()
+    COMMANDS[sub](args[1:])
+    return 0
+
+
+if __name__ == "__main__":
+    S.home = os.path.expanduser("~")
+    S.target_home = S.home
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Fatal as error:
+        line = _stamp(f"FATAL: {error}")
+        print(line, file=sys.stderr)
+        _append_log(line)
+        sys.exit(error.code)
+    except KeyboardInterrupt:
+        sys.exit(130)

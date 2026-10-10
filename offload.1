@@ -42,7 +42,9 @@ Disk space, summary of all targets, recent log entries, admin todo.
 .It Cm drives Op Fl -benchmark
 Scan
 .Pa /Volumes/*
-mount points, classify each as
+mount points, reporting filesystem, SSD, free space, backup
+.Pq Time Machine, Backblaze ,
+ownership, encryption, and role. Classify each as
 .Sy HOT
 .Pq external SSD ,
 .Sy COLD
@@ -64,9 +66,9 @@ so the user can persist the result manually
 .Pq the command never writes the config file itself .
 With
 .Fl -benchmark ,
-adds a SPEED column measured by a 1 GB
+adds a timed
 .Xr dd 1
-read against each non-EXCLUDED drive
+read-speed column measured against each non-EXCLUDED drive
 .Pq about 10s per drive .
 The measurement is page-cache-aware on macOS — trust the relative
 ordering between drives, not absolute MB/s figures.
@@ -83,15 +85,43 @@ iterates every real macOS user account
 .Pq UID >= 500, non-underscore-prefixed
 and prints a section per user plus a grand total. Useful for the
 Admin account auditing which homes still have movable data.
+.It Cm plan
+Advice only: how much the boot drive needs, where each target would
+go, what is private, backup coverage, and priced options
+.Pq buy hardware, cloud
+for any shortfall. Nothing moves; nothing touches the network.
+.It Cm prices Op Fl -update
+Print the dated price table used by
+.Cm plan .
+.Fl -update
+is the only network call
+.Nm
+makes, and only when asked.
+.It Cm repos Op Fl -synced-ok
+Every git repo under
+.Pa ~/Documents/Projects
+with a verdict: keep (active), synced (in a sync folder), reclone
+(clean, pushed, cold), or move (cold but unsafe to remove).
+.It Cm reclone Ar path | all Op Fl -apply
+Restore recloned or moved repositories.
+.It Cm restore Ar Label | path Op Fl -apply
+Bring a cloud archive back.
 .It Cm checklist
 Generated progress checklist, live from OFFLOAD_TARGETS. Includes
 exact commands to advance each entry.
 .It Cm launch Ar BundleName
 Guarded launch. Refuses with a macOS dialog if the app's symlinked
 data directory points to an unmounted volume.
-.It Cm move Ar Label-or-category Op Fl -apply
-Offload one entry by label, or every entry in a category. Categories:
-.Cm app , home , cold , merge , dev , cache , sweep , protected , vm , media-lib .
+.It Cm move Ar Label Op Fl -apply Op Fl -synced-ok Op Fl -upload
+Offload one entry by label. The
+.Fl -synced-ok
+flag permits moving repositories inside sync folders;
+.Fl -upload
+allows a cloud strategy to upload to an approved remote, only with
+.Fl -apply .
+.It Cm move Ar category Op Fl -apply
+Offload every entry in a category. Categories:
+.Cm app , home , cold , merge , dev , cache , sweep , repos , protected , vm , media-lib .
 Default is dry-run; supply
 .Fl -apply
 to mutate.
@@ -175,6 +205,10 @@ Tokens expanded at runtime:
 .It Sy <TH>
 .Pa $TARGET_HOME
 .Pq current user's $HOME by default .
+.It Sy <TARGET_HOME>
+Same as
+.Sy <TH>
+.Pq older configs .
 .It Sy <U>
 basename of
 .Pa $TARGET_HOME .
@@ -182,11 +216,26 @@ basename of
 YYYY-MM-DD.
 .It Sy HOT/
 Prefix —
-.Ev $OFFLOAD_HOT/ .
+.Ev $OFFLOAD_HOT/ ,
+else an SSD in
+.Ev OFFLOAD_DRIVES .
 .It Sy COLD/
 Prefix —
-.Ev $OFFLOAD_COLD/ .
+.Ev $OFFLOAD_COLD/ ,
+else a spinner in
+.Ev OFFLOAD_DRIVES .
+.It Sy CLOUD/
+Prefix — first rclone remote in
+.Ev OFFLOAD_APPROVED_REMOTES .
 .El
+.Pp
+For symlink and archive rows, the drive is picked at move time: the
+first mounted, eligible drive that keeps
+.Ev OFFLOAD_HEADROOM
+free after the move. Network mounts, ExFAT and removable sticks never
+qualify; private labels require an encrypted volume with ownership on.
+An attached encrypted sparsebundle counts as an encrypted drive, unless
+its file sits on the boot drive.
 .Pp
 Strategies:
 .Bl -tag -width 14n
@@ -213,10 +262,23 @@ Apps re-populate the dir as needed.
 .It Cm native-ui
 Printed instructions only. The tool never auto-mutates media
 libraries.
+.It Cm repos
+Cold git repos: clean, pushed repos get a verified
+.Ic git bundle --all
+on COLD, a manifest line, then go (the remote is the archive); unsafe
+repos are copied whole to COLD, verified, then removed.
+.Fl -apply
+re-checks the remote first. Repos in sync folders need
+.Fl -synced-ok .
+.It Cm cloud
+.Xr rclone 1
+copy to an approved remote, check (cryptcheck for crypt), record,
+remove. Only with
+.Fl -apply -upload .
 .El
 .Pp
 Categories:
-.Cm app , home , cold , merge , dev , cache , sweep , protected , vm , media-lib .
+.Cm app , home , cold , merge , dev , cache , sweep , repos , protected , vm , media-lib .
 .Sh OPTIONS
 .Bl -tag -width 22n
 .It Fl -target-home Ar path
@@ -276,15 +338,60 @@ and
 .Ev OFFLOAD_COLD ,
 or from a config file at
 .Pa ${XDG_CONFIG_HOME:-~/.config}/offload/offload.conf .
-The config file is a sourced shell snippet:
+The config file is parsed, never run. It accepts comments,
+.Cm KEY="value"
+lines and
+.Cm KEY=( ... )
+or
+.Cm KEY+=( ... )
+lists of quoted rows; anything else is an error, so a typo cannot
+run as a command:
 .Bd -literal -offset indent
 OFFLOAD_HOT=/Volumes/MyFastSSD
 OFFLOAD_COLD=/Volumes/MyArchiveHDD
-# optional: extend or replace OFFLOAD_TARGETS
+# optional: extend (+=) or replace (=) OFFLOAD_TARGETS
 OFFLOAD_TARGETS+=(
   "MyCustom|app|<TH>/Library/Application Support/Custom|HOT/MovedAppData/<U>/Custom|symlink|no|MyCustom"
 )
 .Ed
+.Pp
+Optional keys:
+.Bl -tag -width 30n
+.It Ev OFFLOAD_DRIVES
+Additional opt-in drives for
+.Sy HOT/
+or
+.Sy COLD/ .
+.It Ev OFFLOAD_HEADROOM
+Percent a drive keeps free after a move.
+.It Ev OFFLOAD_BOOT_FREE_PCT
+Plan's target for the boot drive.
+.It Ev OFFLOAD_PRIVATE_LABELS
+Private labels; defaults to Signal, Messages, Keybase, and iOS-Backups.
+.It Ev OFFLOAD_REPO_KEEP
+Repos never recloned; glob on path or name.
+.It Ev OFFLOAD_APPROVED_REMOTES
+Approved rclone remotes for
+.Sy CLOUD/ .
+.El
+.Pp
+Environment variables:
+.Ev OFFLOAD_HOT ,
+.Ev OFFLOAD_COLD ,
+.Ev OFFLOAD_HEADROOM ,
+.Ev OFFLOAD_CONF ,
+.Ev OFFLOAD_REPO_COLD_DAYS ,
+.Ev OFFLOAD_ALLOW_PLAINTEXT ,
+and
+.Ev OFFLOAD_PRICES_URL .
+.Ev OFFLOAD_VOLUMES
+and
+.Ev OFFLOAD_BZINFO
+point the drive scan elsewhere (tests).
+.Ev OFFLOAD_REPO_COLD_DAYS
+defaults to 90.
+.Ev OFFLOAD_ALLOW_PLAINTEXT Ns =1
+lets private data land on a plain drive, at the user's risk.
 .Pp
 For backward compatibility with v0.1.x, configs that still declare
 .Va OFFLOAD_APPS
@@ -327,6 +434,23 @@ require a separate Admin account whose Terminal has Full Disk Access.
 .Sy Guard launcher.
 .Cm offload launch
 checks the symlink target before opening the app.
+.It
+.Sy Every drive weighed.
+A move goes to a drive that is mounted, fit for the data, and keeps
+headroom; a run never promises the same free space twice. Private data
+never lands in plaintext.
+.It
+.Sy Network only when asked.
+.Cm plan
+and
+.Cm prices
+are advice; the only calls out are
+.Cm prices --update
+and a
+.Sy CLOUD/
+move run with
+.Fl -apply -upload
+to a remote the team approved.
 .El
 .Ss DOES NOT
 .Bl -bullet
@@ -392,6 +516,13 @@ offload drain ROMs --apply     # move to COLD, symlink back
 .Bd -literal -offset indent
 offload media-libraries
 .Ed
+.Ss Where things could go, and what it would cost
+.Bd -literal -offset indent
+offload drives                 # every volume, backup, encryption
+offload plan                   # advice only
+offload repos                  # git repo verdicts
+offload move Repos             # dry run; then --apply
+.Ed
 .Ss Admin running on another user's home
 .Bd -literal -offset indent
 # logged in as Admin account, Terminal has FDA
@@ -410,6 +541,12 @@ Per-run log, append-only.
 Paths collected at run time when an operation failed with EACCES.
 .It Pa ~/bin/offload-admin-pass
 Emitted sudo-review script (only created when admin todo is non-empty).
+.It Pa ${XDG_CONFIG_HOME:-~/.config}/offload/prices.tsv
+Price rows; user rows override by id.
+.It Pa ${XDG_CONFIG_HOME:-~/.config}/offload/reclone.tsv
+Manifest of recloned and moved repositories, and of cloud archives.
+.It Pa <COLD>/offload/Repos/<user>/
+Repository bundles, moved repositories, and manifest copy.
 .El
 .Sh EXIT STATUS
 .Bl -tag -width 4n
@@ -419,6 +556,9 @@ Success.
 Invariant violation, invalid input, or fatal error.
 .It 2
 Destination conflict; manual review required.
+.It 3
+Permission denied; an admin pass is needed (see
+.Pa ~/bin/offload-admin-pass ) .
 .El
 .Sh SEE ALSO
 .Xr rsync 1 ,
