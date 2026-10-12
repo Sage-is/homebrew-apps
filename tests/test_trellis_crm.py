@@ -201,7 +201,7 @@ class FirstStart(Mac):
     def test_the_container_restarts_with_docker_and_listens_on_loopback_only(self):
         self.ok("start")
         (run,) = self.docker_runs()
-        for part in ("--name trellis-crm", "--restart unless-stopped", "--network sage-net", HOST_ENTRY,
+        for part in ("--name trellis-crm", "--restart unless-stopped", "--network sage-network", HOST_ENTRY,
                      "-p 127.0.0.1:8030:8000", "-v trellis-crm-data:/data",
                      f"--env-file {self.env_file}", "ghcr.io/sage-is/trellis:latest"):
             self.assertIn(part, run)
@@ -524,10 +524,10 @@ class Network(Mac):
     def test_the_shared_network_is_made_once_and_ai_ui_joins_it(self):
         (self.state / "container-sage-ai").touch()
         self.ok("start")
-        self.assertIn("docker colima network create sage-net", self.calls())
-        self.assertIn("docker colima network connect sage-net sage-ai", self.calls())
+        self.assertIn("docker colima network create sage-network", self.calls())
+        self.assertIn("docker colima network connect sage-network sage-ai", self.calls())
         self.ok("start")
-        self.assertEqual(self.calls().count("docker colima network create sage-net"), 1)
+        self.assertEqual(self.calls().count("docker colima network create sage-network"), 1)
 
     def test_without_ai_ui_nothing_is_connected(self):
         self.ok("start")

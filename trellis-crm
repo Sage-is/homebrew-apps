@@ -27,7 +27,7 @@ VERSION="$DEFAULT_TAG"
 IMAGE="$IMAGE_REGISTRY:$DEFAULT_TAG"
 CONTAINER="trellis-crm"
 VOLUME="trellis-crm-data"
-NETWORK="sage-net"
+NETWORK="sage-network"
 AI_UI_CONTAINER="sage-ai"
 DEFAULT_PORT=8030
 # Containers reach this machine by name on every runtime: Colima resolves it
