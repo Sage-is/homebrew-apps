@@ -17,9 +17,14 @@ ARCHIVE="$HOME/bin/_archive/replaced-by-brew-$(date +%F)"
 
 field() { sed -n "s/^  $2 \"\(.*\)\"$/\1/p" "$1" | head -1; }
 has_placeholder_sha() { grep -qE '^  sha256 "0{64}"' "$1"; }
+pinned_version() {  # the version line, or the v<X.Y.Z> of the url's tarball when there is none
+  local v; v=$(field "$1" version)
+  [ -n "$v" ] || v=$(basename "$(field "$1" url)" .tar.gz | sed -n 's/^v\([0-9][0-9.]*\)$/\1/p')
+  echo "$v"
+}
 wanted_version() {  # what a tool kept in this tap says; for another repo's tool, what its formula asks for
   if [ -x "./$1" ]; then "./$1" version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
-  else field "Formula/$1.rb" version; fi
+  else pinned_version "Formula/$1.rb"; fi
 }
 
 behind=()
@@ -28,7 +33,7 @@ for formula in Formula/*.rb; do
   name=$(basename "$formula" .rb)
   case "$name" in ai-ui*) continue ;; esac
   wanted=$(wanted_version "$name")
-  pinned=$(field "$formula" version)
+  pinned=$(pinned_version "$formula")
   if [ "$wanted" = "$pinned" ] && ! has_placeholder_sha "$formula"; then
     state="up to date"
   else

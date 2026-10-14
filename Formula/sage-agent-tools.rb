@@ -2,7 +2,6 @@ class SageAgentTools < Formula
   desc "Sage.is agent skills and rules for Claude Code, OpenCode and Codex"
   homepage "https://github.com/Sage-is/agent-tools"
   url "https://github.com/Sage-is/agent-tools/archive/refs/tags/v0.1.0.tar.gz"
-  version "0.1.0"
   sha256 "a31671762c8e8d50b3060c3bb946bebf4a6796066d06d14bda913f3f30b8111b"
   license "MIT"
 

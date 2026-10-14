@@ -39,9 +39,12 @@ wait_for_archive() {  # GitHub serves a new tag's archive within seconds
 [ -f "$formula" ] || die "no $formula"
 case "$tool" in ai-ui*) die "ai-ui ships inside AI-UI's releases: run \`make ai_ui_formula\` after one" ;; esac
 
-pinned_version=$(field version)
-[ -n "$pinned_version" ] || die "$formula needs a version line"
 url=$(field url)
+pinned_version=$(field version)
+# No version line: brew scans it from a v<X.Y.Z>.tar.gz url (brew audit --strict
+# calls an explicit one redundant there). Tap-hosted <tool>-vX tarballs keep theirs.
+[ -n "$pinned_version" ] || pinned_version=$(basename "$url" .tar.gz | sed -n 's/^v\([0-9][0-9.]*\)$/\1/p')
+[ -n "$pinned_version" ] || die "$formula needs a version line or a v<X.Y.Z>.tar.gz url"
 url=${url//$pinned_version/$version}
 tag=$(basename "$url" .tar.gz)
 
