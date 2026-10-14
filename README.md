@@ -326,6 +326,22 @@ brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install work-dele
 delegate-edit --doctor
 ```
 
+## sage-agent-tools
+
+**sage-agent-tools** links the Sage.is skills into Claude Code, OpenCode and Codex and keeps a shared rules block in `~/.claude/CLAUDE.md`. Every skill is a symlink into the brew-kept copy, so `brew upgrade` updates them all at once.
+
+```bash
+brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install sage-agent-tools
+```
+
+```bash
+sage-agent-tools install
+sage-agent-tools rules install
+sage-agent-tools doctor
+```
+
+One route per machine: this installer or the repo's Claude Code plugin, not both. Run `sage-agent-tools uninstall` before `brew uninstall`.
+
 ## Mac apps
 
 Run the tap and trust line at the top first; then:
@@ -385,7 +401,7 @@ make release_tools                  # release every tool that is behind
 make check                          # before a push
 ```
 
-`ai-ui` follows AI-UI's releases through `make ai_ui_formula`; the other tools release with `make tool_release`.
+`ai-ui` follows AI-UI's releases through `make ai_ui_formula`; the other tools release with `make tool_release`. `sage-agent-tools` tags each release in its own repo, as `work-delegation` does, and `make tool_release` waits for that tag before it pins the formula.
 
 ## The vision
 

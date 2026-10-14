@@ -48,6 +48,7 @@ The rules below come from the [Package Acceptance Policy](https://docs.brew.sh/P
 | mdprose | core | 0 | Notability, counted on its own repo (it lives in this tap today). Otherwise shaped for core. |
 | git-release | core | 0 | Notability, counted on its own repo (it lives in this tap today). Otherwise shaped for core. |
 | work-delegation | core | 0 | Notability. Otherwise shaped for core. |
+| sage-agent-tools | core | 0 (new repo, 2026-10-14) | Age and notability: the repo is new. Otherwise shaped for core. Its team companion, `sage-agent-tools-private`, stays in the private tap. |
 | cr-deploy | stays in the tap | 0 | It is an internal ops tool. (Formerly captain; renamed because an official cask uses that name and CapRover's own CLI ships a `caprover-deploy` command.) |
 
 ## The route for ai-ui (decided 2026-09-30)
