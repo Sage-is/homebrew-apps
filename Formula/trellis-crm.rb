@@ -3,7 +3,7 @@ class TrellisCrm < Formula
   homepage "https://github.com/Sage-is/homebrew-apps"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/trellis-crm-v0.1.0.tar.gz"
   version "0.1.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "00c0e97488c7dbc103efddcb319ea72247260ea0d510d9181819c148d4995d29"
   license "MIT"
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
