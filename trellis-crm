@@ -21,9 +21,10 @@ here="$(dirname "$here")"
 source "$here/lib/sage-runtime.sh"
 
 IMAGE_REGISTRY="ghcr.io/sage-is/trellis"
-# The formula pins this to its own version at install; a checkout runs latest.
+# The tool's own version; the release bumps it. The image tag is separate: the
+# formula pins it to the same version at install, and a checkout runs latest.
+VERSION="0.1.0"
 DEFAULT_TAG="latest"
-VERSION="$DEFAULT_TAG"
 IMAGE="$IMAGE_REGISTRY:$DEFAULT_TAG"
 CONTAINER="trellis-crm"
 VOLUME="trellis-crm-data"

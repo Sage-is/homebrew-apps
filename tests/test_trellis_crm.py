@@ -798,7 +798,7 @@ class Lib(unittest.TestCase):
     def assert_runs(self, tool):
         result = self.run_tool(tool)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.startswith("trellis-crm latest "), result.stdout)
+        self.assertRegex(result.stdout, r"^trellis-crm \d+\.\d+\.\d+ \(image ghcr\.io/sage-is/trellis:latest\)")
 
     def test_an_exec_script_in_bin_runs_the_tool_beside_its_lib(self):
         tool = self.place(self.root / "libexec")
