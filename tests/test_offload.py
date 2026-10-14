@@ -576,6 +576,24 @@ class PlanAndPrices(FakeVolumes):
         self.assertIn("--- HOT is below 99% free ---", out)
         self.assertRegex(out, r"offload drain --need \d+")
 
+    def test_plan_never_promises_cold_for_a_hot_row_that_move_refuses(self):
+        ghost, slow = self.volume("Ghost", mounted=False), self.volume("Slow", fs="hfs", ssd=None)
+        self.tree(self.home, {"Library/Application Support/obsidian/a": "a" * 4096})
+        out = self.plan(OFFLOAD_HOT=str(ghost), OFFLOAD_COLD=str(slow))
+        self.assertRegex(out, r"Obsidian +waits for HOT: .*not mounted")
+        self.assertNotIn("COLD: slower", out)
+        self.assertIn("placeable now: 0B", out)
+        result = self.run_tool("move", "Obsidian", "--apply", OFFLOAD_HOT=str(ghost), OFFLOAD_COLD=str(slow))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("No HOT drive can take Obsidian", result.stderr)
+
+    def test_the_drain_covers_headroom_and_the_hot_rows_waiting(self):
+        fast = self.volume("Fast")
+        self.tree(self.home, {"Library/Application Support/obsidian/a": "a" * 4096})
+        out = self.plan(OFFLOAD_HOT=str(fast), OFFLOAD_HEADROOM="99")
+        self.assertRegex(out, r"Obsidian +waits for HOT: .*would leave less than 99% free")
+        self.assertRegex(out, r"offload drain --need \d+ +# 99% headroom plus [\d.]+KiB of HOT rows waiting")
+
     def test_a_shortfall_is_priced_and_stale_prices_are_flagged(self):
         (self.home / "prices.tsv").write_text("b2|cloud|Backblaze B2|6.95|0|month|0|2020-01-01|old row\n")
         out = self.plan("OFFLOAD_BOOT_FREE_PCT=99\n")

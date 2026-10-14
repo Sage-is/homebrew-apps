@@ -306,7 +306,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterator, List, NamedTuple, Optional
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 
 # Built-in targets. Schema: label|category|source|dest|strategy|admin?|bundle
 # Tokens: <TH>=target home, <U>=target user, <DATE>=YYYY-MM-DD; HOT/ and COLD/ prefix the drives.
@@ -2515,7 +2515,7 @@ def cmd_plan(_args: list) -> None:
         else:
             manual += size
     print("--- Fit: on-disk targets, largest first ---")
-    placed, notes, backed = 0, [], set()
+    placed, hot_placed, hot_waiting, notes, backed = 0, 0, 0, [], set()
     for size, t, tier in sorted(placeable, key=lambda x: -x[0]):
         path, why = try_pick(tier, size, t.label)
         verdict = ""
@@ -2524,10 +2524,11 @@ def cmd_plan(_args: list) -> None:
             if t.label in ("Signal", "Messages"):
                 verdict += " (it starts at login, so not inside a disk image either)"
         elif not path and tier == "HOT":
-            path, _ = try_pick("COLD", size, t.label)
-            if path:
-                verdict = f"{os.path.basename(path)} (COLD: slower than HOT)"
+            # move never falls back to COLD: HOT means fast, so the drain below makes room instead.
+            hot_waiting += size
+            verdict = "waits for HOT: " + "; ".join(why)
         elif path:
+            hot_placed += size if tier == "HOT" else 0
             verdict = f"{os.path.basename(path)} ({tier})"
         if path:
             placed += size
@@ -2546,16 +2547,19 @@ def cmd_plan(_args: list) -> None:
             notes.append("iCloud Drive has a Desktop folder: confirm 'Desktop & Documents' sync is off before moving Desktop.")
     print()
     print(f"  placeable now: {human(placed)} · caches and build cruft to clear: {human(immediate)} · "
-          f"admin-only: {human(admin)} · manual (native UI or merge): {human(manual)}")
+          f"admin-only: {human(admin)} · manual (native UI or merge): {human(manual)}"
+          + (f" · waiting for HOT room: {human(hot_waiting)}" if hot_waiting else ""))
     after = boot_free + placed + immediate
     print(f"  boot drive after placing and clearing: {human(after)} free ({100 * after // boot_total}%)")
     hot = volume_for(S.hot) if S.hot else None
-    if hot and hot.size and 100 * hot.free // hot.size < S.headroom:
-        gib = math.ceil(hot.size * S.headroom / 100 / GIB)
+    below = bool(hot and hot.size and 100 * hot.free // hot.size < S.headroom)
+    if hot and hot.size and (below or hot_waiting):
+        gib = math.ceil((hot.size * S.headroom / 100 + hot_placed + hot_waiting) / GIB)
         print()
-        print(f"--- HOT is below {S.headroom}% free ---")
+        print(f"--- HOT is below {S.headroom}% free ---" if below else "--- HOT has no room for the rows waiting ---")
         print(f"  {os.path.basename(hot.mount)} has {human(hot.free)} free. Make room before buying anything:")
-        print(f"    offload drain --need {gib}       # plan: coldest entries move to COLD, each leaves a symlink")
+        print(f"    offload drain --need {gib}       # {S.headroom}% headroom plus {human(hot_waiting)} of HOT rows waiting")
+        print("  The drain moves the coldest entries to COLD, each leaving a symlink. Then re-run 'offload plan'.")
     if "BB" in backed:
         notes.append("Backblaze Personal keeps deleted files 30 days by default (turn on 1-year retention), "
                      "and drops a drive that stays unplugged for 30 days.")
