@@ -32,7 +32,7 @@
   - [x] [WE] This Mac (2026-10-08, Alexander's permission): `default` rebuilt as krunkit on its kept data disk, every volume and image identical; found and fixed abiosoft/colima#1614 (Docker silently on the root disk) with a mount-by-label boot step; `build-vm` proven with an amd64 build
   - [x] [WE] 2026-10-09: `convert` (vz to krunkit, refuses unless Docker's data is on the data disk, prints the way back, resumes from `~/.sage-is/convert`); the runtime code in one shared `lib/sage-runtime.sh` that `sage-runtime` and `trellis-crm` source and AI-UI vendors (`make runtime_sync`, drift test); Docker Desktop step-away (login helper to the Keychain, dangling plugin links, Login Item note, `brew --prefix`, `$SAGE_DATA` guard on `build-vm`); 154 tests
   - [x] [WE] 2026-10-09: `make convert_to_krunkit` in Trellis and AI-UI; one install line everywhere (`brew tap sage-is/apps && brew tap libkrun/krun && brew trust --tap sage-is/apps libkrun/krun && brew install …`); `tool-release.sh` and `check-formulae.sh` check every file a formula installs (`lib/`)
-  - [ ] [MANUALLY] `make tool_release TOOL=sage-runtime VERSION=0.1.0 APPLY=1` and `TOOL=trellis-crm`, so peers install without `--HEAD`
+  - [x] Released: sage-runtime 0.1.0 (2026-10-11), trellis-crm 0.1.0 and 0.1.1 (2026-10-14); peers install without `--HEAD`
   - [ ] [MANUALLY] Peer installs: the install line above, then `sage-runtime migrate` (from Docker Desktop) or `sage-runtime convert --yes` (from Colima vz)
   - [ ] [MANUALLY] After 2026-10-16: uninstall Docker Desktop on this Mac and delete `/Volumes/Somma 01 Dock Drive/Docker/DockerDesktop/Docker.raw` (49 GB)
 
@@ -82,7 +82,8 @@
 
 - [ ] **trellis-crm joins the tap** (Alexander, 2026-10-07): the Trellis source stays private; the CLI, its tests and its formula live here
   - [x] [WE] Moved from Trellis `cli/` with its 31 tests; `trellis-crm dev` added, beside the real instance on `127.0.0.1:8031` (5 tests); `Formula/trellis-crm.rb`, not yet released
-  - [ ] [MANUALLY] First image `v0.1.0` on GHCR as a private package (Trellis `make ship`), then `make tool_release TOOL=trellis-crm VERSION=0.1.0`
+  - [x] 2026-10-14: Trellis `v0.1.0` tagged and `ghcr.io/sage-is/trellis:0.1.0` pushed as a private package (both arches, from the build VM); trellis-crm 0.1.0 and 0.1.1 released; `0.1.1` is the same image retagged, since the formula pins the image to the CLI's version
+  - [ ] Poka-yoke: `tool-release.sh` checks, for trellis-crm, that `ghcr.io/sage-is/trellis:<version>` exists before it tags, or retags the previous image (`docker buildx imagetools create`); today the pin can name an image nobody pushed
   - [ ] One copy of the shared shell: `trellis-crm` carries ai-ui's runtime block and path helpers; one file in the tap, sourced by both
 
 ## v0.2.0 — Current
