@@ -117,6 +117,8 @@ esac""",
   hw.ncpu)    echo "${MAC_CORES:-10}" ;;
 esac""",
     "uname": """if [[ "${1:-}" == -m ]]; then echo "${MAC_ARCH:-arm64}"; else exec /usr/bin/uname "$@"; fi""",
+    # git is logged; a stub answers no repository, so nothing is found by remote.
+    "git": 'echo "git $*" >> "$STATE/calls"; case "$1" in rev-parse|remote) exit 1 ;; esac',
     "curl": """echo "curl $*" >> "$STATE/calls"
 echo '{"ok": true, "worker": "on"}'""",
     # launchd starts Colima as it loads the daemon (RunAtLoad).
@@ -774,6 +776,61 @@ class DevMode(Mac):
         self.ok("dev", "--stop")
         self.assertFalse((self.state / "container-trellis-crm-dev").exists())
         self.assertTrue((self.state / "up-trellis-crm").exists())
+
+
+class SourceMode(Mac):
+    """Server mode from a checkout: the checkout's code replaces the image's; everything else stays."""
+
+    def checkout(self):
+        repo = self.home / "src" / "trellis"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "manage.py").write_text("")
+        return repo
+
+    def test_start_mounts_the_checkout_over_the_code_and_keeps_server_mode(self):
+        repo = self.checkout()
+        self.ok("start", "--source", str(repo))
+        (run,) = self.docker_runs()
+        for part in (f"-v {repo}:/app", "-v trellis-crm-data:/data", "--restart unless-stopped",
+                     f"--env-file {self.env_file}", "ghcr.io/sage-is/trellis:latest"):
+            self.assertIn(part, run)
+        self.assertEqual(self.settings()["TRELLIS_SOURCE"], str(repo))
+        self.ok("start")  # the next plain start keeps the checkout
+        self.assertIn(f"-v {repo}:/app", self.docker_runs()[-1])
+        self.ok("start", "--no-source")
+        self.assertNotIn(":/app", self.docker_runs()[-1])
+
+    def test_update_pulls_the_checkout_before_the_image(self):
+        repo = self.checkout()
+        self.ok("start", "--source", str(repo))
+        self.ok("update")
+        calls = self.calls()
+        after_pull = calls[calls.index(f"git -C {repo} pull --ff-only"):]
+        self.assertIn("docker colima pull ghcr.io/sage-is/trellis:latest", after_pull)  # the image follows the checkout
+        self.assertIn(f"-v {repo}:/app", self.docker_runs()[-1])
+
+    def test_a_folder_that_is_not_trellis_or_outside_home_is_refused(self):
+        other = self.home / "notes"
+        other.mkdir()
+        result = self.run_cli("start", "--source", str(other))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a Trellis checkout", result.stdout)
+        outside = self.home.parent / "elsewhere"
+        (outside / ".git").mkdir(parents=True)
+        (outside / "manage.py").write_text("")
+        result = self.run_cli("start", "--source", str(outside))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside your home folder", result.stdout)
+        self.assertEqual(self.docker_runs(), [])
+
+    def test_a_vanished_checkout_stops_start_with_the_way_out(self):
+        repo = self.checkout()
+        self.ok("start", "--source", str(repo))
+        shutil.rmtree(repo)
+        result = self.run_cli("start")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--no-source", result.stdout)
+        self.assertEqual(len(self.docker_runs()), 1)
 
 
 class Lib(unittest.TestCase):

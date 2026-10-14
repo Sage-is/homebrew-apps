@@ -23,7 +23,7 @@ source "$here/lib/sage-runtime.sh"
 IMAGE_REGISTRY="ghcr.io/sage-is/trellis"
 # The tool's own version; the release bumps it. The image tag is separate: the
 # formula pins it to the same version at install, and a checkout runs latest.
-VERSION="0.1.0"
+VERSION="0.1.1"
 DEFAULT_TAG="latest"
 IMAGE="$IMAGE_REGISTRY:$DEFAULT_TAG"
 CONTAINER="trellis-crm"
@@ -57,10 +57,12 @@ Usage: $PROG <command> [options]
 
 Commands:
   start  [--port PORT] [--bind ADDR] [--url URL] [--profile NAME] [--tag X.Y.Z]
+         [--source DIR | --no-source]
                         Start Trellis (default: http://localhost:$DEFAULT_PORT). Port, address,
-                        URL and profile are saved in $ENV_FILE
+                        URL, profile and source are saved in $ENV_FILE. --source runs
+                        the code from a checkout: a git pull there, then update, upgrades it
   stop                  Stop Trellis; it stays stopped across reboots until start
-  update [--tag X.Y.Z]  Back up, pull the image and start again
+  update [--tag X.Y.Z]  Back up, pull the checkout (if set) and the image, start again
   status                Container, image, address and health
   logs                  Follow the container's output
   open                  Open Trellis in your browser
@@ -364,8 +366,26 @@ is_ephemeral_path() {
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+# A checkout the real Trellis may run from: the dev command's checks, one place.
+# Prints nothing on success; the caller resolves the path itself.
+require_checkout() {
+  local dir="$1"
+  [[ -d "$dir" ]] || { echo "Error: no folder at $dir"; exit 1; }
+  if [[ ! -f "$dir/manage.py" ]]; then
+    echo "Error: $dir is not a Trellis checkout (no manage.py)."
+    exit 1
+  fi
+  # Colima shares only the home folder with containers; elsewhere the mount is empty.
+  case "$dir/" in
+    "$HOME"/*) ;;
+    *) echo "Error: $dir is outside your home folder, which the container cannot see. Move it under $HOME."
+       exit 1 ;;
+  esac
+}
+
 cmd_start() {
-  local port="" bind="" url="" profile="" first_run=0 new_volume=0
+  local port="" bind="" url="" profile="" source_opt="" source_dir="" first_run=0 new_volume=0
+  local mounts=(-v "$VOLUME:/data")
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --port)    port="$2"; shift 2 ;;
@@ -373,6 +393,8 @@ cmd_start() {
       --url)     url="$2"; shift 2 ;;
       --profile) profile="$2"; shift 2 ;;
       --tag)     set_tag "$2"; shift 2 ;;
+      --source)  source_opt="$(cd "$2" 2>/dev/null && pwd || echo "$2")"; require_checkout "$source_opt"; shift 2 ;;
+      --no-source) source_opt=none; shift ;;
       *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
@@ -389,6 +411,20 @@ cmd_start() {
   [[ -z "$bind" ]] || env_set TRELLIS_BIND "$bind"
   [[ -z "$url" ]] || env_set CRM_PUBLIC_URL "${url%/}"
   [[ -z "$profile" ]] || env_set CRM_PROFILE "$profile"
+  case "$source_opt" in
+    "")   ;;
+    none) env_set TRELLIS_SOURCE "" ;;
+    *)    env_set TRELLIS_SOURCE "$source_opt" ;;
+  esac
+  source_dir="$(env_get TRELLIS_SOURCE)"
+  if [[ -n "$source_dir" ]]; then
+    if [[ ! -f "$source_dir/manage.py" ]]; then
+      echo "Error: the checkout $source_dir is gone. Point at it again: $PROG start --source DIR"
+      echo "  Or run the image's own code: $PROG start --no-source"
+      exit 1
+    fi
+    mounts+=(-v "$source_dir:/app")  # the checkout's code over the image's; the image still brings the dependencies
+  fi
   port="$(env_get TRELLIS_PORT)"
   port="${port:-$DEFAULT_PORT}"
   bind="$(env_get TRELLIS_BIND)"
@@ -406,7 +442,7 @@ cmd_start() {
     --network "$NETWORK" \
     "$HOST_ENTRY" \
     -p "$bind:$port:8000" \
-    -v "$VOLUME:/data" \
+    "${mounts[@]}" \
     --env-file "$ENV_FILE" \
     "$IMAGE" >/dev/null
   wait_healthy
@@ -425,6 +461,7 @@ cmd_start() {
   if [[ $first_run == 1 ]]; then
     echo "  Settings and secrets: $ENV_FILE"
   fi
+  [[ -z "$source_dir" ]] || echo "  Code: $source_dir. After a git pull there: $PROG update"
 }
 
 # Same lookup as `ai-ui dev`: --dir, then TRELLIS_DEV_DIR, then a clone here,
@@ -537,6 +574,12 @@ cmd_update() {
   ensure_docker
   if container_running; then
     cmd_backup
+  fi
+  local source_dir
+  source_dir="$(env_get TRELLIS_SOURCE)"
+  if [[ -n "$source_dir" ]]; then
+    echo "Pulling $source_dir..."
+    git -C "$source_dir" pull --ff-only
   fi
   pull_image
   cmd_start "$@"
