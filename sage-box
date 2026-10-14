@@ -1,0 +1,608 @@
+#!/bin/bash
+set -euo pipefail
+# sage-box: a Mac becomes a Sage.is box in one run.
+#
+# A box is a Mac that runs our apps for a team. One file per box,
+# ~/.sage-is/boxes/<name>.env, names it (address, login), the vault items that
+# unlock it (bw: references) and what it runs. `sage-box <name>` reaches the
+# box over SSH, says what it found and what it would change, and changes
+# nothing. --apply runs the plan; every step is idempotent, so a second run
+# finds everything in place. Secrets travel from the vault into this process
+# and over SSH on stdin: never onto a command line, never onto a disk here.
+VERSION="0.1.0"
+PROG="sage-box"
+# The runtime code lives in lib/ beside this script, in a checkout and in the
+# formula's libexec alike. A link to it, such as one in ~/bin, leads there.
+here="${BASH_SOURCE[0]}"
+while [[ -L "$here" ]]; do
+  target="$(readlink "$here")"
+  if [[ "$target" == /* ]]; then here="$target"; else here="$(dirname "$here")/$target"; fi
+done
+here="$(dirname "$here")"
+[[ -f "$here/lib/sage-runtime.sh" ]] || { echo "Error: $here/lib/sage-runtime.sh is missing. Reinstall the formula (brew reinstall sage-box), or run sage-box from a checkout of the tap, which has lib/." >&2; exit 1; }
+# shellcheck source=lib/sage-runtime.sh
+source "$here/lib/sage-runtime.sh"
+
+BOXES_DIR="${SAGE_BOXES_DIR:-$SAGE_CONFIG_DIR/boxes}"
+TAP="sage-is/apps"
+KRUNKIT_TAP="libkrun/krun"
+HOMEBREW_PKG="https://github.com/Homebrew/brew/releases/latest/download/Homebrew.pkg"
+TRELLIS_CLONE_URL="git@github.com:Sage-is/trellis.git"
+DEPLOY_KEY_FILE='$HOME/.ssh/trellis-deploy'
+BOOT_PLIST="/Library/LaunchDaemons/is.sage.colima.plist"
+BACKUP_LABEL="is.sage.trellis-backup"
+BACKUP_PLIST="/Library/LaunchDaemons/$BACKUP_LABEL.plist"
+BOX_BACKUPS='$HOME/.sage-is/backups/trellis-crm'
+KEEP_BACKUPS=14
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
+APPLY=0
+REBOOT=0
+CHANGES=0
+
+usage() {
+  cat <<EOF
+Usage: $PROG <box> [--apply] [--reboot]
+       $PROG <box> update | backup [--nightly] | status
+       $PROG local
+       $PROG version
+
+A box is named by $BOXES_DIR/<box>.env (mode 600; the example is
+docs/boxes/example.env in the tap). Without --apply, $PROG reaches the box,
+prints what it found and what it would change, and changes nothing.
+
+  --apply     run the plan: tools, runtime, power, code, registry, Trellis,
+              backups, then verify
+  --reboot    with --apply: restart the box at the end and verify it comes back
+  update      brew upgrade our tools; in source mode git pull the checkout;
+              trellis-crm update; ai-ui start when the box runs AI-UI
+  backup      pull the box's newest trellis-crm backup, encrypt it with age to
+              BOX_BACKUP_TO, keep the last $KEEP_BACKUPS in BOX_BACKUP_DIR;
+              --nightly installs a launchd agent on this Mac that does so at 03:30
+  status      both apps, the VM, the boot daemon and the newest backup
+  local       the same tool and runtime checks on this Mac, no SSH
+
+Modes (BOX_MODE): source runs Trellis from a checkout on the box, image runs
+the released image, peer installs the tools and the VM and no Trellis.
+EOF
+}
+
+# --- the box file ---------------------------------------------------------------
+
+box_file() { echo "$BOXES_DIR/$1.env"; }
+
+# Every value of the box file reaches this process through sage-secret, which
+# resolves the bw: references from the vault into the environment once. The
+# file's own lines pass through as they are, so BOX_HOST and the rest are set.
+load_box() {
+  local name="$1" file mode
+  file="$(box_file "$name")"
+  [[ -f "$file" ]] || die "no box file $file. Copy docs/boxes/example.env from the tap and fill it in."
+  mode="$(stat -f %Lp "$file" 2>/dev/null || stat -c %a "$file" 2>/dev/null || echo "?")"
+  [[ "$mode" == 600 ]] || die "$file must be mode 600, since it names vault items: chmod 600 \"$file\""
+  if [[ -z "${BOX_RESOLVED:-}" ]]; then
+    command -v sage-secret &>/dev/null || die "sage-secret is not installed: brew install $TAP/sage-secret"
+    BOX_RESOLVED=1 exec sage-secret run --env "$file" -- "$0" "${ORIGINAL_ARGS[@]}"
+  fi
+  local key
+  for key in BOX_HOST BOX_USER BOX_SSH_KEY BOX_SUDO; do
+    [[ -n "${!key:-}" ]] || die "$file needs $key"
+  done
+  BOX_MODE="${BOX_MODE:-image}"
+  case "$BOX_MODE" in
+    source|image|peer) ;;
+    *) die "BOX_MODE must be source, image or peer; $file says $BOX_MODE" ;;
+  esac
+  BOX_AI_UI="${BOX_AI_UI:-0}"
+  BOX_PROFILE="${BOX_PROFILE:-sage}"
+  BOX_PORT="${BOX_PORT:-8030}"
+  BOX_URL="${BOX_URL:-http://localhost:$BOX_PORT}"
+  BOX_CHECKOUT="${BOX_CHECKOUT:-}"
+  BOX_DEPLOY_KEY="${BOX_DEPLOY_KEY:-}"
+  BOX_GHCR_USER="${BOX_GHCR_USER:-}"
+  BOX_GHCR_TOKEN="${BOX_GHCR_TOKEN:-}"
+  BOX_REVIEW_AT="${BOX_REVIEW_AT:-}"
+  BOX_SHIFT_END="${BOX_SHIFT_END:-}"
+  BOX_BACKUP_DIR="${BOX_BACKUP_DIR:-}"
+  BOX_BACKUP_TO="${BOX_BACKUP_TO:-}"
+  if [[ "$BOX_MODE" == source ]]; then
+    [[ -n "$BOX_CHECKOUT" && -n "$BOX_DEPLOY_KEY" ]] || die "source mode needs BOX_CHECKOUT and BOX_DEPLOY_KEY in $file"
+    case "$BOX_CHECKOUT" in /*) ;; *) die "BOX_CHECKOUT must be an absolute path on the box (no ~): $BOX_CHECKOUT" ;; esac
+  fi
+  if [[ "$BOX_MODE" != peer ]]; then
+    [[ -n "$BOX_GHCR_USER" && -n "$BOX_GHCR_TOKEN" ]] || die "$BOX_MODE mode needs BOX_GHCR_USER and BOX_GHCR_TOKEN in $file: the Trellis image is private"
+  fi
+}
+
+# --- reaching the box -----------------------------------------------------------
+
+# An ssh-agent of this run's own holds the key from the vault; it dies with the run.
+agent_up() {
+  eval "$(ssh-agent -s)" >/dev/null
+  trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+  printf '%s\n' "$BOX_SSH_KEY" | ssh-add -q - 2>/dev/null || die "the SSH key in the vault did not load (BOX_SSH_KEY)"
+}
+
+target() { echo "$BOX_USER@$BOX_HOST"; }
+
+# What every remote script starts with: brew on the PATH (a non-interactive
+# shell has no profile) and the box's settings as variables.
+prelude() {
+  cat <<EOF
+eval "\$(/opt/homebrew/bin/brew shellenv 2>/dev/null)" 2>/dev/null || true
+export HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1
+BOX_CHECKOUT=$(printf '%q' "$BOX_CHECKOUT") BOX_PORT=$(printf '%q' "$BOX_PORT") BOX_PROFILE=$(printf '%q' "$BOX_PROFILE") BOX_URL=$(printf '%q' "$BOX_URL")
+BOX_REVIEW_AT=$(printf '%q' "$BOX_REVIEW_AT") BOX_SHIFT_END=$(printf '%q' "$BOX_SHIFT_END") BOX_USER=$(printf '%q' "$BOX_USER")
+EOF
+}
+
+# Run a script on the box. It travels as base64 inside the command, so the
+# box's login shell never parses it, and stdin stays free for one secret.
+remote() {
+  local b64
+  b64="$(printf '%s\n%s' "$(prelude)" "$1" | base64 | tr -d '\n')"
+  ssh "${SSH_OPTS[@]}" "$(target)" "bash -c \"\$(echo $b64 | base64 -d)\""
+}
+
+# The same, after sudo takes the box's password from stdin once. The script
+# then calls sudo -n: the grant is cached for this shell, and a child process
+# (trellis-crm boot, say) would not see it, so the steps run here by name.
+sudo_remote() {
+  printf '%s\n' "$BOX_SUDO" | remote 'sudo -S -p "" -v 2>/dev/null || { echo "sudo refused the password from the vault (BOX_SUDO)" >&2; exit 97; }
+'"$1"
+}
+
+# A secret on stdin for a script that reads it, such as docker login.
+remote_with_stdin() { printf '%s\n' "$2" | remote "$1"; }
+
+# --- what the box holds ---------------------------------------------------------
+
+# One round trip answers every question; each line becomes found_<key>.
+probe() {
+  local key value
+  while IFS='=' read -r key value; do
+    [[ -n "$key" ]] || continue
+    printf -v "found_${key//-/_}" '%s' "$value"
+  done < <(remote '
+echo "arch=$(uname -m)"
+echo "os=$(sw_vers -productVersion 2>/dev/null || uname -s)"
+echo "brew=$(command -v brew || echo missing)"
+for t in sage-runtime trellis-crm ai-ui; do v="$($t version 2>/dev/null | head -1 | awk "{print \$2}")"; echo "$(echo "$t" | tr - _)=${v:-missing}"; done
+echo "vm=$(sed -n "s/^vmType: *//p" ~/.colima/default/colima.yaml 2>/dev/null)"
+echo "context=$(docker context show 2>/dev/null)"
+echo "boot=$([ -f '"$BOOT_PLIST"' ] && echo yes || echo no)"
+echo "backup_daemon=$([ -f '"$BACKUP_PLIST"' ] && echo yes || echo no)"
+echo "autorestart=$(pmset -g 2>/dev/null | awk "/^ *autorestart/{print \$2}")"
+echo "sleep=$(pmset -g 2>/dev/null | awk "/^ *sleep /{print \$2}")"
+echo "ghcr=$(grep -q ghcr.io ~/.docker/config.json 2>/dev/null && echo yes || echo no)"
+echo "deploy_key=$([ -f '"$DEPLOY_KEY_FILE"' ] && echo yes || echo no)"
+if [ -n "$BOX_CHECKOUT" ] && [ -f "$BOX_CHECKOUT/manage.py" ]; then echo "checkout=$(git -C "$BOX_CHECKOUT" log -1 --format=%h 2>/dev/null || echo present)"; else echo "checkout=none"; fi
+echo "source=$(sed -n "s/^TRELLIS_SOURCE=//p" ~/.sage-is/trellis-crm.env 2>/dev/null)"
+echo "profile=$(sed -n "s/^CRM_PROFILE=//p" ~/.sage-is/trellis-crm.env 2>/dev/null)"
+echo "review_at=$(sed -n "s/^REVIEW_AT=//p" ~/.sage-is/trellis-crm.env 2>/dev/null)"
+echo "shift_end=$(sed -n "s/^SHIFT_END=//p" ~/.sage-is/trellis-crm.env 2>/dev/null)"
+echo "trellis=$(curl -fsS --max-time 5 "http://127.0.0.1:$BOX_PORT/crm/health/" >/dev/null 2>&1 && echo up || echo down)"
+echo "aiui=$(curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1 && echo up || echo down)"
+echo "filevault=$(fdesetup status 2>/dev/null | grep -q " On" && echo on || echo off)"
+echo "leftovers=$(sage-runtime status 2>/dev/null | grep -cE "leads nowhere|leads to Docker Desktop|plugin hooks|buildx not found" || true)"
+')
+  : "${found_arch:=?}" "${found_os:=?}" "${found_brew:=missing}" "${found_vm:=}" "${found_boot:=no}" "${found_backup_daemon:=no}"
+  : "${found_autorestart:=}" "${found_sleep:=}" "${found_ghcr:=no}" "${found_deploy_key:=no}" "${found_checkout:=none}"
+  : "${found_source:=}" "${found_profile:=}" "${found_review_at:=}" "${found_shift_end:=}" "${found_trellis:=down}"
+  : "${found_aiui:=down}" "${found_filevault:=off}" "${found_leftovers:=0}" "${found_context:=}"
+  : "${found_sage_runtime:=missing}" "${found_trellis_crm:=missing}" "${found_ai_ui:=missing}"
+}
+
+# --- the plan ----------------------------------------------------------------------
+
+# step NAME FOUND ACTION RUNNER: an empty ACTION means the box already has it.
+step() {
+  local name="$1" found="$2" action="$3" runner="${4:-}"
+  if [[ -z "$action" ]]; then
+    printf '  ok     %-9s %s\n' "$name" "$found"
+  elif [[ $APPLY == 1 ]]; then
+    printf '  doing  %-9s %s\n' "$name" "$action"
+    "$runner"
+  else
+    printf '  would  %-9s %s (found: %s)\n' "$name" "$action" "$found"
+    CHANGES=$((CHANGES + 1))
+  fi
+}
+
+tools_wanted() {
+  local list="sage-runtime trellis-crm"
+  [[ "$BOX_AI_UI" != 1 ]] || list="$list ai-ui"
+  echo "$list"
+}
+
+tools_missing() {
+  local t missing=""
+  for t in $(tools_wanted); do
+    local v; v="found_$(echo "$t" | tr - _)"
+    [[ "${!v}" != missing ]] || missing="$missing $t"
+  done
+  echo "${missing# }"
+}
+
+run_homebrew() {
+  sudo_remote 'curl -fsSL -o /tmp/Homebrew.pkg '"$HOMEBREW_PKG"' && sudo -n installer -pkg /tmp/Homebrew.pkg -target / >/dev/null && rm -f /tmp/Homebrew.pkg
+grep -q "brew shellenv" ~/.zprofile 2>/dev/null || echo '"'"'eval "$(/opt/homebrew/bin/brew shellenv)"'"'"' >> ~/.zprofile'
+}
+
+run_tools() {
+  [[ "$found_brew" != missing ]] || run_homebrew
+  remote 'brew tap '"$TAP"' >/dev/null 2>&1 || true; brew tap '"$KRUNKIT_TAP"' >/dev/null 2>&1 || true
+brew trust --tap '"$TAP"' '"$KRUNKIT_TAP"' >/dev/null 2>&1 || true
+brew update >/dev/null 2>&1 || true
+brew install '"$(tools_missing)"' 2>&1 | grep -vE "^==> (Downloading|Pouring|Fetching)|^\s*$" | tail -3'
+}
+
+step_tools() {
+  local missing; missing="$(tools_missing)"
+  local found="sage-runtime $found_sage_runtime, trellis-crm $found_trellis_crm"
+  [[ "$BOX_AI_UI" != 1 ]] || found="$found, ai-ui $found_ai_ui"
+  [[ "$found_brew" != missing ]] || found="no Homebrew; $found"
+  if [[ -z "$missing" ]]; then step tools "$found" ""; return; fi
+  local action="brew install $missing"
+  [[ "$found_brew" != missing ]] || action="install Homebrew (its signed .pkg, with sudo), then $action"
+  step tools "$found" "$action" run_tools
+}
+
+run_runtime() {
+  case "$found_vm" in
+    "")  remote 'sage-runtime use colima 2>&1 | tail -2' ;;
+    vz)  remote 'sage-runtime convert --yes 2>&1 | tail -2' ;;
+  esac
+}
+
+step_runtime() {
+  case "$found_vm" in
+    "")      step runtime "no Colima VM" "sage-runtime use colima (a new krunkit VM sized for the box)" run_runtime ;;
+    vz)      if [[ "$found_arch" == arm64 ]]; then
+               step runtime "Colima VM is vz" "sage-runtime convert --yes (krunkit on the same data disk; its dry run is sage-runtime convert)" run_runtime
+             else
+               step runtime "Colima VM is vz on $found_arch" ""
+             fi ;;
+    krunkit) step runtime "Colima VM is krunkit" "" ;;
+    *)       step runtime "Colima VM is $found_vm" "" ;;
+  esac
+}
+
+# What sage-runtime status lists after Docker Desktop: the bits this tool
+# knows how to mend. The rest it prints for a person.
+run_leftovers() {
+  sudo_remote 'find ~/.docker/cli-plugins -type l ! -exec test -e {} \; -delete 2>/dev/null || true
+for l in /usr/local/bin/docker*; do [ -L "$l" ] && [ ! -e "$l" ] && sudo -n rm -f "$l"; done; true
+[ -S "$HOME/.colima/default/docker.sock" ] && sudo -n ln -sfn "$HOME/.colima/default/docker.sock" /var/run/docker.sock || true
+command -v docker-buildx >/dev/null 2>&1 || brew list docker-buildx >/dev/null 2>&1 || brew install docker-buildx >/dev/null 2>&1 || true
+sage-runtime use colima >/dev/null 2>&1 || true
+sage-runtime status 2>&1 | grep -E "leads nowhere|leads to Docker Desktop|plugin hooks|buildx not found" || true'
+}
+
+step_leftovers() {
+  if [[ "$found_leftovers" == 0 ]]; then
+    step leftovers "nothing left from Docker Desktop" ""
+  else
+    step leftovers "$found_leftovers lines in sage-runtime status" "mend the dangling plugin links, /var/run/docker.sock, buildx; print what remains" run_leftovers
+  fi
+}
+
+run_power() {
+  sudo_remote 'sudo -n pmset -a sleep 0 autorestart 1'
+}
+
+run_boot() {
+  sudo_remote 'T=$(mktemp); trellis-crm boot --print > "$T" && sudo -n install -m 644 -o root -g wheel "$T" '"$BOOT_PLIST"' && rm -f "$T"
+sudo -n launchctl bootout system/is.sage.colima 2>/dev/null || true
+sudo -n launchctl bootstrap system '"$BOOT_PLIST"
+}
+
+step_power() {
+  if [[ "$found_sleep" == 0 && "$found_autorestart" == 1 ]]; then
+    step power "sleep off, restarts after a power cut" ""
+  else
+    step power "sleep ${found_sleep:-?}, autorestart ${found_autorestart:-?}" "pmset -a sleep 0 autorestart 1" run_power
+  fi
+  if [[ "$found_boot" == yes ]]; then
+    step boot "Colima starts at power-on" ""
+  elif [[ "$found_trellis_crm" == missing && $APPLY == 0 ]]; then
+    step boot "no boot daemon" "install it from trellis-crm boot --print, once trellis-crm is there" run_boot
+  else
+    step boot "no boot daemon" "install the LaunchDaemon from trellis-crm boot --print" run_boot
+  fi
+}
+
+run_deploy_key() {
+  remote_with_stdin 'umask 077; mkdir -p ~/.ssh; cat > '"$DEPLOY_KEY_FILE"'; chmod 600 '"$DEPLOY_KEY_FILE" "$BOX_DEPLOY_KEY"
+}
+
+run_checkout() {
+  remote 'export GIT_SSH_COMMAND="ssh -i '"$DEPLOY_KEY_FILE"' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+if [ -f "$BOX_CHECKOUT/manage.py" ]; then git -C "$BOX_CHECKOUT" config core.sshCommand "$GIT_SSH_COMMAND"; exit 0; fi
+mkdir -p "$(dirname "$BOX_CHECKOUT")"
+if ! git clone -q '"$TRELLIS_CLONE_URL"' "$BOX_CHECKOUT" 2>&1 | tail -2; then
+  echo "The clone was refused. Register the box key as a read-only deploy key on Sage-is/trellis (an admin, once):"
+  echo "  gh api -X POST repos/Sage-is/trellis/keys -f title=\"'"$BOX_USER"' box (read-only)\" -F read_only=true -f key=\"$(ssh-keygen -y -f '"$DEPLOY_KEY_FILE"')\""
+  exit 1
+fi
+git -C "$BOX_CHECKOUT" config core.sshCommand "$GIT_SSH_COMMAND"'
+}
+
+step_code() {
+  [[ "$BOX_MODE" == source ]] || return 0
+  if [[ "$found_deploy_key" == yes ]]; then
+    step key "deploy key on the box" ""
+  else
+    step key "no deploy key" "place the read-only deploy key from the vault at ~/.ssh/trellis-deploy" run_deploy_key
+  fi
+  if [[ "$found_checkout" != none ]]; then
+    step checkout "$BOX_CHECKOUT at $found_checkout" ""
+  else
+    step checkout "no checkout" "git clone Sage-is/trellis into $BOX_CHECKOUT with that key" run_checkout
+  fi
+}
+
+run_registry() {
+  remote_with_stdin 'docker login ghcr.io -u '"$(printf '%q' "$BOX_GHCR_USER")"' --password-stdin 2>&1 | tail -1' "$BOX_GHCR_TOKEN"
+}
+
+step_registry() {
+  [[ "$BOX_MODE" != peer ]] || return 0
+  if [[ "$found_ghcr" == yes ]]; then
+    step registry "signed in to ghcr.io" ""
+  else
+    step registry "not signed in to ghcr.io" "docker login ghcr.io as $BOX_GHCR_USER with the token from the vault on stdin" run_registry
+  fi
+}
+
+# The settings only trellis-crm start does not take: written as trellis-crm
+# writes them, one KEY= line each, then start again reads them.
+run_trellis() {
+  local source_flag="--no-source"
+  [[ "$BOX_MODE" != source ]] || source_flag="--source $(printf '%q' "$BOX_CHECKOUT")"
+  remote 'F=~/.sage-is/trellis-crm.env
+[ -f "$F" ] || trellis-crm start --profile "$BOX_PROFILE" --url "$BOX_URL" --port "$BOX_PORT" '"$source_flag"' 2>&1 | tail -3
+for pair in "REVIEW_AT=$BOX_REVIEW_AT" "SHIFT_END=$BOX_SHIFT_END"; do
+  k="${pair%%=*}"; v="${pair#*=}"; [ -n "$v" ] || continue
+  T="$(mktemp "$F.XXXXXX")"; grep -v "^$k=" "$F" > "$T" || true; echo "$k=$v" >> "$T"; chmod 600 "$T"; mv "$T" "$F"
+done
+trellis-crm start --profile "$BOX_PROFILE" --url "$BOX_URL" --port "$BOX_PORT" '"$source_flag"' 2>&1 | tail -3'
+}
+
+run_aiui() { remote 'ai-ui start 2>&1 | tail -2'; }
+
+step_trellis() {
+  [[ "$BOX_MODE" != peer ]] || return 0
+  local want_source=""
+  [[ "$BOX_MODE" != source ]] || want_source="$BOX_CHECKOUT"
+  local differs=""
+  [[ "$found_profile" == "$BOX_PROFILE" ]] || differs="$differs profile"
+  [[ "$found_source" == "$want_source" ]] || differs="$differs source"
+  [[ -z "$BOX_REVIEW_AT" || "$found_review_at" == "$BOX_REVIEW_AT" ]] || differs="$differs REVIEW_AT"
+  [[ -z "$BOX_SHIFT_END" || "$found_shift_end" == "$BOX_SHIFT_END" ]] || differs="$differs SHIFT_END"
+  if [[ "$found_trellis" == up && -z "$differs" ]]; then
+    step trellis "up on :$BOX_PORT, profile $found_profile${found_source:+, from $found_source}" ""
+  elif [[ "$found_trellis" == up ]]; then
+    step trellis "up, but${differs} differ" "set${differs} and start again (trellis-crm start $BOX_MODE mode)" run_trellis
+  else
+    step trellis "down" "trellis-crm start --profile $BOX_PROFILE $([[ "$BOX_MODE" == source ]] && echo "--source $BOX_CHECKOUT" || echo --no-source)" run_trellis
+  fi
+  if [[ "$BOX_AI_UI" == 1 ]]; then
+    if [[ "$found_aiui" == up ]]; then step ai-ui "up on :8080" ""; else step ai-ui "down" "ai-ui start" run_aiui; fi
+  fi
+}
+
+backup_plist() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$BACKUP_LABEL</string>
+  <key>UserName</key><string>$BOX_USER</string>
+  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/trellis-crm</string><string>backup</string></array>
+  <key>EnvironmentVariables</key><dict><key>HOME</key><string>/Users/$BOX_USER</string><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>/Users/$BOX_USER/.sage-is/logs/trellis-backup.log</string>
+  <key>StandardErrorPath</key><string>/Users/$BOX_USER/.sage-is/logs/trellis-backup.log</string>
+</dict></plist>
+EOF
+}
+
+run_backup_daemon() {
+  sudo_remote 'mkdir -p ~/.sage-is/logs; T=$(mktemp); cat > "$T" <<'"'"'PLIST'"'"'
+'"$(backup_plist)"'
+PLIST
+sudo -n install -m 644 -o root -g wheel "$T" '"$BACKUP_PLIST"' && rm -f "$T"
+sudo -n launchctl bootout system/'"$BACKUP_LABEL"' 2>/dev/null || true
+sudo -n launchctl bootstrap system '"$BACKUP_PLIST"
+}
+
+step_backups() {
+  [[ "$BOX_MODE" != peer ]] || return 0
+  if [[ "$found_backup_daemon" == yes ]]; then
+    step backups "trellis-crm backup runs nightly at 02:00" ""
+  else
+    step backups "no nightly backup" "install the LaunchDaemon $BACKUP_LABEL (02:00, as $BOX_USER); this Mac pulls it with: $PROG <box> backup --nightly" run_backup_daemon
+  fi
+}
+
+verify() {
+  probe
+  local ok=1
+  if [[ "$BOX_MODE" != peer ]]; then
+    printf '  %-9s %s\n' trellis "$found_trellis"; [[ "$found_trellis" == up ]] || ok=0
+  fi
+  if [[ "$BOX_AI_UI" == 1 ]]; then
+    printf '  %-9s %s\n' ai-ui "$found_aiui"; [[ "$found_aiui" == up ]] || ok=0
+  fi
+  printf '  %-9s %s\n' vm "${found_vm:-none}"
+  printf '  %-9s %s\n' boot "$found_boot"
+  [[ $ok == 1 ]]
+}
+
+run_reboot() {
+  echo "Restarting the box..."
+  sudo_remote 'sudo -n shutdown -r now >/dev/null 2>&1 || true' || true
+  local waited=0
+  sleep 20
+  until ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 "$(target)" true 2>/dev/null; do
+    sleep 10; waited=$((waited + 10))
+    [[ $waited -lt 420 ]] || die "the box did not answer within 7 minutes of the restart. FileVault on? Someone unlocks it at the screen."
+  done
+  echo "Back after about $((waited + 20)) s; giving the apps a minute."
+  sleep 60
+}
+
+cmd_plan() {
+  local name="$1"
+  load_box "$name"
+  agent_up
+  echo "$name: $(target), $BOX_MODE mode$([[ "$BOX_AI_UI" == 1 ]] && echo ", with AI-UI")"
+  probe
+  echo "Found: $found_os on $found_arch, FileVault $found_filevault"
+  if [[ $APPLY == 1 ]]; then echo "Plan, applying:"; else echo "Plan (nothing changes without --apply):"; fi
+  step_tools
+  if [[ $APPLY == 1 ]]; then probe; fi  # the tools step may have installed what the next ones need
+  step_runtime
+  step_leftovers
+  step_power
+  step_code
+  step_registry
+  step_trellis
+  step_backups
+  if [[ $APPLY == 1 ]]; then
+    echo "Verify:"
+    verify || die "something is still down; see above"
+    if [[ $REBOOT == 1 ]]; then
+      run_reboot
+      echo "Verify after the restart:"
+      verify || die "the box came back, but not everything did; see above"
+    fi
+    echo "Done. $name is a Sage.is box."
+  elif [[ $CHANGES == 0 ]]; then
+    echo "Nothing to change."
+  else
+    echo "$CHANGES change(s). Run them: $PROG $name --apply"
+  fi
+}
+
+cmd_update() {
+  local name="$1"
+  load_box "$name"
+  agent_up
+  echo "Updating $name..."
+  remote 'brew update >/dev/null 2>&1 || true; brew upgrade '"$(tools_wanted)"' 2>&1 | grep -vE "^==> (Downloading|Pouring|Fetching)|^\s*$" | tail -3 || true'
+  if [[ "$BOX_MODE" != peer ]]; then
+    if [[ "$BOX_MODE" == source ]]; then
+      remote 'git -C "$BOX_CHECKOUT" pull --ff-only 2>&1 | tail -1; git -C "$BOX_CHECKOUT" log -1 --format="  checkout at %h %s"'
+    fi
+    remote 'trellis-crm update 2>&1 | tail -2'
+    [[ "$BOX_AI_UI" != 1 ]] || remote 'ai-ui start 2>&1 | tail -1'
+  fi
+  echo "Verify:"
+  verify || die "something is down after the update; see above"
+}
+
+cmd_backup() {
+  local name="$1" nightly=0 newest base tmp
+  shift
+  [[ "${1:-}" != --nightly ]] || nightly=1
+  load_box "$name"
+  [[ "$BOX_MODE" != peer ]] || die "a peer box has no Trellis to back up"
+  [[ -n "$BOX_BACKUP_DIR" && -n "$BOX_BACKUP_TO" ]] || die "backup needs BOX_BACKUP_DIR (on this Mac) and BOX_BACKUP_TO (an age recipient) in $(box_file "$name")"
+  if [[ $nightly == 1 ]]; then install_pull_agent "$name"; return; fi
+  command -v age &>/dev/null || die "age is not installed here: brew install age"
+  agent_up
+  newest="$(remote 'ls -t '"$BOX_BACKUPS"'/*.tar.gz 2>/dev/null | head -1')"
+  [[ -n "$newest" ]] || die "no backup on the box yet. The nightly daemon makes one at 02:00, or on the box: trellis-crm backup"
+  base="$(basename "$newest")"
+  mkdir -p "$BOX_BACKUP_DIR"
+  tmp="$(mktemp -d)"
+  scp -q "${SSH_OPTS[@]}" "$(target):$newest" "$tmp/$base"
+  age -r "$BOX_BACKUP_TO" -o "$BOX_BACKUP_DIR/$base.age" "$tmp/$base"
+  rm -rf "$tmp"
+  # shellcheck disable=SC2012 # names are ours, without spaces or newlines
+  ls -t "$BOX_BACKUP_DIR"/*.age 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f "$old"; done
+  echo "Stored $BOX_BACKUP_DIR/$base.age ($(du -h "$BOX_BACKUP_DIR/$base.age" | cut -f1)); keeping the last $KEEP_BACKUPS."
+}
+
+# A launchd agent on this Mac pulls the box's backup at 03:30, after the box's 02:00 run.
+install_pull_agent() {
+  local name="$1" dir="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+  local label="is.sage.box-backup-$name"
+  local plist="$dir/$label.plist"
+  mkdir -p "$dir" "$SAGE_CONFIG_DIR/logs"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array><string>$(command -v "$PROG" || echo "$0")</string><string>$name</string><string>backup</string></array>
+  <key>EnvironmentVariables</key><dict><key>HOME</key><string>$HOME</string><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>30</integer></dict>
+  <key>StandardOutPath</key><string>$SAGE_CONFIG_DIR/logs/box-backup-$name.log</string>
+  <key>StandardErrorPath</key><string>$SAGE_CONFIG_DIR/logs/box-backup-$name.log</string>
+</dict></plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || true
+  echo "This Mac pulls $name's backup nightly at 03:30: $plist (log: $SAGE_CONFIG_DIR/logs/box-backup-$name.log)"
+}
+
+cmd_status() {
+  local name="$1"
+  load_box "$name"
+  agent_up
+  probe
+  echo "$name: $(target), $BOX_MODE mode"
+  printf '  %-9s %s\n' tools "sage-runtime $found_sage_runtime, trellis-crm $found_trellis_crm$([[ "$BOX_AI_UI" == 1 ]] && echo ", ai-ui $found_ai_ui")"
+  printf '  %-9s %s\n' vm "${found_vm:-none} (docker context ${found_context:-none})"
+  printf '  %-9s %s\n' boot "$found_boot, autorestart ${found_autorestart:-?}, sleep ${found_sleep:-?}"
+  [[ "$BOX_MODE" == peer ]] || printf '  %-9s %s\n' trellis "$found_trellis, profile ${found_profile:-?}${found_source:+, from $found_source}, nightly backup $found_backup_daemon"
+  [[ "$BOX_AI_UI" != 1 ]] || printf '  %-9s %s\n' ai-ui "$found_aiui"
+  if [[ -n "$BOX_BACKUP_DIR" ]]; then
+    local last; last="$(ls -t "$BOX_BACKUP_DIR"/*.age 2>/dev/null | head -1 || true)"
+    printf '  %-9s %s\n' backups "${last:-none pulled yet} in $BOX_BACKUP_DIR"
+  fi
+}
+
+cmd_local() {
+  echo "This Mac: $(uname -m), $(sw_vers -productVersion 2>/dev/null || uname -s)"
+  local t
+  for t in sage-runtime trellis-crm ai-ui; do
+    printf '  %-13s %s\n' "$t" "$($t version 2>/dev/null | head -1 || echo "not installed")"
+  done
+  printf '  %-13s %s\n' "Colima VM" "$(vm_type || echo none)"
+  if command -v sage-runtime &>/dev/null; then
+    echo "sage-runtime status:"
+    sage-runtime status 2>&1 | sed 's/^/  /'
+  fi
+}
+
+# --- main ----------------------------------------------------------------------------
+
+ORIGINAL_ARGS=("$@")
+name="${1:-}"
+case "$name" in
+  ""|help|-h|--help) usage; exit 0 ;;
+  version|--version|-v) echo "$PROG $VERSION"; exit 0 ;;
+  local) cmd_local; exit 0 ;;
+esac
+shift
+sub="${1:-}"
+case "$sub" in
+  update) cmd_update "$name" ;;
+  backup) shift; cmd_backup "$name" "$@" ;;
+  status) cmd_status "$name" ;;
+  ""|--apply|--reboot)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --apply)  APPLY=1 ;;
+        --reboot) REBOOT=1 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+      esac
+      shift
+    done
+    [[ $REBOOT == 0 || $APPLY == 1 ]] || die "--reboot goes with --apply"
+    cmd_plan "$name" ;;
+  *) echo "Unknown command: $sub" >&2; usage >&2; exit 1 ;;
+esac

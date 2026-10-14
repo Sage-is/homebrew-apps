@@ -1,0 +1,154 @@
+.\" sage-box(1) manpage — mdoc format
+.\" Version 0.1.0
+.Dd October 14, 2026
+.Dt SAGE-BOX 1
+.Os
+.Sh NAME
+.Nm sage-box
+.Nd make a Mac a Sage.is box over SSH, from one file
+.Sh SYNOPSIS
+.Nm
+.Ar box
+.Op Fl -apply
+.Op Fl -reboot
+.Nm
+.Ar box
+.Cm update | status
+.Nm
+.Ar box
+.Cm backup
+.Op Fl -nightly
+.Nm
+.Cm local
+.Nm
+.Cm version
+.Sh DESCRIPTION
+A box is a Mac that runs Sage.is apps for a team.
+.Nm
+reads one file per box,
+.Pa ~/.sage-is/boxes/<box>.env ,
+reaches the box over SSH, prints what it found and what it would change, and
+changes nothing. With
+.Fl -apply
+it runs the plan. Every step is idempotent: a second run finds everything in
+place and prints
+.Dq Nothing to change .
+.Pp
+The box file holds the box's address and login, the names of the vault items
+that unlock it, and what it runs. Secrets are
+.Li bw:
+references;
+.Xr sage-secret 1
+resolves them into the environment for the run, and they reach the box on
+stdin, never on a command line and never on a disk here. The file names a host
+and a login, so it stays out of every repository; the formula installs an
+example as
+.Pa share/sage-box/boxes/example.env .
+.Sh STEPS
+.Bl -tag -width "registry"
+.It tools
+.Li brew tap
+and
+.Li brew trust
+the Sage.is and krunkit taps; install
+.Nm sage-runtime ,
+.Nm trellis-crm
+and, when
+.Ev BOX_AI_UI
+is 1,
+.Nm ai-ui .
+A box without Homebrew gets its signed package first.
+.It runtime
+A new Colima VM (krunkit on Apple Silicon) when there is none;
+.Li sage-runtime convert --yes
+when the VM is vz. The dry run says so first.
+.It leftovers
+What Docker Desktop left behind, as
+.Li sage-runtime status
+lists it: dangling plugin links, a
+.Pa /var/run/docker.sock
+that leads nowhere, a missing buildx. What the tool cannot mend it prints.
+.It power
+.Li pmset -a sleep 0 autorestart 1 ,
+and the LaunchDaemon from
+.Li trellis-crm boot --print ,
+so Colima starts at power-on with nobody signed in.
+.It key, checkout
+Source mode only: the read-only deploy key from the vault at
+.Pa ~/.ssh/trellis-deploy ,
+and a clone of Sage-is/trellis at
+.Ev BOX_CHECKOUT .
+A refused clone prints the one
+.Li gh api
+line an admin runs to register the key.
+.It registry
+.Li docker login ghcr.io
+with the token on stdin; the Trellis image is a private package.
+.It trellis
+.Li trellis-crm start
+with the profile, URL and port from the file, from the checkout in source
+mode or the image alone in image mode;
+.Ev BOX_REVIEW_AT
+and
+.Ev BOX_SHIFT_END
+go into the settings file first. Then
+.Li ai-ui start
+when the box runs AI-UI.
+.It backups
+A LaunchDaemon on the box runs
+.Li trellis-crm backup
+nightly at 02:00.
+.It verify
+Both apps answer their health checks. With
+.Fl -reboot ,
+the box restarts and the checks run again.
+.El
+.Pp
+.Cm peer
+mode runs the first four steps and no Trellis: a developer's Mac.
+.Sh COMMANDS
+.Bl -tag -width "backup --nightly"
+.It Cm update
+.Li brew upgrade
+our tools; in source mode
+.Li git pull --ff-only
+in the checkout;
+.Li trellis-crm update ;
+.Li ai-ui start
+when the box runs AI-UI; then verify.
+.It Cm backup
+Pull the box's newest backup archive, encrypt it with
+.Xr age 1
+to
+.Ev BOX_BACKUP_TO ,
+store it in
+.Ev BOX_BACKUP_DIR
+and keep the last 14. The private half of the age key lives in the vault.
+.It Cm backup Fl -nightly
+Install a launchd agent on this Mac that runs
+.Cm backup
+at 03:30, after the box's own run.
+.It Cm status
+Tools, VM, boot daemon, both apps and the newest backup pulled.
+.It Cm local
+The tool and runtime checks on this Mac, with no SSH.
+.El
+.Sh SUDO OVER SSH
+Steps that need root take the box's password from the vault on stdin once per
+shell
+.Pq Li sudo -S -v ,
+then call
+.Li sudo -n .
+A child process cannot see that grant, so the tool runs the steps itself
+rather than through a command that calls sudo on its own.
+.Sh FILES
+.Bl -tag -width "~/.sage-is/boxes/<box>.env" -compact
+.It Pa ~/.sage-is/boxes/<box>.env
+The box file, mode 600.
+.It Pa ~/Library/LaunchAgents/is.sage.box-backup-<box>.plist
+The nightly pull on this Mac.
+.El
+.Sh SEE ALSO
+.Xr sage-runtime 1 ,
+.Xr sage-secret 1 ,
+.Xr trellis-crm 1

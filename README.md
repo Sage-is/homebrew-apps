@@ -231,6 +231,22 @@ trellis-crm backup            # the database and artifacts in one .tar.gz
 
 `trellis-crm dev` runs a checkout beside the real Trellis, never in its place: its own container, volume and port (8031), loopback only, synthetic data only, live reload. It finds the checkout the way `ai-ui dev` does and shares its saved paths in `~/.sage-is/projects`. A box that clones the private repo needs a read-only deploy key for `Sage-is/trellis`.
 
+## sage-box
+
+**sage-box** makes a Mac a Sage.is box: one file per box names its address, its login, the vault items that unlock it and what it runs; one run reaches it over SSH, prints what it found and what it would change, and with `--apply` does it. Tools from the tap, a krunkit VM, Colima at power-on, restart after a power cut, the Trellis checkout or image, the registry sign-in, `trellis-crm start`, a nightly backup on the box and an encrypted copy pulled here. Every step is idempotent; secrets travel from the vault on stdin, never on a command line.
+
+```bash
+brew install sage-is/apps/sage-box
+cp "$(brew --prefix)/share/sage-box/boxes/example.env" ~/.sage-is/boxes/pilot.env && chmod 600 ~/.sage-is/boxes/pilot.env
+sage-box pilot              # what it has, what would change; nothing changes
+sage-box pilot --apply      # the plan, then both apps verified; --reboot proves it comes back
+sage-box pilot update       # brew upgrade, git pull in source mode, trellis-crm update
+sage-box pilot backup       # the newest archive, encrypted with age, kept 14 deep
+sage-box local              # the same checks on this Mac
+```
+
+Modes: `source` runs Trellis from a checkout on the box (a `git pull` and `update` is an upgrade), `image` runs the released image, `peer` sets up a developer's Mac with no Trellis. The box file stays out of every repository.
+
 ## sage-secret
 
 **sage-secret** runs a command with secrets from Bitwarden (a self-hosted Vaultwarden works) without writing them to files or showing them. Env files and the environment hold references such as `bw:cloudflare-tunnel-startr`; each run unlocks an agent account's vault, resolves them for the one command, and locks the vault again. The agent account's own credentials live in the login Keychain.
