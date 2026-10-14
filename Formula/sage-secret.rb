@@ -5,7 +5,7 @@ class SageSecret < Formula
   homepage "https://github.com/Sage-is/homebrew-apps"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/sage-secret-v0.1.0.tar.gz"
   version "0.1.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "12b34894c6ee8d994314927cb5d2750ff06d3f16b69917587457331b6c819f0d"
   license "MIT"
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
