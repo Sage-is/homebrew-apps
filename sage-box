@@ -274,6 +274,7 @@ run_leftovers() {
 for l in /usr/local/bin/docker*; do [ -L "$l" ] && [ ! -e "$l" ] && sudo -n rm -f "$l"; done; true
 [ -S "$HOME/.colima/default/docker.sock" ] && sudo -n ln -sfn "$HOME/.colima/default/docker.sock" /var/run/docker.sock || true
 command -v docker-buildx >/dev/null 2>&1 || brew list docker-buildx >/dev/null 2>&1 || brew install docker-buildx >/dev/null 2>&1 || true
+plutil -remove features.hooks ~/.docker/config.json >/dev/null 2>&1 || true
 sage-runtime use colima >/dev/null 2>&1 || true
 sage-runtime status 2>&1 | grep -E "leads nowhere|leads to Docker Desktop|plugin hooks|buildx not found" || true'
 }
