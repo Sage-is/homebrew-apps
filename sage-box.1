@@ -99,7 +99,11 @@ A LaunchDaemon on the box runs
 .Li trellis-crm backup
 nightly at 02:00.
 .It verify
-Both apps answer their health checks. With
+Both apps answer their health checks. When the box runs AI-UI,
+.Li sage-ai
+must also be on
+.Li sage-network .
+With
 .Fl -reboot ,
 the box restarts and the checks run again.
 .El
@@ -115,7 +119,12 @@ our tools; in source mode
 in the checkout;
 .Li trellis-crm update ;
 .Li ai-ui start
-when the box runs AI-UI; then verify.
+when the box runs AI-UI, then
+.Li sage-ai
+joins
+.Li sage-network
+again; then verify.
+The first step that fails stops the run.
 .It Cm backup
 Pull the box's newest backup archive, encrypt it with
 .Xr age 1

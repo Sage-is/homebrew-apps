@@ -29,13 +29,13 @@ help:
 	@echo ""
 
 tool_release:  ## Release one formula: TOOL=offload VERSION=0.7.0 (dry run unless APPLY=1)
-	@scripts/tool-release.sh $(if $(APPLY),--apply,--dry-run) $(TOOL) $(VERSION)
+	@scripts/tool-release.sh $(if $(filter 1,$(APPLY)),--apply,--dry-run) $(TOOL) $(VERSION)
 
 release_tools:  ## Release every formula that is behind, then retire old ~/bin copies (dry run unless APPLY=1)
-	@scripts/release-tools.sh $(if $(APPLY),--apply,--dry-run)
+	@scripts/release-tools.sh $(if $(filter 1,$(APPLY)),--apply,--dry-run)
 
 rename_projects:  ## Move renamed projects: GitHub repo, remote, folder, Claude memory (dry run unless APPLY=1)
-	@scripts/rename-projects.sh $(if $(APPLY),--apply,--dry-run)
+	@scripts/rename-projects.sh $(if $(filter 1,$(APPLY)),--apply,--dry-run)
 
 # ---------------------------------------------------------------------------
 # Testing

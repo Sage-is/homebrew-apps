@@ -46,6 +46,16 @@ BOOT_PLIST="${LAUNCH_DAEMONS_DIR:-/Library/LaunchDaemons}/$BOOT_LABEL.plist"
 DEV_CONTAINER="trellis-crm-dev"
 DEV_VOLUME="trellis-crm-dev-data"
 DEV_PORT=8031
+# What a dev install's --env-file may set: keys and the demo's switches. Never
+# mail settings, so a dev copy cannot reach a real mailbox. The AI-UI key and
+# Space only with --link-ai-ui, which then requires both, so it cannot post into
+# a real Space unasked. The AI-UI address is never in the file: --link-ai-ui
+# sets it.
+DEV_ENV_NAMES="CRM_API_KEY CRM_API_CLIENTS CRM_API_WRITES CRM_INSTANCE_LABEL INTAKE_SECRET DEMO_STORY DEMO_PASSWORD FIXTURE_SEED FIXTURE_CITIES"
+DEV_AI_UI_NAMES="AI_UI_API_KEY NOTIFY_SPACE_ID"
+# A demo's switches: they load synthetic data into an instance and wipe it on a
+# timer. The real Trellis never takes them; dev mode sets its own.
+DEMO_ONLY_NAMES="LOAD_FIXTURES DEMO_RESET DEMO_RESET_HOURS"
 SAGE_PROJECTS="${SAGE_CONFIG_DIR}/projects"
 TRELLIS_REMOTE="Sage-is/trellis"
 # The repo is private: SSH, so a read-only deploy key is all a box needs.
@@ -73,10 +83,16 @@ Commands:
                         Start Colima at power-on with nobody signed in (asks for sudo)
   nuke   [--dry-run] [--yes] [--force]
                         Remove Trellis and its record from this machine
-  dev    [--dir DIR] [--port PORT] [--profile NAME] [--where] [--stop]
+  dev    [--dir DIR] [--port PORT] [--profile NAME] [--env-file FILE]
+         [--reset] [--link-ai-ui] [--where] [--stop]
                         Run your Trellis checkout with live reload (default:
                         http://localhost:$DEV_PORT), beside the real one and on
-                        synthetic data. Finds the checkout like ai-ui dev does
+                        synthetic data. Finds the checkout like ai-ui dev does.
+                        --env-file (mode 600) gives it API keys and the demo's
+                        switches, never mail settings; --reset starts its
+                        synthetic data afresh; --link-ai-ui puts it on $NETWORK
+                        beside AI-UI (http://$AI_UI_CONTAINER:8080) and needs
+                        the file to carry AI_UI_API_KEY and NOTIFY_SPACE_ID
   version               Show the version
 
 Every command also takes:
@@ -191,9 +207,11 @@ ensure_docker() {
 # Settings: one env file at mode 600. The container reads every line through
 # --env-file; trellis-crm itself reads TRELLIS_PORT and TRELLIS_BIND.
 # ---------------------------------------------------------------------------
+# A setting's last value; from the settings file, or from the file named second.
 env_get() {
-  [[ -f "$ENV_FILE" ]] || return 0
-  sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
+  local file="${2:-$ENV_FILE}"
+  [[ -f "$file" ]] || return 0
+  sed -n "s/^$1=//p" "$file" | tail -n 1
 }
 
 env_set() {
@@ -282,7 +300,8 @@ pull_image() {
 # Trellis and AI-UI reach each other by container name on one network: AI-UI
 # calls http://trellis-crm:8000 and Trellis calls http://sage-ai:8080. `ai-ui
 # start` makes a new sage-ai off this network; run `trellis-crm start` after it
-# until ai-ui joins the network itself.
+# until ai-ui joins the network itself. `dev --link-ai-ui` puts its own
+# container here the same way, as trellis-crm-dev.
 ensure_network() {
   docker network inspect "$NETWORK" &>/dev/null || docker network create "$NETWORK" >/dev/null
   if docker container inspect "$AI_UI_CONTAINER" &>/dev/null; then
@@ -363,6 +382,14 @@ is_ephemeral_path() {
   esac
 }
 
+# Two paths that lead to one folder, whatever their links and spelling.
+same_folder() {
+  local one two
+  one="$(cd -P "$1" 2>/dev/null && pwd -P)" || return 1
+  two="$(cd -P "$2" 2>/dev/null && pwd -P)" || return 1
+  [[ "$one" == "$two" ]]
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -383,6 +410,21 @@ require_checkout() {
   esac
 }
 
+# The real Trellis never takes a demo's switches: LOAD_FIXTURES=1 fills it with
+# synthetic data, and DEMO_RESET or DEMO_RESET_HOURS wipes its record on a boot
+# or a timer. A bare name counts, since docker passes it on from the shell, and
+# so does an indented one, since docker trims the space. Names only, no values.
+refuse_demo_settings() {
+  local name found=""
+  [[ -f "$ENV_FILE" ]] || return 0
+  for name in $DEMO_ONLY_NAMES; do
+    if grep -Eq "^[[:space:]]*$name(=|\$)" "$ENV_FILE"; then found+="${found:+, }$name"; fi
+  done
+  [[ -z "$found" ]] || {
+    echo "Error: $ENV_FILE sets $found. A demo's switches never belong in the real Trellis's settings: take them out, or run the demo with: $PROG dev"
+    exit 1; }
+}
+
 cmd_start() {
   local port="" bind="" url="" profile="" source_opt="" source_dir="" first_run=0 new_volume=0
   local mounts=(-v "$VOLUME:/data")
@@ -400,6 +442,7 @@ cmd_start() {
   done
 
   [[ -f "$ENV_FILE" ]] || first_run=1
+  refuse_demo_settings
   ensure_env_file
   if [[ -n "$port" ]]; then
     # A URL still on the old local port follows the new one.
@@ -436,6 +479,7 @@ cmd_start() {
   docker volume inspect "$VOLUME" &>/dev/null || new_volume=1
   docker rm -f "$CONTAINER" &>/dev/null || true
 
+  # -e LOAD_FIXTURES=0 backs the check above: the file cannot turn fixtures on.
   echo "Starting Trellis ($IMAGE)..."
   docker run -d --name "$CONTAINER" \
     --restart unless-stopped \
@@ -444,6 +488,7 @@ cmd_start() {
     -p "$bind:$port:8000" \
     "${mounts[@]}" \
     --env-file "$ENV_FILE" \
+    -e LOAD_FIXTURES=0 \
     "$IMAGE" >/dev/null
   wait_healthy
 
@@ -454,7 +499,8 @@ cmd_start() {
     *) echo "  It listens on $bind:$port, open to the network. Put TLS in front of it." ;;
   esac
   if [[ $first_run == 1 && $new_volume == 1 ]]; then
-    echo "  Sign in as $(env_get DJANGO_SUPERUSER_USERNAME) with $(env_get DJANGO_SUPERUSER_PASSWORD), then change the password."
+    # Never the password itself: this output lands in terminals and transcripts.
+    echo "  Sign in as $(env_get DJANGO_SUPERUSER_USERNAME) with the password DJANGO_SUPERUSER_PASSWORD in $ENV_FILE, then change it."
   elif [[ $first_run == 1 ]]; then
     echo "  The volume $VOLUME already had an admin: sign in with that account's password."
   fi
@@ -464,16 +510,67 @@ cmd_start() {
   [[ -z "$source_dir" ]] || echo "  Code: $source_dir. After a git pull there: $PROG update"
 }
 
+# A dev install's env file: private, one NAME=value per line, and only the names
+# dev mode allows. The second argument is 1 under --link-ai-ui, which adds the
+# AI-UI key and Space, needs both, and turns back the real Trellis's own; mail
+# settings never pass. A bad line is named by its number and never printed: it
+# may be a key. A line ending in a carriage return is bad: docker would pass the
+# return on in the value.
+check_dev_env_file() {
+  local file="$1" link="$2" mode line name n=0 seen=" " allowed="$DEV_ENV_NAMES"
+  local skip_re='^[[:space:]]*(#.*)?$' assign_re='^[A-Za-z_][A-Za-z0-9_]*=.*[^[:space:]]'
+  [[ -f "$file" ]] || { echo "Error: no env file at $file"; exit 1; }
+  mode="$(stat -f %Lp "$file" 2>/dev/null || stat -c %a "$file")"
+  [[ "$mode" == 600 || "$mode" == 400 ]] || {
+    echo "Error: $file is mode $mode and holds keys. First: chmod 600 $file"; exit 1; }
+  if [[ "$link" == 1 ]]; then allowed+=" $DEV_AI_UI_NAMES"; fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ "$line" =~ $skip_re ]] && continue
+    if [[ ! "$line" =~ $assign_re || "$line" == *$'\r'* ]]; then
+      echo "Error: $file: line $n is not NAME=value"
+      exit 1
+    fi
+    name="${line%%=*}"
+    case " $allowed " in
+      *" $name "*) seen+="$name " ;;
+      *) echo "Error: $file sets $name. Dev mode takes only: $allowed"
+         case "$name" in
+           AI_UI_API_KEY|NOTIFY_SPACE_ID) echo "  AI-UI settings need: $PROG dev --link-ai-ui" ;;
+           AI_UI_URL) echo "  Take it out: $PROG dev --link-ai-ui sets it, to http://$AI_UI_CONTAINER:8080" ;;
+         esac
+         exit 1 ;;
+    esac
+  done < "$file"
+  [[ "$link" == 1 ]] || return 0
+  for name in $DEV_AI_UI_NAMES; do
+    case "$seen" in
+      *" $name "*) ;;
+      *) echo "Error: --link-ai-ui needs AI_UI_API_KEY and NOTIFY_SPACE_ID in $file; $name is not there."
+         exit 1 ;;
+    esac
+    if [[ "$(env_get "$name" "$file")" == "$(env_get "$name")" ]]; then
+      echo "Error: $file has the same $name as the real Trellis ($ENV_FILE). A dev install takes its own AI-UI key and a test Space."
+      exit 1
+    fi
+  done
+}
+
 # Same lookup as `ai-ui dev`: --dir, then TRELLIS_DEV_DIR, then a clone here,
 # then the saved path, then a fresh clone in ~/src/trellis.
 cmd_dev() {
   local port="$DEV_PORT" explicit_dir="" profile="realestate" repo_dir="" saved needs_clone=0
+  local env_file="" reset=0 link=0 extra=() real_source="" tries=0 gone=0
+  local ai_ui_url="http://$AI_UI_CONTAINER:8080"
   saved="$(sage_project_dir trellis)" || true
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir)     explicit_dir="$2"; shift 2 ;;
       --port)    port="$2"; shift 2 ;;
       --profile) profile="$2"; shift 2 ;;
+      --env-file) env_file="$2"; shift 2 ;;
+      --reset)   reset=1; shift ;;
+      --link-ai-ui) link=1; shift ;;
       --where)
         if [[ -n "$saved" ]]; then echo "$saved"; else echo "No saved checkout yet. Run: $PROG dev"; fi
         return 0 ;;
@@ -485,6 +582,10 @@ cmd_dev() {
       *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
+  if [[ $link == 1 && -z "$env_file" ]]; then
+    echo "Error: --link-ai-ui needs --env-file FILE with AI_UI_API_KEY and NOTIFY_SPACE_ID in it."
+    exit 1
+  fi
 
   if [[ -n "$explicit_dir" ]]; then
     repo_dir="$(cd "$explicit_dir" 2>/dev/null && pwd)" || { echo "Error: no folder at $explicit_dir"; exit 1; }
@@ -524,13 +625,43 @@ cmd_dev() {
   if is_ephemeral_path "$repo_dir"; then
     echo "Heads up: $repo_dir may not survive a reboot. For a lasting place: $PROG dev --dir ~/src/trellis"
   fi
+  # The real Trellis may run from this very folder (start --source): one edit, both.
+  real_source="$(env_get TRELLIS_SOURCE)"
+  if [[ -n "$real_source" ]] && same_folder "$repo_dir" "$real_source"; then
+    echo "This checkout also serves the real Trellis: an edit here changes both."
+  fi
+  if [[ -n "$env_file" ]]; then
+    check_dev_env_file "$env_file" "$link"
+    extra+=(--env-file "$env_file")
+  fi
   sage_set_project_dir trellis "$repo_dir"
 
   ensure_docker
   docker image inspect "$IMAGE" &>/dev/null || pull_image
+  if [[ $link == 1 ]]; then
+    ensure_network
+    extra+=(--network "$NETWORK" -e "AI_UI_URL=$ai_ui_url")
+  fi
   docker rm -f "$DEV_CONTAINER" &>/dev/null || true
+  if [[ $reset == 1 ]]; then
+    # The container just removed may hold the volume a moment longer: try up to
+    # five times, and claim a reset only when the volume is gone.
+    for tries in 1 2 3 4 5; do
+      [[ $tries == 1 ]] || sleep 1
+      docker volume rm "$DEV_VOLUME" &>/dev/null || true
+      if ! docker volume inspect "$DEV_VOLUME" &>/dev/null; then gone=1; break; fi
+    done
+    if [[ $gone == 0 ]]; then
+      echo "Error: the dev volume is still there; nothing was reset. What holds it: docker ps -a --filter volume=$DEV_VOLUME"
+      exit 1
+    fi
+    echo "Dev data reset. It held synthetic data only; the real Trellis is untouched."
+  fi
   # Not the settings file: it holds the real instance's secrets and AI-UI keys,
-  # and a dev copy must never post into a real Space or reach real mailboxes.
+  # and a dev copy must not post into a real Space or reach real mailboxes
+  # unasked. --link-ai-ui is the one door, and it opens on AI-UI only: the
+  # network, the address, and the AI-UI key and Space of --env-file. Mail stays
+  # shut. The dev install's own address is its own, never the real one's.
   echo "Starting dev mode from $repo_dir..."
   docker run -d --name "$DEV_CONTAINER" \
     "$HOST_ENTRY" \
@@ -542,7 +673,9 @@ cmd_dev() {
     -e LOAD_FIXTURES=1 \
     -e RUN_WORKER=1 \
     -e CRM_PROFILE="$profile" \
+    -e CRM_PUBLIC_URL="http://localhost:$port" \
     -e TZ="$(host_timezone)" \
+    ${extra[@]+"${extra[@]}"} \
     "$IMAGE" >/dev/null
   wait_healthy "http://127.0.0.1:$port"
   docker exec "$DEV_CONTAINER" python manage.py dev_superuser >/dev/null
@@ -551,6 +684,15 @@ cmd_dev() {
   echo "Dev mode is running at http://localhost:$port (this Mac only)."
   echo "  Source: $repo_dir. Edits reload by themselves; schema changes need: docker exec $DEV_CONTAINER python manage.py migrate"
   echo "  Synthetic data only. Sign in as admin@example.com with: password"
+  [[ -z "$env_file" ]] || echo "  Keys and demo settings from $env_file (names only: $(grep -oE '^[A-Z_]+' "$env_file" | tr '\n' ' '))"
+  if [[ $link == 1 ]]; then
+    if docker container inspect "$AI_UI_CONTAINER" &>/dev/null; then
+      echo "  Linked to AI-UI over $NETWORK. AI-UI reaches this install at http://$DEV_CONTAINER:8000; this install reaches AI-UI at $ai_ui_url"
+      echo "  Notices go to Space $(env_get NOTIFY_SPACE_ID "$env_file") through $ai_ui_url"
+    else
+      echo "  On $NETWORK, but $AI_UI_CONTAINER is not here yet. After: ai-ui start, run $PROG dev --link-ai-ui again to connect it."
+    fi
+  fi
   echo "  The real Trellis and its record are untouched. Stop dev mode: $PROG dev --stop"
 }
 

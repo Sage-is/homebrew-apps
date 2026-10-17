@@ -50,6 +50,8 @@
 
 - [ ] **Release the tap's tools** #critical: one command per step, dry run unless `APPLY=1`
   - [x] [WE] `make release_tools` / `tool_release` (tag, push, pin sha256, install, test, retire old `~/bin` copies; hard-linked copies left alone); sandbox-proven 2026-09-28
+  - [x] [WE] 2026-10-16: `tool_release`, `release_tools` and `rename_projects` act only at `APPLY=1`; `APPLY=0` and `APPLY=no` are dry runs
+  - [x] [WE] 2026-10-16: `sage-box update` stops at the first failing step; `sage-ai` rejoins `sage-network` after each `ai-ui start`, and `verify` checks it
   - [x] [MANUALLY] Stray `release/1.0.5` branch deleted; the formula guard is on `develop` (6035334)
   - [x] [MANUALLY] `make release_ai_ui`: CLI 3.2.0 = AI-UI 3.2.0, `ai-ui@3` created (2026-09-29)
   - [ ] [MANUALLY] On other Macs: `brew update && brew upgrade ai-ui && ai-ui update`
@@ -82,6 +84,11 @@
 
 - [ ] **trellis-crm joins the tap** (Alexander, 2026-10-07): the Trellis source stays private; the CLI, its tests and its formula live here
   - [x] [WE] Moved from Trellis `cli/` with its 31 tests; `trellis-crm dev` added, beside the real instance on `127.0.0.1:8031` (5 tests); `Formula/trellis-crm.rb`, not yet released
+  - [x] [WE] 2026-10-15: `trellis-crm dev --env-file FILE` (mode 600; keys and demo switches only, mail settings refused) and `--reset` (the dev volume only); 4 tests, 78 pass
+  - [x] [WE] 2026-10-15: `trellis-crm dev --link-ai-ui` (opt-in): the dev install joins `sage-network` and `sage-ai` is connected; the tap sets `AI_UI_URL`, and `--env-file` must carry `AI_UI_API_KEY` and `NOTIFY_SPACE_ID`; mail never
+  - [x] [WE] 2026-10-16 poka-yoke: `start` refuses `LOAD_FIXTURES` and `DEMO_RESET*` in the real settings file and pins `LOAD_FIXTURES=0`; it never prints the first admin password
+  - [x] [WE] 2026-10-16 poka-yoke: dev env-file lines must be NAME=value, refused by line number and never echoed; `--link-ai-ui` refuses the real install's key or Space; dev passes `CRM_PUBLIC_URL`; `--reset` checks the volume is gone; a warning when dev and the real install share a checkout
+  - [ ] [MANUALLY] Tag `ghcr.io/sage-is/trellis:0.1.2` from `0.1.1` (the formula pins the image to its version), release trellis-crm 0.1.2 (`make tool_release TOOL=trellis-crm VERSION=0.1.2 APPLY=1`), then `make box_update BOX=pilot` in Trellis
   - [x] 2026-10-14: Trellis `v0.1.0` tagged and `ghcr.io/sage-is/trellis:0.1.0` pushed as a private package (both arches, from the build VM); trellis-crm 0.1.0 and 0.1.1 released; `0.1.1` is the same image retagged, since the formula pins the image to the CLI's version
   - [ ] Poka-yoke: `tool-release.sh` checks, for trellis-crm, that `ghcr.io/sage-is/trellis:<version>` exists before it tags, or retags the previous image (`docker buildx imagetools create`); today the pin can name an image nobody pushed
   - [ ] One copy of the shared shell: `trellis-crm` carries ai-ui's runtime block and path helpers; one file in the tap, sourced by both

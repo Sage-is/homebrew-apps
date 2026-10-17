@@ -229,7 +229,11 @@ trellis-crm boot              # Colima at power-on, nobody signed in
 trellis-crm backup            # the database and artifacts in one .tar.gz
 ```
 
-`trellis-crm dev` runs a checkout beside the real Trellis, never in its place: its own container, volume and port (8031), loopback only, synthetic data only, live reload. It finds the checkout the way `ai-ui dev` does and shares its saved paths in `~/.sage-is/projects`. A box that clones the private repo needs a read-only deploy key for `Sage-is/trellis`.
+`trellis-crm start` refuses a settings file that sets `LOAD_FIXTURES`, `DEMO_RESET` or `DEMO_RESET_HOURS` (a bare name counts), and runs the container with `LOAD_FIXTURES=0`: a demo's switches would fill the real record with synthetic data or wipe it. It names the switches, never a value. Run a demo with `trellis-crm dev`. A first start prints no password. The first admin's is `DJANGO_SUPERUSER_PASSWORD` in the settings file.
+
+`trellis-crm dev` runs a checkout beside the real Trellis, never in its place: its own container, volume and port (8031), loopback only, synthetic data only, live reload. It finds the checkout the way `ai-ui dev` does and shares its saved paths in `~/.sage-is/projects`. A box that clones the private repo needs a read-only deploy key for `Sage-is/trellis`. It tells the app its own address, `CRM_PUBLIC_URL=http://localhost:<port>`, so no link points at the real Trellis. When the real Trellis runs from the same checkout (`start --source`), dev prints one warning line, "This checkout also serves the real Trellis: an edit here changes both.", and goes on.
+
+For a demo, `--env-file FILE` (mode 600) hands the dev install API keys and the demo's switches, never mail settings. Every line is `NAME=value` with a value, a `#` comment or blank. Any other line stops the run with its number (`line 4 is not NAME=value`) and is never printed. `--reset` starts its synthetic data afresh: it tries `docker volume rm` up to five times, and if the volume survives it stops with "the dev volume is still there; nothing was reset". `--link-ai-ui` is opt-in and needs an `--env-file` that carries `AI_UI_API_KEY` and `NOTIFY_SPACE_ID`. It puts the dev install on `sage-network`, which it makes if missing, connects `sage-ai` to it when that container exists, and sets `AI_UI_URL=http://sage-ai:8080` itself, so the file may not carry `AI_UI_URL`. AI-UI then reaches the dev install at `http://trellis-crm-dev:8000`, and the summary says which Space gets the notices. Give the dev install its own AI-UI key and a test Space: it stops when the file's key or Space is the real settings file's, and prints neither. Mail settings never pass.
 
 ## sage-box
 
@@ -240,7 +244,7 @@ brew install sage-is/apps/sage-box
 cp "$(brew --prefix)/share/sage-box/boxes/example.env" ~/.sage-is/boxes/pilot.env && chmod 600 ~/.sage-is/boxes/pilot.env
 sage-box pilot              # what it has, what would change; nothing changes
 sage-box pilot --apply      # the plan, then both apps verified; --reboot proves it comes back
-sage-box pilot update       # brew upgrade, git pull in source mode, trellis-crm update
+sage-box pilot update       # brew upgrade, git pull in source mode, trellis-crm update; stops at the first failing step
 sage-box pilot backup       # the newest archive, encrypted with age, kept 14 deep
 sage-box local              # the same checks on this Mac
 ```

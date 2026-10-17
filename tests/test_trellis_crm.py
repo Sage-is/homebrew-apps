@@ -39,7 +39,9 @@ DATA_DISK = ("# krunkit puts the data disk on vdc, where Lima 2.2 looks for vdb;
              "provision:\n" + DATA_DISK_STEP)
 
 # Stand-ins log each call. Docker keeps a little state as marker files: the
-# runtime answering, the image, the network, the volume, the container.
+# runtime answering, the image, the network, the volume, the container. The
+# number in $STATE/rm-fails is how many `volume rm` calls fail before one works,
+# as when a container just removed still holds the volume.
 STUBS = {
     # Like docker: --context, else DOCKER_CONTEXT, else the saved context.
     "docker": """ctx="${DOCKER_CONTEXT:-$(cat "$STATE/current-context" 2>/dev/null || echo default)}"
@@ -54,7 +56,9 @@ case "$1 ${2:-}" in
   "network inspect") [[ -e "$STATE/network" ]] ;;
   "network create")  touch "$STATE/network" ;;
   "volume inspect")  [[ -e "$STATE/volume" ]] ;;
-  "volume rm")       rm -f "$STATE/volume" ;;
+  "volume rm")       fails="$(cat "$STATE/rm-fails" 2>/dev/null || echo 0)"
+                     if (( fails > 0 )); then echo $(( fails - 1 )) > "$STATE/rm-fails"; exit 1; fi
+                     rm -f "$STATE/volume" ;;
   "container inspect")
     name="${@: -1}"
     [[ -e "$STATE/container-$name" ]] || exit 1
@@ -208,9 +212,16 @@ class FirstStart(Mac):
                      f"--env-file {self.env_file}", "ghcr.io/sage-is/trellis:latest"):
             self.assertIn(part, run)
 
-    def test_the_first_admin_password_is_shown_once(self):
+    def test_the_first_admin_password_is_never_printed_and_the_first_start_says_where_it_is(self):
+        # What start prints lands in terminals, transcripts and sage-box's report.
         first = self.ok("start")
-        self.assertIn(f"Sign in as admin with {self.settings()['DJANGO_SUPERUSER_PASSWORD']}", first.stdout)
+        password = self.settings()["DJANGO_SUPERUSER_PASSWORD"]
+        self.assertNotIn(password, first.stdout + first.stderr)
+        self.assertFalse([call for call in self.calls() if password in call])
+        (line,) = [line for line in first.stdout.splitlines() if "Sign in as" in line]
+        self.assertIn("Sign in as admin", line)
+        self.assertIn("DJANGO_SUPERUSER_PASSWORD", line)
+        self.assertIn(str(self.env_file), line)
         self.assertNotIn("Sign in as", self.ok("start").stdout)
 
     def test_a_second_start_keeps_the_secrets(self):
@@ -235,6 +246,49 @@ class FirstStart(Mac):
         self.ok("start")
         self.assertTrue([call for call in self.calls() if call.startswith("colima start --profile default --vm-type ")])
         self.assertEqual((self.home / ".sage-is" / "runtime").read_text().strip(), "colima")
+
+
+class DemoSwitches(Mac):
+    """The real Trellis holds real records: a demo's switches never reach it."""
+
+    def test_start_refuses_a_demo_switch_in_the_settings_before_it_changes_anything(self):
+        self.ok("start")
+        settings = self.env_file.read_text()
+        runs = len(self.docker_runs())
+        for text, names in (("LOAD_FIXTURES=1", "LOAD_FIXTURES"), ("LOAD_FIXTURES=0", "LOAD_FIXTURES"),
+                            ("LOAD_FIXTURES=", "LOAD_FIXTURES"), ("LOAD_FIXTURES", "LOAD_FIXTURES"),
+                            ("DEMO_RESET=2026-10-06", "DEMO_RESET"), ("DEMO_RESET", "DEMO_RESET"),
+                            ("DEMO_RESET_HOURS=24", "DEMO_RESET_HOURS"), ("DEMO_RESET_HOURS", "DEMO_RESET_HOURS"),
+                            ("  LOAD_FIXTURES=1", "LOAD_FIXTURES"),  # docker trims the space
+                            ("DEMO_RESET_HOURS=24\nLOAD_FIXTURES=1", "LOAD_FIXTURES, DEMO_RESET_HOURS")):
+            with self.subTest(text=text):
+                self.env_file.write_text(settings + text + "\n")
+                result = self.run_cli("start", "--port", "9000")
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(len(result.stdout.splitlines()), 1, result.stdout)
+                self.assertIn(f"sets {names}. ", result.stdout)
+                self.assertIn("trellis-crm dev", result.stdout)
+                self.assertEqual(self.env_file.read_text(), settings + text + "\n", "start saved its options")
+                self.assertEqual(len(self.docker_runs()), runs)
+                self.assertTrue((self.state / "up-trellis-crm").exists(), "the running Trellis was taken down")
+        # An update ends in a start, so it stops there too, with the running Trellis left up.
+        self.env_file.write_text(settings + "LOAD_FIXTURES=1\n")
+        result = self.run_cli("update")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("sets LOAD_FIXTURES. ", result.stdout)
+        self.assertTrue((self.state / "up-trellis-crm").exists())
+        self.assertEqual(len(self.docker_runs()), runs)
+
+    def test_only_the_switches_themselves_count(self):
+        self.ok("start")
+        near_misses = "# LOAD_FIXTURES=1\nLOAD_FIXTURES_NOTE=1\nMY_DEMO_RESET=1\nDEMO_RESET_HOURS_NOTE=1\n"
+        self.env_file.write_text(self.env_file.read_text() + near_misses)
+        self.ok("start")
+
+    def test_the_real_container_is_told_fixtures_are_off_after_the_settings_file(self):
+        self.ok("start")
+        (run,) = self.docker_runs()
+        self.assertIn(f"--env-file {self.env_file} -e LOAD_FIXTURES=0 ghcr.io/sage-is/trellis:latest", run)
 
 
 class Logins(Mac):
@@ -717,6 +771,15 @@ class Usage(Mac):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Unknown command: launch", result.stdout)
 
+    def test_every_dev_option_is_listed_and_the_formula_still_finds_its_line(self):
+        usage = self.ok("--help").stdout
+        self.assertIn("dev    [--dir DIR]", usage)  # the test block of Formula/trellis-crm.rb reads this line
+        # The synopsis runs from "  dev" to the first description line, which sits 24 columns in.
+        synopsis = re.search(r"^  dev    .*?(?=^ {24})", usage, re.M | re.S).group(0)
+        for option in ("[--dir DIR]", "[--port PORT]", "[--profile NAME]", "[--env-file FILE]", "[--reset]",
+                       "[--link-ai-ui]", "[--where]", "[--stop]"):
+            self.assertIn(option, synopsis)
+
 
 class DevMode(Mac):
     """A checkout runs beside the real Trellis: its own container, volume and port, loopback, synthetic data."""
@@ -769,6 +832,216 @@ class DevMode(Mac):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("outside your home folder", result.stdout)
 
+    def dev_env(self, text, mode=0o600):
+        path = self.home / ".sage-is" / "trellis-dev.env"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(mode)
+        return path
+
+    def link_env(self, more=""):
+        """The env file --link-ai-ui needs: the dev install's own AI-UI key and a test Space."""
+        return self.dev_env("AI_UI_API_KEY=ai-key-value-77\nNOTIFY_SPACE_ID=space-9\n" + more)
+
+    def test_an_env_file_reaches_the_container_and_no_value_reaches_a_command_line(self):
+        repo = self.checkout()
+        path = self.dev_env("CRM_API_KEY=dev-key-value-42\nDEMO_STORY=1\n# a comment\n")
+        result = self.ok("dev", "--dir", str(repo), "--env-file", str(path))
+        (dev,) = self.docker_runs()
+        self.assertIn(f"--env-file {path}", dev)
+        self.assertFalse([c for c in self.calls() if "dev-key-value-42" in c])
+        self.assertNotIn("dev-key-value-42", result.stdout)
+        self.assertIn("CRM_API_KEY DEMO_STORY", result.stdout)
+
+    def test_an_env_file_others_can_read_is_refused(self):
+        repo = self.checkout()
+        result = self.run_cli("dev", "--dir", str(repo), "--env-file", str(self.dev_env("DEMO_STORY=1\n", 0o644)))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("chmod 600", result.stdout)
+        self.assertEqual(self.docker_runs(), [])
+
+    def test_mail_settings_are_refused_with_the_ai_ui_link_and_without_it(self):
+        repo = self.checkout()
+        for options in ((), ("--link-ai-ui",)):
+            for line in ("IMAP_DEV_PASSWORD=x", "SMTP_PASSWORD=x"):
+                with self.subTest(line=line, options=options):
+                    path = self.dev_env(line + "\n")
+                    result = self.run_cli("dev", "--dir", str(repo), "--env-file", str(path), *options)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"sets {line.split('=')[0]}", result.stdout)
+                    self.assertIn("Dev mode takes only", result.stdout)
+                    self.assertNotIn("--link-ai-ui", result.stdout, "the link would not mend a mail setting")
+        self.assertEqual(self.docker_runs(), [])
+
+    def test_the_ai_ui_settings_are_refused_without_the_link_and_the_error_names_it(self):
+        repo = self.checkout()
+        for name in ("AI_UI_URL", "AI_UI_API_KEY", "NOTIFY_SPACE_ID"):
+            with self.subTest(name=name):
+                result = self.run_cli("dev", "--dir", str(repo), "--env-file", str(self.dev_env(f"{name}=x\n")))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"sets {name}", result.stdout)
+                self.assertIn("trellis-crm dev --link-ai-ui", result.stdout)
+        self.assertEqual(self.docker_runs(), [])
+        self.assertFalse([c for c in self.calls() if " network " in c], "refused after docker was touched")
+
+    def test_the_link_lets_the_env_file_carry_the_ai_ui_key_and_space(self):
+        repo = self.checkout()
+        path = self.link_env("DEMO_STORY=1\n")
+        result = self.ok("dev", "--dir", str(repo), "--link-ai-ui", "--env-file", str(path))
+        (dev,) = self.docker_runs()
+        self.assertIn(f"--env-file {path}", dev)
+        self.assertIn("--network sage-network", dev)
+        self.assertFalse([c for c in self.calls() if "ai-key-value-77" in c])
+        self.assertNotIn("ai-key-value-77", result.stdout)
+        self.assertIn("AI_UI_API_KEY NOTIFY_SPACE_ID DEMO_STORY", result.stdout)
+
+    def test_the_link_joins_the_shared_network_and_connects_ai_ui(self):
+        repo = self.checkout()
+        (self.state / "container-sage-ai").touch()
+        result = self.ok("dev", "--dir", str(repo), "--link-ai-ui", "--env-file", str(self.link_env()))
+        (dev,) = self.docker_runs()
+        self.assertIn("--name trellis-crm-dev", dev)
+        self.assertIn("--network sage-network", dev)
+        calls = self.calls()
+        for step in ("docker colima network create sage-network", "docker colima network connect sage-network sage-ai"):
+            self.assertIn(step, calls)
+            self.assertLess(calls.index(step), calls.index(dev), f"{step} came after the dev container")
+        self.assertIn("Linked to AI-UI", result.stdout)
+        self.assertIn("http://trellis-crm-dev:8000", result.stdout)
+        self.assertIn("http://sage-ai:8080", result.stdout)
+        self.assertNotIn("ai-ui start", result.stdout)
+
+    def test_the_link_shares_the_network_the_real_trellis_made(self):
+        repo = self.checkout()
+        (self.state / "container-sage-ai").touch()
+        self.ok("start")
+        self.ok("dev", "--dir", str(repo), "--link-ai-ui", "--env-file", str(self.link_env()))
+        self.assertEqual(self.calls().count("docker colima network create sage-network"), 1)
+        real, dev = self.docker_runs()
+        for run in (real, dev):
+            self.assertIn("--network sage-network", run)
+        self.assertTrue((self.state / "up-trellis-crm").exists(), "the real Trellis stopped")
+
+    def test_without_the_link_the_dev_install_stays_off_the_network(self):
+        repo = self.checkout()
+        (self.state / "container-sage-ai").touch()
+        self.ok("dev", "--dir", str(repo))
+        (dev,) = self.docker_runs()
+        self.assertNotIn("--network", dev)
+        self.assertFalse([c for c in self.calls() if " network " in c])
+
+    def test_the_link_without_ai_ui_running_says_how_to_connect_it_later(self):
+        repo = self.checkout()
+        result = self.ok("dev", "--dir", str(repo), "--link-ai-ui", "--env-file", str(self.link_env()))
+        self.assertIn("--network sage-network", self.docker_runs()[0])
+        self.assertFalse([c for c in self.calls() if "network connect" in c])
+        self.assertIn("sage-ai is not here yet", result.stdout)
+        self.assertIn("trellis-crm dev --link-ai-ui again", result.stdout)
+        self.assertNotIn("Linked to AI-UI", result.stdout, "it claimed a link to an AI-UI that is not there")
+        self.assertNotIn("Notices go to", result.stdout, "it claimed a delivery to an AI-UI that is not there")
+
+    def test_a_line_that_is_not_name_value_is_refused_by_its_number_and_never_printed(self):
+        repo = self.checkout()
+        secret = "leaked-secret-token-12345"
+        bad = {"a blank value": "CRM_API_KEY=", "a value of spaces": "CRM_API_KEY=   ", "a bare name": "CRM_API_KEY",
+               "no name": f"={secret}", "no equals sign": secret, "a space in the name": f"export CRM_API_KEY={secret}",
+               "an indented line": f"  CRM_API_KEY={secret}", "a carriage return": f"CRM_API_KEY={secret}\r"}
+        for what, line in bad.items():
+            for options in ((), ("--link-ai-ui",)):
+                with self.subTest(what, options=options):
+                    path = self.dev_env(f"# keys\n\nDEMO_STORY=1\n{line}\nDEMO_PASSWORD=x\n")
+                    result = self.run_cli("dev", "--dir", str(repo), "--env-file", str(path), *options)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("line 4 is not NAME=value", result.stdout)
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+        self.assertEqual(self.docker_runs(), [])
+        # Comments, blank lines, a last line with no newline and a value with spaces or = in it are fine.
+        path = self.dev_env("# keys\n\n   \n  # an indented note\nCRM_API_KEY=a=b c\nDEMO_STORY=1")
+        self.ok("dev", "--dir", str(repo), "--env-file", str(path))
+
+    def test_the_ai_ui_address_is_never_in_the_file_and_the_link_sets_it(self):
+        repo = self.checkout()
+        address = "AI_UI_URL=http://elsewhere.example:9999\n"
+        for options, text in (((), address), (("--link-ai-ui",), "AI_UI_API_KEY=k\nNOTIFY_SPACE_ID=s\n" + address)):
+            with self.subTest(options=options):
+                path = self.dev_env(text)
+                result = self.run_cli("dev", "--dir", str(repo), "--env-file", str(path), *options)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("sets AI_UI_URL", result.stdout)
+                self.assertIn("trellis-crm dev --link-ai-ui sets it, to http://sage-ai:8080", result.stdout)
+        self.assertEqual(self.docker_runs(), [])
+        self.ok("dev", "--dir", str(repo), "--link-ai-ui", "--env-file", str(self.link_env()))
+        self.assertIn("-e AI_UI_URL=http://sage-ai:8080", self.docker_runs()[-1])
+        self.ok("dev", "--dir", str(repo))
+        self.assertNotIn("AI_UI_URL", self.docker_runs()[-1])
+        usage = " ".join(self.ok("--help").stdout.split())
+        self.assertIn("needs the file to carry AI_UI_API_KEY and NOTIFY_SPACE_ID", usage)
+        self.assertNotIn("AI_UI_URL", usage)
+
+    def test_the_link_needs_an_env_file_that_carries_the_ai_ui_key_and_space(self):
+        repo = self.checkout()
+        result = self.run_cli("dev", "--dir", str(repo), "--link-ai-ui")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--link-ai-ui needs --env-file", result.stdout)
+        for held, missing in (("AI_UI_API_KEY=k\n", "NOTIFY_SPACE_ID"), ("NOTIFY_SPACE_ID=s\n", "AI_UI_API_KEY"),
+                              ("DEMO_STORY=1\n", "AI_UI_API_KEY"), ("# nothing\n", "AI_UI_API_KEY")):
+            with self.subTest(held=held):
+                path = self.dev_env(held)
+                result = self.run_cli("dev", "--dir", str(repo), "--link-ai-ui", "--env-file", str(path))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"{missing} is not there", result.stdout)
+        self.assertEqual(self.docker_runs(), [])
+        self.assertFalse([c for c in self.calls() if " network " in c], "refused after docker was touched")
+
+    def test_the_summary_says_which_space_gets_the_notices_and_through_what(self):
+        repo = self.checkout()
+        (self.state / "container-sage-ai").touch()
+        result = self.ok("dev", "--dir", str(repo), "--link-ai-ui", "--env-file", str(self.link_env()))
+        self.assertIn("Notices go to Space space-9 through http://sage-ai:8080", result.stdout)
+        self.assertNotIn("ai-key-value-77", result.stdout + result.stderr)
+
+    def test_the_link_turns_back_the_real_trellis_key_and_space_without_printing_them(self):
+        repo = self.checkout()
+        self.ok("start")
+        real = {"AI_UI_API_KEY": "real-key-value-31", "NOTIFY_SPACE_ID": "real-space-5"}
+        own = {"AI_UI_API_KEY": "dev-key-value-8", "NOTIFY_SPACE_ID": "dev-space-2"}
+        self.env_file.write_text(self.env_file.read_text() + "".join(f"{k}={v}\n" for k, v in real.items()))
+        runs, before = len(self.docker_runs()), len(self.calls())
+        for name in own:
+            with self.subTest(name=name):
+                path = self.dev_env("".join(f"{k}={v}\n" for k, v in (own | {name: real[name]}).items()))
+                result = self.run_cli("dev", "--dir", str(repo), "--link-ai-ui", "--env-file", str(path))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"{name} as the real Trellis", result.stdout)
+                for value in (*real.values(), *own.values()):
+                    self.assertNotIn(value, result.stdout + result.stderr)
+        self.assertEqual(len(self.docker_runs()), runs)
+        self.assertFalse([c for c in self.calls()[before:] if " network " in c], "refused after docker was touched")
+        # Its own key and a test Space pass.
+        self.ok("dev", "--dir", str(repo), "--link-ai-ui",
+                "--env-file", str(self.dev_env("".join(f"{k}={v}\n" for k, v in own.items()))))
+        self.assertEqual(len(self.docker_runs()), runs + 1)
+
+    def test_the_dev_install_tells_the_app_its_own_address_and_the_file_cannot_change_it(self):
+        repo = self.checkout()
+        self.ok("start", "--url", "https://crm.example.com")
+        self.ok("dev", "--dir", str(repo))
+        self.ok("dev", "--dir", str(repo), "--port", "9100")
+        _, first, second = self.docker_runs()
+        self.assertIn("-e CRM_PUBLIC_URL=http://localhost:8031", first)
+        self.assertIn("-e CRM_PUBLIC_URL=http://localhost:9100", second)
+        path = self.dev_env("CRM_PUBLIC_URL=https://crm.example.com\n")
+        result = self.run_cli("dev", "--dir", str(repo), "--env-file", str(path))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("sets CRM_PUBLIC_URL", result.stdout)
+
+    def test_reset_removes_only_the_dev_volume(self):
+        repo = self.checkout()
+        self.ok("dev", "--dir", str(repo), "--reset")
+        removed = [c for c in self.calls() if " volume rm " in c]
+        self.assertEqual(len(removed), 1)
+        self.assertTrue(removed[0].endswith(" trellis-crm-dev-data"))
+
     def test_stop_removes_only_the_dev_container(self):
         repo = self.checkout()
         self.ok("start")
@@ -776,6 +1049,48 @@ class DevMode(Mac):
         self.ok("dev", "--stop")
         self.assertFalse((self.state / "container-trellis-crm-dev").exists())
         self.assertTrue((self.state / "up-trellis-crm").exists())
+
+    def stick_volume(self, fails):
+        """Docker holds the volume through that many removals; the pause between tries takes no time."""
+        (self.state / "rm-fails").write_text(f"{fails}\n")
+        self.stub("sleep", 'echo "sleep $*" >> "$STATE/calls"')
+
+    def test_reset_tries_the_volume_up_to_five_times_and_claims_a_reset_only_once_it_is_gone(self):
+        repo = self.checkout()
+        self.ok("dev", "--dir", str(repo))  # makes the dev volume
+        self.stick_volume(2)
+        before = len(self.calls())
+        result = self.ok("dev", "--dir", str(repo), "--reset")
+        calls = self.calls()[before:]
+        self.assertEqual(len([c for c in calls if " volume rm " in c]), 3)
+        self.assertEqual(calls.count("sleep 1"), 2)
+        self.assertIn("Dev data reset", result.stdout)
+        self.assertIn("-v trellis-crm-dev-data:/data", self.docker_runs()[-1])
+        # A volume that stays: five tries, then an error, with no reset claimed and no dev container over the old data.
+        self.stick_volume(99)
+        runs, before = len(self.docker_runs()), len(self.calls())
+        result = self.run_cli("dev", "--dir", str(repo), "--reset")
+        calls = self.calls()[before:]
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the dev volume is still there; nothing was reset", result.stdout)
+        self.assertNotIn("Dev data reset", result.stdout)
+        self.assertEqual(len([c for c in calls if " volume rm " in c]), 5)
+        self.assertEqual(len(self.docker_runs()), runs)
+
+    def test_a_checkout_that_also_serves_the_real_trellis_is_flagged_once_and_not_refused(self):
+        repo, other = self.checkout(), self.checkout("trellis-two")
+        link = self.home / "src" / "trellis-by-another-name"
+        link.symlink_to(repo)
+        warning = "This checkout also serves the real Trellis: an edit here changes both."
+        self.ok("start", "--source", str(repo))
+        for what, folder, flagged in (("the folder itself", repo, 1), ("a link to it", link, 1),
+                                      ("another checkout", other, 0)):
+            with self.subTest(what):
+                result = self.ok("dev", "--dir", str(folder))
+                self.assertEqual(result.stdout.count(warning), flagged)
+                self.assertIn("Dev mode is running", result.stdout)
+        self.ok("start", "--no-source")  # the real one runs the image's code: no checkout to share
+        self.assertNotIn(warning, self.ok("dev", "--dir", str(repo)).stdout)
 
 
 class SourceMode(Mac):

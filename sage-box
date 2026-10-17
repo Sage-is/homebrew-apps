@@ -34,6 +34,10 @@ BACKUP_LABEL="is.sage.trellis-backup"
 BACKUP_PLIST="/Library/LaunchDaemons/$BACKUP_LABEL.plist"
 BOX_BACKUPS='$HOME/.sage-is/backups/trellis-crm'
 KEEP_BACKUPS=14
+AI_UI_CONTAINER="sage-ai"
+AI_UI_NETWORK="sage-network"
+# ai-ui start makes a new sage-ai, off the network Trellis calls it on (http://sage-ai:8080): join it again after every start.
+AI_UI_CONNECT="docker network connect $AI_UI_NETWORK $AI_UI_CONTAINER"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
 APPLY=0
 REBOOT=0
@@ -54,7 +58,8 @@ prints what it found and what it would change, and changes nothing.
               backups, then verify
   --reboot    with --apply: restart the box at the end and verify it comes back
   update      brew upgrade our tools; in source mode git pull the checkout;
-              trellis-crm update; ai-ui start when the box runs AI-UI
+              trellis-crm update; ai-ui start when the box runs AI-UI, which
+              then rejoins sage-network. The first step to fail stops the run.
   backup      pull the box's newest trellis-crm backup, encrypt it with age to
               BOX_BACKUP_TO, keep the last $KEEP_BACKUPS in BOX_BACKUP_DIR;
               --nightly installs a launchd agent on this Mac that does so at 03:30
@@ -157,6 +162,7 @@ remote_with_stdin() { printf '%s\n' "$2" | remote "$1"; }
 # --- what the box holds ---------------------------------------------------------
 
 # One round trip answers every question; each line becomes found_<key>.
+# The engine is asked only when sage-ai has answered: a half-started engine holds a docker call open for minutes (see ANSWER_SECONDS in lib/sage-runtime.sh).
 probe() {
   local key value
   while IFS='=' read -r key value; do
@@ -181,14 +187,15 @@ echo "profile=$(sed -n "s/^CRM_PROFILE=//p" ~/.sage-is/trellis-crm.env 2>/dev/nu
 echo "review_at=$(sed -n "s/^REVIEW_AT=//p" ~/.sage-is/trellis-crm.env 2>/dev/null)"
 echo "shift_end=$(sed -n "s/^SHIFT_END=//p" ~/.sage-is/trellis-crm.env 2>/dev/null)"
 echo "trellis=$(curl -fsS --max-time 5 "http://127.0.0.1:$BOX_PORT/crm/health/" >/dev/null 2>&1 && echo up || echo down)"
-echo "aiui=$(curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1 && echo up || echo down)"
+aiui=$(curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1 && echo up || echo down); echo "aiui=$aiui"
+echo "aiui_net=$([ "$aiui" = up ] && docker network inspect '"$AI_UI_NETWORK"' -f "{{range .Containers}}{{println .Name}}{{end}}" 2>/dev/null | grep -qx '"$AI_UI_CONTAINER"' && echo yes || echo no)"
 echo "filevault=$(fdesetup status 2>/dev/null | grep -q " On" && echo on || echo off)"
 echo "leftovers=$(sage-runtime status 2>/dev/null | grep -cE "leads nowhere|leads to Docker Desktop|plugin hooks|buildx not found" || true)"
 ')
   : "${found_arch:=?}" "${found_os:=?}" "${found_brew:=missing}" "${found_vm:=}" "${found_boot:=no}" "${found_backup_daemon:=no}"
   : "${found_autorestart:=}" "${found_sleep:=}" "${found_ghcr:=no}" "${found_deploy_key:=no}" "${found_checkout:=none}"
   : "${found_source:=}" "${found_profile:=}" "${found_review_at:=}" "${found_shift_end:=}" "${found_trellis:=down}"
-  : "${found_aiui:=down}" "${found_filevault:=off}" "${found_leftovers:=0}" "${found_context:=}"
+  : "${found_aiui:=down}" "${found_aiui_net:=no}" "${found_filevault:=off}" "${found_leftovers:=0}" "${found_context:=}"
   : "${found_sage_runtime:=missing}" "${found_trellis_crm:=missing}" "${found_ai_ui:=missing}"
 }
 
@@ -369,7 +376,10 @@ done
 trellis-crm start --profile "$BOX_PROFILE" --url "$BOX_URL" --port "$BOX_PORT" '"$source_flag"' 2>&1 | tail -3'
 }
 
-run_aiui() { remote 'ai-ui start 2>&1 | tail -2'; }
+run_aiui() {
+  remote 'ai-ui start 2>&1 | tail -2
+'"$AI_UI_CONNECT"' 2>/dev/null || true'
+}
 
 step_trellis() {
   [[ "$BOX_MODE" != peer ]] || return 0
@@ -434,6 +444,14 @@ verify() {
   fi
   if [[ "$BOX_AI_UI" == 1 ]]; then
     printf '  %-9s %s\n' ai-ui "$found_aiui"; [[ "$found_aiui" == up ]] || ok=0
+    # Only Trellis calls sage-ai by name, and only trellis-crm makes sage-network: a peer box has none to judge. AI-UI down already fails the run.
+    if [[ "$BOX_MODE" != peer && "$found_aiui" == up ]]; then
+      if [[ "$found_aiui_net" == yes ]]; then
+        printf '  %-9s %s\n' network "$AI_UI_CONTAINER is on $AI_UI_NETWORK"
+      else
+        printf '  %-9s %s\n' network "$AI_UI_CONTAINER is not on $AI_UI_NETWORK (on the box: $AI_UI_CONNECT)"; ok=0
+      fi
+    fi
   fi
   printf '  %-9s %s\n' vm "${found_vm:-none}"
   printf '  %-9s %s\n' boot "$found_boot"
@@ -486,18 +504,28 @@ cmd_plan() {
   fi
 }
 
+# A step of the update that fails stops the update, also one behind "| tail":
+# -e stops the script, pipefail makes a pipe report the failure and not tail's
+# success. The scripts say so themselves, not prelude: the grep | tail lines of
+# the other scripts would fail on an empty match.
+update_remote() {
+  remote $'set -eo pipefail\n'"$2" || die "the update stopped at $1 on the box; the steps after it did not run"
+}
+
 cmd_update() {
   local name="$1"
   load_box "$name"
   agent_up
   echo "Updating $name..."
-  remote 'brew update >/dev/null 2>&1 || true; brew upgrade '"$(tools_wanted)"' 2>&1 | grep -vE "^==> (Downloading|Pouring|Fetching)|^\s*$" | tail -3 || true'
+  update_remote "brew upgrade" 'brew update >/dev/null 2>&1 || true; brew upgrade '"$(tools_wanted)"' 2>&1 | grep -vE "^==> (Downloading|Pouring|Fetching)|^\s*$" | tail -3 || true'
   if [[ "$BOX_MODE" != peer ]]; then
     if [[ "$BOX_MODE" == source ]]; then
-      remote 'git -C "$BOX_CHECKOUT" pull --ff-only 2>&1 | tail -1; git -C "$BOX_CHECKOUT" log -1 --format="  checkout at %h %s"'
+      # This pulls BOX_CHECKOUT; trellis-crm update pulls the TRELLIS_SOURCE in the box's settings. Only --apply makes them one checkout.
+      update_remote "git pull" 'git -C "$BOX_CHECKOUT" pull --ff-only 2>&1 | tail -1; git -C "$BOX_CHECKOUT" log -1 --format="  checkout at %h %s"'
     fi
-    remote 'trellis-crm update 2>&1 | tail -2'
-    [[ "$BOX_AI_UI" != 1 ]] || remote 'ai-ui start 2>&1 | tail -1'
+    update_remote "trellis-crm update" 'trellis-crm update 2>&1 | tail -2'
+    [[ "$BOX_AI_UI" != 1 ]] || update_remote "ai-ui start" 'ai-ui start 2>&1 | tail -1
+'"$AI_UI_CONNECT"' 2>/dev/null || true'
   fi
   echo "Verify:"
   verify || die "something is down after the update; see above"
