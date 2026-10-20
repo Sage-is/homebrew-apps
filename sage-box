@@ -47,6 +47,8 @@ usage() {
   cat <<EOF
 Usage: $PROG <box> [--apply] [--reboot]
        $PROG <box> update | backup [--nightly] | status
+       $PROG <box> mailbox list | add NAME ... | check NAME | enable NAME | disable NAME
+       $PROG <box> mailbox secret NAME (--from bw:ITEM[/FIELD] | --prompt [--vault ITEM [--replace]] | --clear)
        $PROG local
        $PROG version
 
@@ -64,6 +66,13 @@ prints what it found and what it would change, and changes nothing.
               BOX_BACKUP_TO, keep the last $KEEP_BACKUPS in BOX_BACKUP_DIR;
               --nightly installs a launchd agent on this Mac that does so at 03:30
   status      both apps, the VM, the boot daemon and the newest backup
+  mailbox     trellis-crm mailbox on the box, every argument as typed and its
+              exit code back. A new mailbox starts disabled.
+  mailbox secret NAME
+              the password reaches the box on stdin, never on a command line:
+              --from resolves a vault item on this Mac; --prompt asks twice,
+              without echo, and --vault ITEM stores it in the vault first
+              (sage-secret put; --replace changes an item that exists)
   local       the same tool and runtime checks on this Mac, no SSH
 
 Modes (BOX_MODE): source runs Trellis from a checkout on the box, image runs
@@ -594,6 +603,88 @@ cmd_status() {
   fi
 }
 
+# --- mailboxes -----------------------------------------------------------------------
+
+# Arguments as words the box's bash reads back exactly: spaces and quotes survive.
+quoted() {
+  [[ $# -eq 0 ]] || printf ' %q' "$@"
+}
+
+mailbox_box() {
+  load_box "$1"
+  [[ "$BOX_MODE" != peer ]] || die "a peer box runs no Trellis, so it has no mailboxes"
+  agent_up
+}
+
+# Every mailbox command but secret goes through as typed. stdin stays here:
+# nothing on the box reads it.
+cmd_mailbox() {
+  local name="$1"
+  shift
+  if [[ "${1:-}" == secret ]]; then shift; cmd_mailbox_secret "$name" "$@"; return; fi
+  mailbox_box "$name"
+  remote "trellis-crm mailbox$(quoted "$@")" </dev/null
+}
+
+# The password lives in one shell variable, travels on stdin alone (printf is
+# a builtin, so no process list shows it) and is unset after. --from resolves
+# the vault item on this Mac: the reference rides in a child's environment,
+# and sage-secret run hands that child the value.
+cmd_mailbox_secret() {
+  local name="$1" mailbox="${2:-}" from="" prompt=0 vault="" replace=0 clear=0 password="" again="" status=0
+  local how="$PROG $name mailbox secret NAME (--from bw:ITEM[/FIELD] | --prompt [--vault ITEM [--replace]] | --clear)"
+  [[ -n "$mailbox" && "$mailbox" != -* ]] || die "name the mailbox: $how"
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)    [[ $# -ge 2 ]] || die "--from needs bw:ITEM or bw:ITEM/FIELD"; from="$2"; shift 2 ;;
+      --prompt)  prompt=1; shift ;;
+      --vault)   [[ $# -ge 2 ]] || die "--vault needs the vault item's name"; vault="${2#bw:}"; shift 2 ;;
+      --replace) replace=1; shift ;;
+      --clear)   clear=1; shift ;;
+      # Never echo it: a password typed here by mistake would land in the terminal.
+      *) die "mailbox secret takes no such argument. $how" ;;
+    esac
+  done
+  [[ $((${from:+1} + prompt + clear)) == 1 ]] || die "pick one of --from, --prompt or --clear. $how"
+  [[ -z "$vault" || $prompt == 1 ]] || die "--vault goes with --prompt: an item from --from is in the vault already"
+  [[ $replace == 0 || -n "$vault" ]] || die "--replace goes with --vault"
+  [[ -z "$from" || "$from" == bw:?* ]] || die "--from takes a vault reference, bw:ITEM or bw:ITEM/FIELD. A password never goes on a command line."
+  [[ $prompt == 0 || -t 0 ]] || die "--prompt reads from a terminal. From a script, put the password in the vault and use --from bw:ITEM"
+  mailbox_box "$name"
+  if [[ $clear == 1 ]]; then
+    remote "trellis-crm mailbox secret $(printf '%q' "$mailbox") --clear" </dev/null
+    return
+  fi
+  if [[ -n "$from" ]]; then
+    # shellcheck disable=SC2016 # the child expands the variable, after sage-secret resolves it
+    password="$(SAGE_BOX_MAILBOX_SECRET="$from" sage-secret run -- /bin/sh -c 'printf "%s" "$SAGE_BOX_MAILBOX_SECRET"')" \
+      || die "the vault did not give $from; nothing reached the box"
+    [[ -n "$password" ]] || die "$from is empty in the vault; nothing reached the box"
+  else
+    IFS= read -rs -p "Password for mailbox $mailbox: " password || true
+    echo >&2
+    IFS= read -rs -p "The same again: " again || true
+    echo >&2
+    if [[ -z "$password" || "$password" != "$again" ]]; then
+      unset password again
+      die "the two entries differ or are empty; nothing changed"
+    fi
+    unset again
+    if [[ -n "$vault" ]]; then
+      local put=(sage-secret put "$vault" --stdin)
+      [[ $replace == 0 ]] || put+=(--replace)
+      printf '%s' "$password" | "${put[@]}" || { unset password; die "the vault refused $vault; nothing reached the box"; }
+    fi
+  fi
+  printf '%s' "$password" | remote "trellis-crm mailbox secret $(printf '%q' "$mailbox") --stdin" || status=$?
+  unset password
+  if [[ $status != 0 && -n "$vault" ]]; then
+    echo "The vault holds it as bw:$vault. Send it again: $PROG $name mailbox secret$(quoted "$mailbox") --from bw:$vault" >&2
+  fi
+  return "$status"
+}
+
 cmd_local() {
   echo "This Mac: $(uname -m), $(sw_vers -productVersion 2>/dev/null || uname -s)"
   local t
@@ -622,6 +713,7 @@ case "$sub" in
   update) cmd_update "$name" ;;
   backup) shift; cmd_backup "$name" "$@" ;;
   status) cmd_status "$name" ;;
+  mailbox) shift; cmd_mailbox "$name" "$@" ;;
   ""|--apply|--reboot)
     while [[ $# -gt 0 ]]; do
       case "$1" in

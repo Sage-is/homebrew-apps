@@ -81,6 +81,14 @@ Commands:
   restore FILE [--yes]  Replace the record with a backup (the current one is backed up first)
   boot   [--print|--remove]
                         Start Colima at power-on with nobody signed in (asks for sudo)
+  mailbox list | add NAME ... | check NAME | enable NAME | disable NAME
+  mailbox secret NAME (--stdin | --clear)
+                        The mail accounts Trellis reads, run by its own command
+                        in the container: python manage.py mailbox. A new one
+                        starts disabled; check signs in and out and reads no
+                        mail. The password comes on stdin, never as an argument;
+                        at a terminal it is asked for without echo. The exit
+                        code is the command's
   nuke   [--dry-run] [--yes] [--force]
                         Remove Trellis and its record from this machine
   dev    [--dir DIR] [--port PORT] [--profile NAME] [--env-file FILE]
@@ -227,6 +235,21 @@ random_secret() {
   head -c 48 /dev/urandom | base64 | tr -d '/+=\n' | cut -c "1-$1"
 }
 
+# A Fernet key: 32 random bytes in urlsafe base64, padding kept (44 characters).
+fernet_key() {
+  head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_'
+}
+
+MAILBOX_KEY_NOTE="# Encrypts the mailbox passwords Trellis keeps in its database. Lose it and every password must be entered again."
+
+# A settings file from before mailboxes has no key: add one, and touch no other line.
+ensure_mailbox_key() {
+  [[ -z "$(env_get MAILBOX_SECRETS_KEY)" ]] || return 0
+  grep -q '^MAILBOX_SECRETS_KEY=' "$ENV_FILE" || echo "$MAILBOX_KEY_NOTE" >> "$ENV_FILE"
+  env_set MAILBOX_SECRETS_KEY "$(fernet_key)"
+  echo "Added MAILBOX_SECRETS_KEY to $ENV_FILE: it encrypts mailbox passwords, so keep it with the file."
+}
+
 host_timezone() {
   local tz
   tz="$(readlink /etc/localtime 2>/dev/null | sed 's#.*zoneinfo/##')" || true
@@ -264,6 +287,9 @@ INTAKE_SECRET=$(random_secret 40)
 AI_UI_URL=http://$AI_UI_CONTAINER:8080
 AI_UI_API_KEY=
 NOTIFY_SPACE_ID=
+$MAILBOX_KEY_NOTE
+# More keys, comma-separated, rotate it: the first encrypts, every one decrypts.
+MAILBOX_SECRETS_KEY=$(fernet_key)
 EOF
   chmod 600 "$ENV_FILE"
 }
@@ -444,6 +470,7 @@ cmd_start() {
   [[ -f "$ENV_FILE" ]] || first_run=1
   refuse_demo_settings
   ensure_env_file
+  ensure_mailbox_key
   if [[ -n "$port" ]]; then
     # A URL still on the old local port follows the new one.
     if [[ "$(env_get CRM_PUBLIC_URL)" == "http://localhost:$(env_get TRELLIS_PORT)" ]]; then
@@ -818,6 +845,26 @@ cmd_restore() {
   cmd_start
 }
 
+# The mail accounts Trellis reads live in its database, behind its own command.
+# Every argument goes through as it is, stdin too, and the command's exit code
+# comes back. A password arrives on stdin (secret NAME --stdin), never as an
+# argument; typed at a terminal, it is read here without echo and piped on.
+cmd_mailbox() {
+  local password="" status=0
+  if ! container_running; then
+    echo "Trellis is not running; its mailboxes live in its database. Start it first: $PROG start" >&2
+    exit 1
+  fi
+  if [[ -t 0 && " $* " == *" --stdin "* ]]; then
+    IFS= read -rs -p "Mailbox password: " password || true
+    echo >&2
+    printf '%s' "$password" | docker exec -i "$CONTAINER" python manage.py mailbox "$@" || status=$?
+    unset password
+    exit "$status"
+  fi
+  exec docker exec -i "$CONTAINER" python manage.py mailbox "$@"
+}
+
 # Colima at power-on with nobody signed in: a LaunchDaemon runs
 # `colima start --foreground` as this user, and Docker brings the containers
 # back by their restart policy. At shutdown launchd stops Colima, which stops
@@ -979,7 +1026,7 @@ set -- ${args[@]+"${args[@]}"}
 if [[ "$(uname)" == Darwin ]]; then
   case "$command" in
     start|update|restore|dev)               select_runtime ask ;;
-    stop|status|logs|backup|boot|nuke)      select_runtime ;;
+    stop|status|logs|backup|boot|nuke|mailbox) select_runtime ;;
   esac
 fi
 
@@ -992,6 +1039,7 @@ case "$command" in
   open)    cmd_open ;;
   backup)  cmd_backup "$@" ;;
   restore) cmd_restore "$@" ;;
+  mailbox) cmd_mailbox "$@" ;;
   boot)    cmd_boot "$@" ;;
   nuke)    cmd_nuke "$@" ;;
   dev)     cmd_dev "$@" ;;

@@ -227,9 +227,12 @@ docker login ghcr.io          # once, with a token that can only read packages
 trellis-crm start             # http://localhost:8030
 trellis-crm boot              # Colima at power-on, nobody signed in
 trellis-crm backup            # the database and artifacts in one .tar.gz
+trellis-crm mailbox list      # the mail accounts Trellis reads
 ```
 
 `trellis-crm start` refuses a settings file that sets `LOAD_FIXTURES`, `DEMO_RESET` or `DEMO_RESET_HOURS` (a bare name counts), and runs the container with `LOAD_FIXTURES=0`: a demo's switches would fill the real record with synthetic data or wipe it. It names the switches, never a value. Run a demo with `trellis-crm dev`. A first start prints no password. The first admin's is `DJANGO_SUPERUSER_PASSWORD` in the settings file.
+
+`trellis-crm mailbox` runs Trellis's own `python manage.py mailbox` in the container: `list`, `add`, `secret`, `check`, `enable`, `disable`. Every argument goes through as typed, and the exit code comes back (0 ok, 1 refused, 2 usage). A new mailbox starts disabled. `check` signs in and out and reads no mail. The password comes on stdin (`mailbox secret NAME --stdin`), never as an argument; at a terminal it is asked for without echo. `MAILBOX_SECRETS_KEY` in the settings file encrypts those passwords in the database. A first start writes it, and `start` adds one to an older file and says so. A backup holds the passwords but not the key: keep the settings file, or enter every password again.
 
 `trellis-crm dev` runs a checkout beside the real Trellis, never in its place: its own container, volume and port (8031), loopback only, synthetic data only, live reload. It finds the checkout the way `ai-ui dev` does and shares its saved paths in `~/.sage-is/projects`. A box that clones the private repo needs a read-only deploy key for `Sage-is/trellis`. It tells the app its own address, `CRM_PUBLIC_URL=http://localhost:<port>`, so no link points at the real Trellis. When the real Trellis runs from the same checkout (`start --source`), dev prints one warning line, "This checkout also serves the real Trellis: an edit here changes both.", and goes on.
 
@@ -246,10 +249,14 @@ sage-box pilot              # what it has, what would change; nothing changes
 sage-box pilot --apply      # the plan, then both apps verified; --reboot proves it comes back
 sage-box pilot update       # brew upgrade, git pull in source mode, trellis-crm update; stops at the first failing step
 sage-box pilot backup       # the newest archive, encrypted with age, kept 14 deep
+sage-box pilot mailbox list # trellis-crm mailbox on the box: arguments as typed, the exit code back
+sage-box pilot mailbox secret front --prompt --vault mail-front   # asked twice, stored in the vault, sent on stdin
 sage-box local              # the same checks on this Mac
 ```
 
 Modes: `source` runs Trellis from a checkout on the box (a `git pull` and `update` is an upgrade), `image` runs the released image, `peer` sets up a developer's Mac with no Trellis. The box file stays out of every repository.
+
+A mailbox password reaches the box on stdin, never on a command line. `mailbox secret NAME --from bw:ITEM[/FIELD]` resolves the item on this Mac through `sage-secret run`, with the reference in a child's environment. `--prompt` asks twice without echo and stops when the entries differ. `--vault ITEM` first stores it with `sage-secret put ITEM --stdin`, in the agents' writable organization; an item that exists needs `--replace`. `--clear` forgets it on the box.
 
 ## sage-secret
 

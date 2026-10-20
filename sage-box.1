@@ -1,6 +1,6 @@
 .\" sage-box(1) manpage — mdoc format
 .\" Version 0.1.0
-.Dd October 14, 2026
+.Dd October 20, 2026
 .Dt SAGE-BOX 1
 .Os
 .Sh NAME
@@ -18,6 +18,15 @@
 .Ar box
 .Cm backup
 .Op Fl -nightly
+.Nm
+.Ar box
+.Cm mailbox
+.Ar args ...
+.Nm
+.Ar box
+.Cm mailbox secret
+.Ar name
+.Fl -from Ar bw:item[/field] | Fl -prompt Oo Fl -vault Ar item Oo Fl -replace Oc Oc | Fl -clear
 .Nm
 .Cm local
 .Nm
@@ -139,6 +148,40 @@ Install a launchd agent on this Mac that runs
 at 03:30, after the box's own run.
 .It Cm status
 Tools, VM, boot daemon, both apps and the newest backup pulled.
+.It Cm mailbox Ar args ...
+Run
+.Li trellis-crm mailbox
+on the box:
+.Cm list , add , check , enable , disable .
+Every argument arrives as typed, and the exit code comes back: 0 ok, 1
+refused, 2 usage.
+A new mailbox starts disabled;
+.Cm check
+signs in and out and reads no mail.
+A peer box has no mailboxes.
+.It Cm mailbox secret Ar name Fl -from Ar bw:item[/field]
+Resolve the vault item on this Mac with
+.Li sage-secret run ,
+the reference in a child's environment, and send the password to the box on
+stdin.
+.Fl -from
+takes a reference only, never a password.
+.It Cm mailbox secret Ar name Fl -prompt
+Ask for the password twice, without echo; entries that differ change nothing.
+With
+.Fl -vault Ar item ,
+store it first with
+.Li sage-secret put Ar item Li --stdin ,
+in the agents' writable organization; an item that exists needs
+.Fl -replace .
+Then send it as
+.Fl -from
+does.
+When the box refuses it, the error names the
+.Fl -from
+line that sends it again.
+.It Cm mailbox secret Ar name Fl -clear
+Forget the password on the box.
 .It Cm local
 The tool and runtime checks on this Mac, with no SSH.
 .El

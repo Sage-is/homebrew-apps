@@ -1,5 +1,7 @@
 """trellis-crm in server mode: the settings file, the docker run, backups, boot and nuke."""
 
+import base64
+import hashlib
 import json
 import os
 import plistlib
@@ -11,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import termios
 import unittest
 from pathlib import Path
 
@@ -41,7 +44,9 @@ DATA_DISK = ("# krunkit puts the data disk on vdc, where Lima 2.2 looks for vdb;
 # Stand-ins log each call. Docker keeps a little state as marker files: the
 # runtime answering, the image, the network, the volume, the container. The
 # number in $STATE/rm-fails is how many `volume rm` calls fail before one works,
-# as when a container just removed still holds the volume.
+# as when a container just removed still holds the volume. `exec ... manage.py
+# mailbox` writes its argv NUL-separated to $STATE/exec-argv and a digest of its
+# stdin, never the bytes, to $STATE/exec-stdin, and exits with $STATE/mailbox-exit.
 STUBS = {
     # Like docker: --context, else DOCKER_CONTEXT, else the saved context.
     "docker": """ctx="${DOCKER_CONTEXT:-$(cat "$STATE/current-context" 2>/dev/null || echo default)}"
@@ -73,6 +78,12 @@ case "$1 ${2:-}" in
   "stop "*)          rm -f "$STATE/up-${@: -1}" ;;
   "rm "*)            rm -f "$STATE/container-${@: -1}" "$STATE/up-${@: -1}" ;;
   "exec "*)
+    if [[ "$*" == *" manage.py mailbox"* ]]; then
+      printf '%s\\0' "$@" > "$STATE/exec-argv"
+      shasum -a 256 | cut -d' ' -f1 > "$STATE/exec-stdin"
+      [[ " $* " != *" --stdin "* ]] || echo stored
+      exit "$(cat "$STATE/mailbox-exit" 2>/dev/null || echo 0)"
+    fi
     if [[ "$2" == -i ]]; then cat > /dev/null; fi
     if [[ "$*" == *" tar "* ]]; then printf 'TARDATA'; fi ;;
 esac""",
@@ -139,7 +150,7 @@ class Mac(unittest.TestCase):
     def setUp(self):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
-        root = Path(scratch.name)
+        root = self.root = Path(scratch.name)
         self.home, self.state, self.daemons = root / "home", root / "state", root / "LaunchDaemons"
         self.bin = root / "bin"
         for folder in (self.home, self.state, self.daemons, self.bin, root / "Applications"):
@@ -1146,6 +1157,140 @@ class SourceMode(Mac):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--no-source", result.stdout)
         self.assertEqual(len(self.docker_runs()), 1)
+
+
+class MailboxKey(Mac):
+    """MAILBOX_SECRETS_KEY encrypts the mailbox passwords in Trellis's database: one Fernet key, made once."""
+
+    def key_lines(self):
+        return [line for line in self.env_file.read_text().splitlines() if line.startswith("MAILBOX_SECRETS_KEY=")]
+
+    def assert_fernet(self, key):
+        self.assertEqual(len(key), 44)
+        self.assertEqual(len(base64.urlsafe_b64decode(key)), 32)
+        self.assertNotRegex(key, r"[+/]")
+
+    def test_a_new_settings_file_carries_a_key_and_says_what_losing_it_costs(self):
+        result = self.ok("start")
+        self.assert_fernet(self.settings()["MAILBOX_SECRETS_KEY"])
+        self.assertEqual(len(self.key_lines()), 1)
+        text = self.env_file.read_text()
+        note = text[:text.index("MAILBOX_SECRETS_KEY=")].splitlines()[-2]
+        self.assertIn("mailbox passwords", note)
+        self.assertIn("entered again", note)
+        self.assertNotIn("Added MAILBOX_SECRETS_KEY", result.stdout)
+        self.assertNotIn(self.settings()["MAILBOX_SECRETS_KEY"], result.stdout + result.stderr)
+
+    def test_an_old_settings_file_gets_one_key_once_and_keeps_every_other_line(self):
+        self.ok("start")
+        old = "".join(line + "\n" for line in self.env_file.read_text().splitlines() if "MAILBOX" not in line)
+        self.env_file.write_text(old)
+        result = self.ok("start")
+        self.assertEqual([line for line in result.stdout.splitlines() if "MAILBOX_SECRETS_KEY" in line],
+                         [f"Added MAILBOX_SECRETS_KEY to {self.env_file}: it encrypts mailbox passwords, so keep it with the file."])
+        text = self.env_file.read_text()
+        self.assertTrue(text.startswith(old), "every line before stays as it was")
+        (line,) = self.key_lines()
+        key = line.split("=", 1)[1]
+        self.assert_fernet(key)
+        self.assertNotIn(key, result.stdout + result.stderr)
+        self.assertEqual(stat.S_IMODE(self.env_file.stat().st_mode), 0o600)
+        again = self.ok("start")
+        self.assertNotIn("MAILBOX_SECRETS_KEY", again.stdout)
+        self.assertEqual(self.env_file.read_text(), text, "never a second key")
+
+    def test_an_empty_key_is_filled_in_its_place(self):
+        self.ok("start")
+        text = self.env_file.read_text()
+        key = self.settings()["MAILBOX_SECRETS_KEY"]
+        self.env_file.write_text(text.replace(f"MAILBOX_SECRETS_KEY={key}\n", "MAILBOX_SECRETS_KEY=\n"))
+        self.assertIn("Added MAILBOX_SECRETS_KEY", self.ok("start").stdout)
+        (line,) = self.key_lines()
+        self.assert_fernet(line.split("=", 1)[1])
+        self.assertEqual(self.env_file.read_text().count("mailbox passwords"), 1, "the note stays one")
+
+
+class Mailboxes(Mac):
+    """trellis-crm mailbox: Trellis's own command in the container, arguments as typed, stdin through, the exit code back."""
+
+    PREFIX = ["exec", "-i", "trellis-crm", "python", "manage.py", "mailbox"]
+
+    def setUp(self):
+        super().setUp()
+        self.ok("start")
+
+    def piped(self, *args, data):
+        return subprocess.run([TRELLIS_CRM, *args], env=self.env, capture_output=True, text=True, input=data, timeout=30)
+
+    def typed(self, *args, answer):
+        """stdin a terminal that types `answer`, echo off: read -s waits for an undrained echo (tcsetattr TCSADRAIN)."""
+        terminal, typist = pty.openpty()
+        attrs = termios.tcgetattr(typist)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(typist, termios.TCSANOW, attrs)
+        os.write(terminal, answer.encode())
+        try:
+            return subprocess.run([TRELLIS_CRM, *args], env=self.env, capture_output=True, text=True, stdin=typist, timeout=30)
+        finally:
+            os.close(terminal)
+            os.close(typist)
+
+    def container_argv(self):
+        path = self.state / "exec-argv"
+        return path.read_text().split("\0")[:-1] if path.exists() else None
+
+    def container_stdin(self):
+        return (self.state / "exec-stdin").read_text().strip()
+
+    def assert_nowhere(self, secret, result):
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        for call in self.calls():
+            self.assertNotIn(secret, call)
+        for path in (p for p in self.root.rglob("*") if p.is_file()):
+            self.assertNotIn(secret.encode(), path.read_bytes(), path)
+
+    def test_arguments_reach_the_container_as_typed(self):
+        args = ["add", "Front desk", "--host", "imap.example.test", "--username", "o'neil \"desk\"@example.test",
+                "--read-from", "2026-10-01", "--port", "993", "--mode", "personal", "--owner", "agent one"]
+        self.ok("mailbox", *args)
+        self.assertEqual(self.container_argv(), self.PREFIX + args)
+        self.ok("mailbox", "list", "--runtime", "colima")
+        self.assertEqual(self.container_argv(), self.PREFIX + ["list"])
+
+    def test_the_password_goes_on_stdin_and_nowhere_else(self):
+        secret = "pa ss 'word' \"x\" $HOME"
+        result = self.piped("mailbox", "secret", "front desk", "--stdin", data=secret)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.container_argv(), self.PREFIX + ["secret", "front desk", "--stdin"])
+        self.assertEqual(self.container_stdin(), hashlib.sha256(secret.encode()).hexdigest())
+        self.assertIn("stored", result.stdout)
+        self.assert_nowhere(secret, result)
+
+    def test_at_a_terminal_the_password_is_asked_for_without_echo(self):
+        result = self.typed("mailbox", "secret", "front", "--stdin", answer="typed pw\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.container_stdin(), hashlib.sha256(b"typed pw").hexdigest())
+        self.assertIn("Mailbox password:", result.stderr)
+        self.assert_nowhere("typed pw", result)
+
+    def test_the_exit_code_comes_back(self):
+        for code in (0, 1, 2):
+            with self.subTest(code=code):
+                (self.state / "mailbox-exit").write_text(str(code))
+                self.assertEqual(self.run_cli("mailbox", "check", "front").returncode, code)
+                self.assertEqual(self.piped("mailbox", "secret", "front", "--stdin", data="x").returncode, code)
+
+    def test_it_needs_trellis_running(self):
+        self.ok("stop")
+        result = self.run_cli("mailbox", "list")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Start it first", result.stderr)
+        self.assertIsNone(self.container_argv())
+
+    def test_usage_lists_it(self):
+        usage = self.ok("--help").stdout
+        self.assertIn("mailbox list | add NAME ... | check NAME | enable NAME | disable NAME", usage)
+        self.assertIn("mailbox secret NAME (--stdin | --clear)", usage)
 
 
 class Lib(unittest.TestCase):

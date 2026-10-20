@@ -1,8 +1,11 @@
 """sage-box: a Mac becomes a Sage.is box in one run, from one file, over SSH, with secrets from the vault."""
 
+import hashlib
 import os
+import pty
 import subprocess
 import tempfile
+import termios
 import time
 import unittest
 from pathlib import Path
@@ -17,12 +20,20 @@ FORMULA = TOOL.parent / "Formula" / "sage-box.rb"
 # With $STATE/exec it runs every other script, as the box would, against the
 # stand-in git, brew, trellis-crm, ai-ui and docker, and returns the script's
 # exit status; $STATE/fail-<step> makes one stand-in fail. curl answers a health
-# check, until $STATE/no-health exists.
-# sage-secret resolves bw:ITEM to secret-ITEM, or names a missing item.
+# check, until $STATE/no-health exists. With $STATE/hash-stdin, ssh keeps a
+# digest of its stdin and never the bytes, so a test can scan every file for a
+# secret. On the box, trellis-crm mailbox writes its argv NUL-separated to
+# $STATE/mailbox-argv, a digest of its stdin to $STATE/mailbox-stdin, and exits
+# with the code in $STATE/mailbox-exit.
+# sage-secret run resolves bw:ITEM, from --env FILE or the environment, to
+# secret-ITEM (a mail-* item to one with quotes, spaces and a $), or names a
+# missing item; put keeps a digest of the value in $STATE/item-ITEM.
 STUBS = {
     "ssh": r'''echo "ssh $*" >> "$STATE/calls"
 n=$(( $(cat "$STATE/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE/n"
-cat > "$STATE/stdin-$n"
+input="$(cat; printf x)"; input="${input%x}"
+if [ -e "$STATE/hash-stdin" ]; then printf '%s' "$input" | shasum -a 256 | cut -d' ' -f1 > "$STATE/stdin-$n"
+else printf '%s' "$input" > "$STATE/stdin-$n"; fi
 last="${@: -1}"
 case "$last" in
   true) left=$(cat "$STATE/down" 2>/dev/null || echo 0); if [ "$left" -gt 0 ]; then echo $((left - 1)) > "$STATE/down"; exit 1; fi; exit 0 ;;
@@ -39,7 +50,7 @@ if grep -q 'echo "arch=' <<< "$script"; then
   exit 0
 fi
 if grep -q 'ls -t' <<< "$script"; then [ -e "$STATE/no-backup" ] || echo "/Users/user/.sage-is/backups/trellis-crm/trellis-20261014-020000.tar.gz"; exit 0; fi
-if [ -e "$STATE/exec" ]; then bash -c "$(sed 's#/opt/homebrew/bin/brew#/nonexistent/brew#' <<< "$script")"; exit $?; fi
+if [ -e "$STATE/exec" ]; then printf '%s' "$input" | bash -c "$(sed 's#/opt/homebrew/bin/brew#/nonexistent/brew#' <<< "$script")"; exit $?; fi
 exit 0''',
     "ssh-agent": 'case "${1:-}" in -s) echo "SSH_AUTH_SOCK=/tmp/sage-box-test; export SSH_AUTH_SOCK;" ;; esac; echo "ssh-agent $*" >> "$STATE/calls"',
     "ssh-add": 'echo "ssh-add $*" >> "$STATE/calls"; cat > "$STATE/ssh-key"',
@@ -50,26 +61,49 @@ cp "$in" "$out"''',
     "launchctl": 'echo "launchctl $*" >> "$STATE/calls"',
     "sleep": "true",
     "curl": '[ ! -e "$STATE/no-health" ] || exit 22',
-    "sage-secret": r'''echo "sage-secret $1" >> "$STATE/calls"
-[ "$1" = run ] || exit 1
-shift; file="$2"; shift 3
-while IFS= read -r line; do
-  case "$line" in ''|'#'*) continue ;; esac
-  key="${line%%=*}"; val="${line#*=}"
-  case "$val" in
-    bw:*) item="${val#bw:}"; item="${item%%/*}"
-          [ ! -e "$STATE/missing-$item" ] || { echo "sage-secret: no item named $item that the agent account can see (for $key)" >&2; exit 1; }
-          val="secret-$item" ;;
-  esac
-  export "$key=$val"
-done < "$file"
-exec "$@"''',
+    "sage-secret": r'''echo "sage-secret $*" >> "$STATE/calls"
+value_of() {
+  item="${1#bw:}"; item="${item%%/*}"
+  [ ! -e "$STATE/missing-$item" ] || { echo "sage-secret: no item named $item that the agent account can see (for $2)" >&2; return 1; }
+  case "$item" in mail-*) printf '%s' "secret-$item it's \"quoted\" and spaced \$HOME" ;; *) printf '%s' "secret-$item" ;; esac
+}
+case "$1" in
+  run) shift
+       if [ "$1" = --env ]; then
+         while IFS= read -r line; do
+           case "$line" in ''|'#'*) continue ;; esac
+           export "${line%%=*}=${line#*=}"
+         done < "$2"
+         shift 2
+       fi
+       [ "$1" != -- ] || shift
+       for key in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=bw:.*/\1/p'); do
+         val="$(value_of "${!key}" "$key")" || exit 1
+         export "$key=$val"
+       done
+       exec "$@" ;;
+  put) item="$2"; shift 2; replace=0
+       for a in "$@"; do [ "$a" != --replace ] || replace=1; done
+       value="$(cat)"
+       [ -n "$value" ] || { echo "Error: the value is empty; nothing stored" >&2; exit 1; }
+       if [ -e "$STATE/item-$item" ] && [ $replace = 0 ]; then echo "Error: $item already exists in Agents-edit. Add --replace to change its password" >&2; exit 1; fi
+       printf '%s' "$value" | shasum -a 256 | cut -d' ' -f1 > "$STATE/item-$item"
+       echo "Stored $item (password) in Agents-edit / Agents. Use it as bw:$item" ;;
+  *) exit 1 ;;
+esac''',
     "sage-runtime": 'case "${1:-}" in version) echo "sage-runtime 0.1.0" ;; status) echo "Runtimes:"; echo "  colima running" ;; esac',
     "trellis-crm": r'''case "${1:-}" in
   version) echo "trellis-crm 0.1.1 (image x)" ;;
   update) echo "trellis-crm update" >> "$STATE/calls"
           [ ! -e "$STATE/fail-update" ] || { echo "Error: could not pull ghcr.io/sage-is/trellis:latest."; exit 1; }
           echo "Trellis is running at http://localhost:8030" ;;
+  mailbox) shift; echo "trellis-crm mailbox $*" >> "$STATE/calls"
+           printf '%s\0' "$@" > "$STATE/mailbox-argv"
+           case " $* " in
+             *" --stdin "*) shasum -a 256 | cut -d' ' -f1 > "$STATE/mailbox-stdin"; echo stored ;;
+             *) echo "front-desk  imap.example.test  disabled" ;;
+           esac
+           exit "$(cat "$STATE/mailbox-exit" 2>/dev/null || echo 0)" ;;
 esac''',
     "ai-ui": r'''case "${1:-}" in
   version) echo "ai-ui 3.2.0_2" ;;
@@ -114,6 +148,7 @@ class Mac(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         root = Path(scratch.name)
+        self.root = root
         self.home, self.state, self.bin, self.agents = root / "home", root / "state", root / "bin", root / "LaunchAgents"
         for folder in (self.home, self.state, self.bin, self.agents):
             folder.mkdir()
@@ -484,6 +519,166 @@ class Network(Mac):
         self.probe({**DONE, "aiui": "up", "aiui_net": "no"})  # something answers on :8080, but this box does not run AI-UI
         out = self.ok("pilot", "update").stdout
         self.assertNotIn("sage-ai", out)
+
+
+MAIL_SECRET = "secret-mail-front it's \"quoted\" and spaced $HOME"
+
+
+def digest(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class Mailbox(Mac):
+    """trellis-crm mailbox on the box: arguments as typed, the password on stdin alone, the exit code back."""
+
+    def setUp(self):
+        super().setUp()
+        self.box()
+        self.probe(DONE)
+        for marker in ("exec", "hash-stdin"):
+            (self.state / marker).touch()
+
+    def typed(self, *args, answer):
+        """Run sage-box with stdin a terminal that types `answer`. Typed ahead into a terminal that echoes, the
+        echo would wait for a reader, and read -s blocks until it drains (tcsetattr TCSADRAIN): turn echo off."""
+        terminal, typist = pty.openpty()
+        attrs = termios.tcgetattr(typist)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(typist, termios.TCSANOW, attrs)
+        os.write(terminal, answer.encode())
+        try:
+            return subprocess.run([TOOL, *args], env=self.env, capture_output=True, text=True, stdin=typist, timeout=60)
+        finally:
+            os.close(terminal)
+            os.close(typist)
+
+    def box_argv(self):
+        path = self.state / "mailbox-argv"
+        return path.read_text().split("\0")[:-1] if path.exists() else None
+
+    def assert_nowhere(self, secret, result):
+        """Not in what sage-box printed, not in any command line a stand-in saw, not in any file of the test."""
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        for call in self.calls():
+            self.assertNotIn(secret, call)
+        files = [p for p in self.root.rglob("*") if p.is_file()]
+        self.assertTrue(files)
+        for path in files:
+            self.assertNotIn(secret.encode(), path.read_bytes(), path)
+
+    def test_arguments_reach_the_box_as_typed(self):
+        args = ["add", "Front desk", "--host", "imap.example.test", "--username", "o'neil \"desk\"@example.test",
+                "--read-from", "2026-10-01", "--mode", "bcc"]
+        out = self.ok("pilot", "mailbox", *args).stdout
+        self.assertEqual(self.box_argv(), args)
+        self.assertIn("front-desk", out)
+        self.ok("pilot", "mailbox", "list")
+        self.assertEqual(self.box_argv(), ["list"])
+
+    def test_the_exit_code_comes_back(self):
+        for code in (0, 1, 2):
+            with self.subTest(code=code):
+                (self.state / "mailbox-exit").write_text(str(code))
+                self.assertEqual(self.run_cli("pilot", "mailbox", "check", "front desk").returncode, code)
+
+    def test_from_resolves_the_item_here_and_the_password_reaches_the_box_on_stdin(self):
+        result = self.ok("pilot", "mailbox", "secret", "front desk", "--from", "bw:mail-front/password")
+        self.assertEqual(self.box_argv(), ["secret", "front desk", "--stdin"])
+        self.assertEqual((self.state / "mailbox-stdin").read_text().strip(), digest(MAIL_SECRET))
+        self.assertIn("stored", result.stdout)
+        runs = [c for c in self.calls() if c.startswith("sage-secret run")]
+        self.assertEqual(len(runs), 2, "the box file, then the one item")
+        self.assertEqual(runs[1], "sage-secret run -- /bin/sh -c printf \"%s\" \"$SAGE_BOX_MAILBOX_SECRET\"",
+                         "the reference rides in the child's environment, not on sage-secret's command line")
+        self.assert_nowhere(MAIL_SECRET, result)
+
+    def test_from_takes_only_a_vault_reference_and_never_echoes_what_it_got(self):
+        result = self.run_cli("pilot", "mailbox", "secret", "front", "--from", "hunter2 typed here")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bw:ITEM", result.stderr)
+        self.assertNotIn("hunter2", result.stdout + result.stderr)
+        result = self.run_cli("pilot", "mailbox", "secret", "front", "hunter2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("hunter2", result.stdout + result.stderr)
+        self.assertEqual(self.remote(), [])
+
+    def test_a_missing_item_stops_before_the_box(self):
+        (self.state / "missing-mail-front").touch()
+        result = self.run_cli("pilot", "mailbox", "secret", "front", "--from", "bw:mail-front")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no item named mail-front", result.stderr)
+        self.assertIsNone(self.box_argv())
+
+    def test_prompt_with_vault_stores_the_password_then_sends_it(self):
+        password = "Tr0ub4dor & 'horse' \"staple\" $PATH"
+        result = self.typed("pilot", "mailbox", "secret", "front desk", "--prompt", "--vault", "mail-front-desk",
+                            answer=f"{password}\n{password}\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        put = calls.index("sage-secret put mail-front-desk --stdin")
+        self.assertLess(put, calls.index("trellis-crm mailbox secret front desk --stdin"))
+        self.assertEqual((self.state / "item-mail-front-desk").read_text().strip(), digest(password))
+        self.assertEqual((self.state / "mailbox-stdin").read_text().strip(), digest(password))
+        self.assertIn("Use it as bw:mail-front-desk", result.stdout)
+        self.assert_nowhere(password, result)
+
+    def test_prompt_alone_sends_without_the_vault(self):
+        result = self.typed("pilot", "mailbox", "secret", "front", "--prompt", answer="s3cret pw\ns3cret pw\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse([c for c in self.calls() if c.startswith("sage-secret put")])
+        self.assertEqual((self.state / "mailbox-stdin").read_text().strip(), digest("s3cret pw"))
+        self.assert_nowhere("s3cret pw", result)
+
+    def test_two_entries_that_differ_change_nothing(self):
+        result = self.typed("pilot", "mailbox", "secret", "front", "--prompt", "--vault", "mail-front",
+                            answer="first try\nsecond try\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differ", result.stderr)
+        self.assertFalse([c for c in self.calls() if c.startswith("sage-secret put")])
+        self.assertIsNone(self.box_argv())
+        self.assert_nowhere("first try", result)
+
+    def test_an_item_that_exists_needs_replace(self):
+        (self.state / "item-mail-front").write_text("an older value\n")
+        result = self.typed("pilot", "mailbox", "secret", "front", "--prompt", "--vault", "mail-front", answer="new pw\nnew pw\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--replace", result.stderr)
+        self.assertIsNone(self.box_argv(), "a refused vault write sends nothing to the box")
+        result = self.typed("pilot", "mailbox", "secret", "front", "--prompt", "--vault", "mail-front", "--replace",
+                            answer="new pw\nnew pw\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("sage-secret put mail-front --stdin --replace", self.calls())
+        self.assertEqual((self.state / "mailbox-stdin").read_text().strip(), digest("new pw"))
+
+    def test_a_refused_push_says_the_vault_holds_it(self):
+        (self.state / "mailbox-exit").write_text("1")
+        result = self.typed("pilot", "mailbox", "secret", "front", "--prompt", "--vault", "mail-front", answer="pw 1\npw 1\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pilot mailbox secret front --from bw:mail-front", result.stderr)
+
+    def test_prompt_needs_a_terminal(self):
+        result = self.run_cli("pilot", "mailbox", "secret", "front", "--prompt")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--from bw:ITEM", result.stderr)
+        self.assertEqual(self.remote(), [])
+
+    def test_clear_goes_straight_through(self):
+        self.ok("pilot", "mailbox", "secret", "front desk", "--clear")
+        self.assertEqual(self.box_argv(), ["secret", "front desk", "--clear"])
+
+    def test_one_way_in_at_a_time(self):
+        for args in ((), ("--from", "bw:mail-front", "--clear"), ("--clear", "--vault", "mail-front"), ("--prompt", "--replace")):
+            with self.subTest(args=args):
+                result = self.run_cli("pilot", "mailbox", "secret", "front", *args)
+                self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.remote(), [])
+
+    def test_a_peer_box_has_no_mailboxes(self):
+        self.box(BOX_MODE="peer", BOX_CHECKOUT=None, BOX_DEPLOY_KEY=None, BOX_GHCR_USER=None, BOX_GHCR_TOKEN=None)
+        result = self.run_cli("pilot", "mailbox", "list")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("peer box", result.stderr)
+        self.assertEqual(self.remote(), [])
 
 
 class Shape(unittest.TestCase):
