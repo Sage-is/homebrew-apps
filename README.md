@@ -326,7 +326,7 @@ brew tap sage-is/apps && brew trust --tap sage-is/apps && brew install git-relea
 git-release patch
 ```
 
-A repo's `make release` runs it from PATH, so repos keep no copy of their own. [startr.sh](https://startr.sh/scripts/release.sh) publishes the same file for projects without brew.
+A repo's `make release` runs it from PATH, so repos keep no copy of their own. When it is missing, the Startr Makefile offers the install through [startr.sh/scripts/tools.sh](https://startr.sh/scripts/tools.sh), which asks before each step, Homebrew included: `curl -fsSL https://startr.sh/scripts/tools.sh | bash -s -- git-release`.
 
 ## mdprose
 

@@ -12,10 +12,10 @@
 #   git-release custom 2.1.0     # non-interactive custom version
 #   git-release -i patch          # interactive with pauses between steps
 #
-# ONE FILE: homebrew-apps/git-release is the source. The git-release formula
-# installs it, and each repo's `make release` runs it from PATH. Hard links to it:
-# ~/bin/git-release (until the brew copy replaces it) and
-# WEB-Startr.sh/src/scripts/release.sh, published at startr.sh/scripts/release.sh.
+# ONE FILE: homebrew-apps/git-release is the source, and the git-release
+# formula installs it. Each repo's `make release` runs it from PATH; startr.sh
+# keeps no copy (2026-10-21) and offers the brew install instead.
+# ~/bin/git-release is a hard link to this file until the brew copy replaces it.
 # Edit it in place (`cat new > file`): an editor's atomic save or macOS
 # `sed -i` splits a link off.
 #
@@ -72,9 +72,11 @@ pause() {
 	fi
 }
 
-# Helper: check if a make target exists
+# Helper: check if a make target exists. It reads make's database for the
+# dummy target ":", so no recipe runs: `make -n` would still run any recipe
+# line that calls $(MAKE). make exits non-zero for ":", so pipefail must not see it.
 has_target() {
-	make -n "$1" >/dev/null 2>&1 || return 1
+	{ make -pRrq -f Makefile : 2>/dev/null || true; } | grep -q "^$1:"
 }
 
 # If no type given, prompt
