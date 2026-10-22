@@ -3,7 +3,7 @@ class GitRelease < Formula
   homepage "https://github.com/Sage-is/homebrew-apps"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/git-release-v1.0.0.tar.gz"
   version "1.0.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "0bc01c9cdca1da654fdc0c5116fb0e7621d87e2f4deea4c64ee38a03732e8b6f"
   license "MIT"
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
