@@ -1,11 +1,9 @@
 class AiUiAT3 < Formula
   desc "One-command local deployment of Sage AI UI via Docker"
   homepage "https://github.com/Sage-is/AI-UI"
-  url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/v3.2.0_2.tar.gz"
-  version "3.2.0"
-  sha256 "8831b5cb11a0bfc72582429df816bcad2daaf5668ffcb13e21d169566199ecc2"
-  license "MIT"
-  revision 2
+  url "https://github.com/Sage-is/AI-UI/archive/refs/tags/v3.2.2.tar.gz"
+  sha256 "e1330b3a4e8534da40eaa8dafa0d0bc899c55ba32dbfd70a67fc1e42ec9119c2"
+  license "AGPL-3.0-or-later"
   keg_only :versioned_formula
 
   depends_on "docker"
@@ -16,9 +14,7 @@ class AiUiAT3 < Formula
   end
 
   def install
-    libexec.install "ai-ui"
-    # `ai-ui nuke` runs the nuke-sage beside it, in scripts/.
-    (libexec/"scripts").install "scripts/nuke-sage"
+    libexec.install "cli/ai-ui", "cli/nuke-sage", "cli/lib"
     # From 3.x the CLI's version is the AI-UI version it pins, read from the
     # distribution.env beside it. A 1.x tarball's copy names an older server.
     if version.major.to_i >= 3
@@ -38,6 +34,8 @@ class AiUiAT3 < Formula
       Or keep a runtime this Mac already uses; ai-ui remembers the choice:
         ai-ui start --runtime docker-desktop
         ai-ui start --runtime orbstack
+
+      On a Mac using Docker Desktop or OrbStack? `ai-ui migrate` moves Sage to Colima.
 
       Pin a specific server version:
         ai-ui start --tag 2.3.1
