@@ -1,9 +1,9 @@
 class TrellisCrm < Formula
   desc "Run Trellis, the Sage.is CRM, on this Mac: server mode, backups and dev mode"
   homepage "https://github.com/Sage-is/homebrew-apps"
-  url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/trellis-crm-v0.1.1.tar.gz"
-  version "0.1.1"
-  sha256 "f5efbaf5f11d8be99b79af7b69e20601ad768345229d9d6cafb0093fec40a54c"
+  url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/trellis-crm-v0.1.2.tar.gz"
+  version "0.1.2"
+  sha256 "349ad8e6d9b1195b4383333cc8d60c2410d09775005c6bea476a3df00a9bcf0a"
   license "MIT"
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
