@@ -245,8 +245,13 @@ For a demo, `--env-file FILE` (mode 600) hands the dev install API keys and the 
 ```bash
 brew install sage-is/apps/sage-box
 cp "$(brew --prefix)/share/sage-box/boxes/example.env" ~/.sage-is/boxes/pilot.env && chmod 600 ~/.sage-is/boxes/pilot.env
-sage-box pilot              # what it has, what would change; nothing changes
+sage-box pilot              # what it has, what would change; nothing changes (through the read key)
+sage-box pilot status       # both apps, the VM, the UPS, the nightly backup and its age (through the read key)
+sage-box pilot read backup  # one read verb: probe, backup, power, containers or version
+sage-box pilot unlock       # a 1-4 hour window, signed by your FIDO CA (one touch); admin verbs use it
+sage-box pilot lock         # ends the window now
 sage-box pilot --apply      # the plan, then both apps verified; --reboot proves it comes back
+sage-box pilot --as-me --apply   # the same, through your own SSH agent; the login password asked once
 sage-box pilot update       # brew upgrade, git pull in source mode, trellis-crm update; stops at the first failing step
 sage-box pilot backup       # the newest archive, encrypted with age, kept 14 deep
 sage-box pilot mailbox list # trellis-crm mailbox on the box: arguments as typed, the exit code back
@@ -255,6 +260,8 @@ sage-box local              # the same checks on this Mac
 ```
 
 Modes: `source` runs Trellis from a checkout on the box (a `git pull` and `update` is an upgrade), `image` runs the released image, `peer` sets up a developer's Mac with no Trellis. The box file stays out of every repository.
+
+Doors: `status`, `read` and the dry run use a per-box read key, which the box holds to a fixed list of read verbs and logs. Admin verbs need an unlock window (a short-lived certificate signed by a FIDO CA, at most 4 hours) or `--as-me`. The old admin key (`BOX_SSH_KEY`, `BOX_SUDO`) still works, with a warning, until a box has its window. Step `access` installs root's three files (the read dispatcher, a root helper with fixed verbs, a sudoers rule for that helper alone) with the login password, once. The standard, the setup and a note for the client: [docs/boxes/access.md](docs/boxes/access.md).
 
 A mailbox password reaches the box on stdin, never on a command line. `mailbox secret NAME --from bw:ITEM[/FIELD]` resolves the item on this Mac through `sage-secret run`, with the reference in a child's environment. `--prompt` asks twice without echo and stops when the entries differ. `--vault ITEM` first stores it with `sage-secret put ITEM --stdin`, in the agents' writable organization; an item that exists needs `--replace`. `--clear` forgets it on the box.
 
