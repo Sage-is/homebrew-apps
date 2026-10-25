@@ -19,7 +19,7 @@ set -euo pipefail
 #   me      --as-me: the person's own SSH agent, such as a FIDO key.
 #   legacy  BOX_SSH_KEY and BOX_SUDO from the vault, until every box has windows.
 # Admin verbs take the first of window, me and legacy that is there, or stop.
-VERSION="0.1.0"
+VERSION="0.1.1"
 PROG="sage-box"
 # The runtime code lives in lib/ beside this script, in a checkout and in the
 # formula's libexec alike. A link to it, such as one in ~/bin, leads there.

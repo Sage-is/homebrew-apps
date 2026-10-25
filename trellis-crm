@@ -23,7 +23,7 @@ source "$here/lib/sage-runtime.sh"
 IMAGE_REGISTRY="ghcr.io/sage-is/trellis"
 # The tool's own version; the release bumps it. The image tag is separate: the
 # formula pins it to the same version at install, and a checkout runs latest.
-VERSION="0.1.1"
+VERSION="0.1.2"
 DEFAULT_TAG="latest"
 IMAGE="$IMAGE_REGISTRY:$DEFAULT_TAG"
 CONTAINER="trellis-crm"
