@@ -2,6 +2,30 @@
 
 ## TODO
 
+- [ ] **sage-box 0.1.0 reports success while steps fail** #critical (found on the pilot box, 2026-10-20): `--apply` exited 0 with the registry, Trellis and backup steps all failed
+  - [ ] [WE] `apply` exits non-zero and names each failed step; `verify` runs and its result decides the exit code
+  - [ ] [WE] Registry: `docker login` over SSH cannot use the keychain (`User interaction is not allowed. (-25308)`), and with no `credsStore` the CLI picks `osxkeychain` again while `auths` is empty. Write the `ghcr.io` auth into `~/.docker/config.json` (mode 600, token on stdin), as done by hand 2026-10-20
+  - [ ] [WE] Leftovers: also remove Docker Desktop's `credsStore: osxkeychain` and its plugin hooks (`ai`, `scout`, `debug`, `compose`) from `~/.docker/config.json`, after a dated backup
+  - [ ] [WE] Sudo: `sudo -S -v` caches no grant over SSH without a tty, so each later `sudo -n` fails (`sudo: a password is required`). Replaced 2026-10-22 by the sudoers drop-in on the card "Box access standard": no password in automation at all
+  - [ ] [WE] Tests for all three, then a 0.1.1 release; [MANUALLY] `brew upgrade sage-box`
+
+- [ ] **Box access standard: read key, unlock window, FIDO admin** #critical #security (Alexander, 2026-10-22): one standard for every managed box (pilot first, School B's from day one); plan `~/.claude/plans/what-about-when-i-purring-castle.md`; the agreements promise least privilege and logging
+  - [x] [WE] Read tier: a `restrict,from=,command=` key per box; root-owned dispatcher `/usr/local/libexec/sage-box/read` (probe, backup, power, containers, version), 64 KiB cap, each call to `logger`; `sage-box <box> read VERB` (2026-10-22)
+  - [x] [WE] Unlock window: `unlock [--hours 1-4]` signs a certificate (FIDO CA only, principal `sage-window`, `-O clear`, source-address); `lock`; admin verbs stop when locked; `--as-me` for a person's own key
+  - [x] [WE] Steps `access` and `keys`: dispatcher, root helper (fixed verbs), sudoers drop-in per verb (`visudo -cf`), tagged key lines; root installs only copies matching digests on its own command line, `/usr/bin/sudo` by path
+  - [x] [WE] `load_box` resolves only what a command needs; `-F none` and `IdentitiesOnly=yes`; ControlMaster per door; `sudo_remote` gone with the `sudo -n` bug; 87 tests, shellcheck, bash 3.2
+  - [x] [WE] `sage-box.1`, `docs/boxes/access.md`, `example.env`; `make box_read` in Trellis (feature branch) and AI-UI: `$(value)` and env only, `$` refused; injection tried, nothing ran
+  - [ ] [MANUALLY] Commit, bump `sage-box` to 0.1.1, `make tool_release TOOL=sage-box VERSION=0.1.1 APPLY=1`; then `--as-me --apply` on pilot installs the doors (the password once)
+  - [x] [WE] The root helper's Homebrew install needs Apple's notarization and Homebrew's signing team `927JGANW46` (read from the real package 2026-10-22); any other signer is refused
+  - [x] [WE] `status` says whether launchd holds the backup job and how old the newest backup is, WARNING past 26 h; `--apply` reloads a job that was never loaded (the pilot's, 2026-10-22: 0.1.0's `sudo -n` bootstrap failed)
+  - [x] [WE] Fixed: `load_box` cleared the tool's own `BOX_BACKUPS` constant (every `BOX_` name goes), which broke the backup pull; now `TRELLIS_BACKUPS`, and a test refuses any `BOX_` constant; 90 tests
+  - [ ] Open: `rotate-key read`, `unlock --all`, an ops key for the unattended nightly pull (it still needs the legacy key)
+  - [ ] [MANUALLY] FIDO: an `ed25519-sk` CA and admin key on each device (`ecdsa-sk` on U2F-only), a spare of each; `brew install openssh` here if Apple's `ssh-keygen -t ed25519-sk` refuses
+  - [ ] [MANUALLY] Vault: `<box>-read-key` into `Agents`; after the window ships, retire `<box>-ssh-key` and move `<box>-user` to a humans-only collection
+  - [x] [WE] Tailnet policy drafted (2026-10-22): OPS-Sage `deploy/tailscale/policy.hujson`; `tag:box` reachable from `autogroup:admin` on port 22 only, no box-initiated traffic, Tailscale SSH off
+  - [ ] [MANUALLY] Tailnet: tag both boxes `tag:box`, rename them `box-pilot` and `box-school-b` (both names carry real names today), then paste the policy
+  - [ ] [MANUALLY] Allow rule `Bash(make box_read BOX=* WHAT=*)` in the Trellis and AI-UI `.claude/settings.json`
+
 - [ ] **The ai-ui CLI moves into AI-UI** (2026-09-30): Homebrew counts the formula's download repo, so AI-UI's stars and forks must be the ones counted #launch
   - [x] [WE] AI-UI's `cli/` holds `ai-ui`, `nuke-sage` and 16 tests (gate `cli_tests`); `make ai_ui_formula` points the formula at an AI-UI release and keeps the old major as `ai-ui@N`
   - [x] [WE] Git-flow release machinery for ai-ui removed (Makefile 463 to 190 lines); README, `docs/versioned-formulas.md` and `docs/poka-yoke-lessons.md` follow
@@ -10,6 +34,11 @@
   - [x] [WE] AI-UI's `make ship` runs `ai_ui_formula` last; `make check` refuses a push while the formula lags AI-UI's newest release (2026-09-30)
   - [ ] [MANUALLY] After AI-UI's next release: commit and push the tap's formula change, then `brew upgrade ai-ui && brew test ai-ui`
   - [ ] Later: `CLI_VERSION` in `distribution.env` is unread now that the CLI's version is `SERVER_TAG`; drop it from all three copies
+
+- [ ] **sage-secret: the session key and bootstrap credentials sit within an agent's reach** #security (2026-10-24; found by the guide-and-guard review)
+  - [ ] [WE] `bw()` passes `--session KEY` on the command line, where `ps` can see it while `bw` runs: pass it as `BW_SESSION` in the child's environment instead
+  - [ ] [MANUALLY] Decide where the agent account's API key and password live: today the login Keychain (service `sage-secret`), readable by any process that can run `security` as the user
+  - [ ] [WE] Level-2 proxy: scope each secret by host, method and path, and log each injected request
 
 - [ ] **sage-tunnel and sage-secret: tunnels by tool, secrets by reference** (Alexander, 2026-10-06) #security
   - [x] [WE] `sage-tunnel` (list, create, route, unroute, delete): routes live in Cloudflare, proxied CNAMEs only, connector token written to the env file at 600 and never printed; 11 tests, 3 mutations caught
@@ -35,6 +64,13 @@
   - [x] Released: sage-runtime 0.1.0 (2026-10-11), trellis-crm 0.1.0 and 0.1.1 (2026-10-14); peers install without `--HEAD`
   - [ ] [MANUALLY] Peer installs: the install line above, then `sage-runtime migrate` (from Docker Desktop) or `sage-runtime convert --yes` (from Colima vz)
   - [ ] [MANUALLY] After 2026-10-16: uninstall Docker Desktop on this Mac and delete `/Volumes/Somma 01 Dock Drive/Docker/DockerDesktop/Docker.raw` (49 GB)
+    - [ ] [WE] Inventory first (2026-10-21 plan): `sage-runtime migrate --from docker-desktop --images --dry-run` and the anonymous volumes, gone over together
+    - [ ] [WE] Copy what is kept; [MANUALLY] an encrypted DMG of `Docker.raw` on Somma 02, its password in the vault; then Docker's own uninstaller
+
+- [ ] **Map Apple's container (macOS 26) onto our stack** (Alexander, 2026-10-21: Colima for now) #ux
+  - [ ] [WE] First, a session where we go over together what Apple's containers are: how they run, and what they can and cannot do next to Colima
+  - [ ] [WE] What breaks without a Docker socket: compose, buildx, our Makefiles' `docker` calls
+  - [ ] [WE] Whether a shim or a separate runtime option fits, and how `~/.sage-is/runtime` records it
 
 - [ ] **Colima by default: no Docker Desktop windows on first launch** (ai-ui 3.2.0_1, 2026-09-29) #ux
   - [x] [WE] `ai-ui` runs Sage in Colima, Docker Desktop or OrbStack; the first start asks when a Mac has more than one; `--runtime NAME` picks directly, remembered in `~/.sage-is/runtime`
@@ -66,7 +102,10 @@
 - [ ] **One git-release, from the tap** (2026-09-29): repos run it from PATH and keep no copy
   - [x] [WE] The 16 repos' `make release` runs `git-release`, with the brew install line when it is missing
   - [ ] [MANUALLY] Delete each repo's `scripts/release.sh` (a hard link; the tap keeps the file), then commit the Makefile and the deletion after `git-release-v1.0.0` ships
-  - [ ] [MANUALLY] After `brew install git-release`: `rm ~/bin/git-release`; startr.sh keeps `src/scripts/release.sh`, its published copy
+  - [ ] [MANUALLY] After `brew install git-release`: `rm ~/bin/git-release` (re-linked to the tap file 2026-10-21)
+  - [x] [WE] 2026-10-21: startr.sh keeps no copy; its Makefile offers the brew install through `startr.sh/scripts/tools.sh`
+  - [x] [WE] 2026-10-21: `has_target` reads make's database, never `make -n`, which ran recipe lines that call `$(MAKE)`; proven by startr.sh `tests/run.sh`
+  - [ ] [MANUALLY] Tag `git-release-v1.0.0` and push, then [WE] pin its sha256: the formula's sha is all zeros and the tag is missing, so `brew install git-release` fails today
 
 - [ ] **Renames and branding, decided 2026-09-28** #brand: plain tool names, no prefix
   - [x] [WE] `captain` → `cr-deploy` (an official cask owns `captain`; CapRover's npm CLI ships `caprover-*` commands, including `caprover-deploy`); `captain` alias until cr-deploy 0.2.0

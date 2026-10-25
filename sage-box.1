@@ -1,6 +1,6 @@
 .\" sage-box(1) manpage — mdoc format
 .\" Version 0.1.0
-.Dd October 20, 2026
+.Dd October 22, 2026
 .Dt SAGE-BOX 1
 .Os
 .Sh NAME
@@ -9,17 +9,35 @@
 .Sh SYNOPSIS
 .Nm
 .Ar box
+.Op Fl -as-me
 .Op Fl -apply
 .Op Fl -reboot
 .Nm
 .Ar box
-.Cm update | status
+.Op Fl -as-me
+.Cm update
 .Nm
 .Ar box
+.Cm status
+.Nm
+.Ar box
+.Cm read
+.Ar verb
+.Nm
+.Ar box
+.Cm unlock
+.Op Fl -hours Ar n
+.Nm
+.Ar box
+.Cm lock
+.Nm
+.Ar box
+.Op Fl -as-me
 .Cm backup
 .Op Fl -nightly
 .Nm
 .Ar box
+.Op Fl -as-me
 .Cm mailbox
 .Ar args ...
 .Nm
@@ -36,8 +54,8 @@ A box is a Mac that runs Sage.is apps for a team.
 .Nm
 reads one file per box,
 .Pa ~/.sage-is/boxes/<box>.env ,
-reaches the box over SSH, prints what it found and what it would change, and
-changes nothing. With
+reaches the box over SSH through its read key, prints what it found and what
+it would change, and changes nothing. With
 .Fl -apply
 it runs the plan. Every step is idempotent: a second run finds everything in
 place and prints
@@ -46,15 +64,101 @@ place and prints
 The box file holds the box's address and login, the names of the vault items
 that unlock it, and what it runs. Secrets are
 .Li bw:
-references;
+references, and a secret written into the file is refused.
 .Xr sage-secret 1
-resolves them into the environment for the run, and they reach the box on
-stdin, never on a command line and never on a disk here. The file names a host
-and a login, so it stays out of every repository; the formula installs an
+resolves only the references a command needs, and they reach the box on
+stdin, never on a command line and never on a disk here.
+.Cm status
+and
+.Cm read
+need the read key alone; a window needs nothing from the vault.
+The file names a host and a login, so it stays out of every repository; the
+formula installs an
 example as
 .Pa share/sage-box/boxes/example.env .
+.Sh DOORS
+Each run reaches the box through one door, each with its own key.
+.Pa docs/boxes/access.md
+in the tap is the standard.
+.Bl -tag -width "window"
+.It read
+.Ev BOX_READ_KEY ,
+an ed25519 key in the vault.
+.Cm status ,
+.Cm read
+and the dry run use it, and nothing else: ssh runs with
+.Li -F none
+and
+.Li IdentitiesOnly=yes ,
+and its one IdentityFile is the read key's public half. The box's
+.Pa authorized_keys
+line forces the key through the read dispatcher, which answers a fixed list of
+verbs. A box that refuses the key gets a message saying how to install it;
+nothing falls back to the admin key.
+.It window
+A certificate that
+.Cm unlock
+signs with a person's FIDO CA, for one to four hours. Admin verbs use it while
+it is valid. The box checks its principal, its addresses and its expiry.
+.It me
+.Fl -as-me :
+the person's own SSH agent, such as a FIDO key. The access step asks for the
+box's login password once, without echo.
+.It legacy
+.Ev BOX_SSH_KEY
+and
+.Ev BOX_SUDO
+from the vault, with a one-line warning. They go once every box has windows.
+.El
+.Pp
+Admin verbs
+.Po
+.Fl -apply ,
+.Cm update ,
+.Cm backup ,
+.Cm mailbox
+.Pc
+take the first of window, me and legacy that is there. With none, the run
+stops before it asks the vault for anything:
+.Dq locked: run sage-box <box> unlock .
+Each admin door shares one connection per run
+.Pq Li ControlMaster=auto ,
+with its own socket in
+.Pa ~/.sage-is/ssh/ ,
+so a run costs one login and one touch. A window's connection lives no longer
+than the window, and
+.Cm lock
+closes it.
 .Sh STEPS
 .Bl -tag -width "registry"
+.It access
+The box's half of the doors, all root's: the read dispatcher
+.Pa /usr/local/libexec/sage-box/read ,
+the root helper
+.Pa /usr/local/libexec/sage-box/root ,
+and the sudoers drop-in
+.Pa /etc/sudoers.d/sage-box .
+It runs only when they differ from what this
+.Nm
+writes, and it takes the login password once: from the vault on the legacy
+door, typed at a terminal on the others. An agent in a window cannot change
+root's files.
+.It keys
+Tagged lines in the box user's
+.Pa authorized_keys :
+the read key, forced through the dispatcher, and one
+.Li cert-authority
+line per CA in
+.Pa ~/.sage-is/ca .
+Both carry
+.Li restrict
+and
+.Li from= Ns Ev BOX_OPERATORS .
+Every line tagged
+.Li sage-box:
+is replaced; every other line stays as it was, except a copy of one of these
+keys without its tag. A dated copy of the file comes first. A second run
+changes nothing.
 .It tools
 .Li brew tap
 and
@@ -79,9 +183,8 @@ lists it: dangling plugin links, a
 that leads nowhere, a missing buildx. What the tool cannot mend it prints.
 .It power
 .Li pmset -a sleep 0 autorestart 1 ,
-and the LaunchDaemon from
-.Li trellis-crm boot --print ,
-so Colima starts at power-on with nobody signed in.
+and a LaunchDaemon that starts Colima at power-on as the box user, with
+nobody signed in. The root helper writes the plist itself.
 .It key, checkout
 Source mode only: the read-only deploy key from the vault at
 .Pa ~/.ssh/trellis-deploy ,
@@ -118,7 +221,7 @@ the box restarts and the checks run again.
 .El
 .Pp
 .Cm peer
-mode runs the first four steps and no Trellis: a developer's Mac.
+mode runs the first six steps and no Trellis: a developer's Mac.
 .Sh COMMANDS
 .Bl -tag -width "backup --nightly"
 .It Cm update
@@ -147,7 +250,24 @@ Install a launchd agent on this Mac that runs
 .Cm backup
 at 03:30, after the box's own run.
 .It Cm status
-Tools, VM, boot daemon, both apps and the newest backup pulled.
+Tools, VM, boot daemon, both apps, the newest backup pulled, and the window:
+.Dq open until 14:32
+or
+.Dq locked .
+It reads through the read key.
+The
+.Li ups
+line comes from
+.Li pmset -g ps
+in the same visit:
+.Li none
+when no UPS is attached,
+.Li <name>, 87%, on AC
+or
+.Li <name>, 54%, on battery
+when one is, and
+.Li unknown
+when the box's answer cannot be read. It never fails the run.
 .It Cm mailbox Ar args ...
 Run
 .Li trellis-crm mailbox
@@ -182,25 +302,105 @@ When the box refuses it, the error names the
 line that sends it again.
 .It Cm mailbox secret Ar name Fl -clear
 Forget the password on the box.
+.It Cm read Ar verb
+One read verb through the read key, its output as the box gives it, at most 64
+KiB:
+.Cm probe
+(what the dry run reads),
+.Cm backup
+(the last 50 lines of the backup log, the backup folder's dates, sizes and
+names, and the LaunchDaemon's state),
+.Cm power
+.Pq Li pmset -g , pmset -g ps , uptime , No last boot ,
+.Cm containers
+(names and status only),
+.Cm version .
+The box logs every call with the tag
+.Li sage-box-read .
+.It Cm unlock Op Fl -hours Ar n
+Make a fresh key in
+.Pa ~/.sage-is/unlock/<box>/
+and have the FIDO CA named by
+.Ev SAGE_BOX_CA
+sign it: principal
+.Li sage-window ,
+key ID
+.Li <user>-<box>-<UTC time> ,
+valid
+.Ar n
+hours, 1 to 4, default 2. Anything else is refused, never trimmed. The
+certificate carries no forwarding and the
+.Ev BOX_OPERATORS
+addresses. Signing takes a touch.
+.It Cm lock
+Delete the window's key and close its shared connection.
 .It Cm local
 The tool and runtime checks on this Mac, with no SSH.
 .El
-.Sh SUDO OVER SSH
-Steps that need root take the box's password from the vault on stdin once per
-shell
-.Pq Li sudo -S -v ,
-then call
-.Li sudo -n .
-A child process cannot see that grant, so the tool runs the steps itself
-rather than through a command that calls sudo on its own.
+.Sh SUDO
+Every step that needs root calls the root helper with one fixed verb:
+.Li sudo -n /usr/local/libexec/sage-box/root Ar verb .
+The sudoers drop-in allows that helper with those verbs and nothing else, with
+no password, so no password travels and no cached grant is needed. The helper
+takes no other argument and writes every file it installs from its own text.
+Its verbs:
+.Cm homebrew ,
+.Cm power ,
+.Cm boot-daemon ,
+.Cm backup-daemon ,
+.Cm docker-sock ,
+.Cm reboot .
+Only the access step uses the login password, once, to install the helper.
+.Sh ENVIRONMENT
+.Bl -tag -width "SAGE_BOX_CA_DIR"
+.It Ev SAGE_BOX_CA
+The handle of your FIDO CA key
+.Pq Li ed25519-sk No or Li ecdsa-sk ,
+for
+.Cm unlock .
+Its
+.Pa .pub
+must be in the CA folder.
+.It Ev SAGE_BOX_CA_DIR
+The CA folder; default
+.Pa ~/.sage-is/ca .
+.El
+.Pp
+Box file settings beyond the example's comments:
+.Ev BOX_READ_KEY
+.Pq Li bw:<box>-read-key ,
+.Ev BOX_OPERATORS
+(the addresses operators reach boxes from, such as
+.Li 100.64.0.0/10 ) ,
+and, on the legacy door only,
+.Ev BOX_SSH_KEY
+and
+.Ev BOX_SUDO .
 .Sh FILES
-.Bl -tag -width "~/.sage-is/boxes/<box>.env" -compact
+.Bl -tag -width "~/.sage-is/unlock/<box>/" -compact
 .It Pa ~/.sage-is/boxes/<box>.env
 The box file, mode 600.
+.It Pa ~/.sage-is/ca/<name>.pub
+The FIDO CAs every box trusts for windows, one per device.
+.It Pa ~/.sage-is/unlock/<box>/
+The window's key and certificate; folder 700, key 600.
+.It Pa ~/.sage-is/ssh/
+Shared-connection sockets and the read key's public half; mode 700.
 .It Pa ~/Library/LaunchAgents/is.sage.box-backup-<box>.plist
-The nightly pull on this Mac.
+The nightly pull on this Mac. It runs unattended, so it needs the legacy key
+until boxes have an ops key.
 .El
+.Pp
+On the box, all root's:
+.Pa /usr/local/libexec/sage-box/read
+and
+.Pa /usr/local/libexec/sage-box/root
+(755), and
+.Pa /etc/sudoers.d/sage-box
+(440).
 .Sh SEE ALSO
 .Xr sage-runtime 1 ,
 .Xr sage-secret 1 ,
-.Xr trellis-crm 1
+.Xr ssh-keygen 1 ,
+.Xr trellis-crm 1 ,
+.Xr sshd 8

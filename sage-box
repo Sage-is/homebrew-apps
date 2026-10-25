@@ -9,6 +9,16 @@ set -euo pipefail
 # nothing. --apply runs the plan; every step is idempotent, so a second run
 # finds everything in place. Secrets travel from the vault into this process
 # and over SSH on stdin: never onto a command line, never onto a disk here.
+#
+# Each run reaches the box through one door, and each door has its own key
+# (docs/boxes/access.md is the standard):
+#   read    the box's read key, for status, read and the dry run. The box
+#           itself holds it to a fixed list of read verbs.
+#   window  a certificate that `unlock` signs with a person's FIDO CA for one
+#           to four hours. The box checks the expiry, not this Mac.
+#   me      --as-me: the person's own SSH agent, such as a FIDO key.
+#   legacy  BOX_SSH_KEY and BOX_SUDO from the vault, until every box has windows.
+# Admin verbs take the first of window, me and legacy that is there, or stop.
 VERSION="0.1.0"
 PROG="sage-box"
 # The runtime code lives in lib/ beside this script, in a checkout and in the
@@ -27,45 +37,110 @@ BOXES_DIR="${SAGE_BOXES_DIR:-$SAGE_CONFIG_DIR/boxes}"
 TAP="sage-is/apps"
 KRUNKIT_TAP="libkrun/krun"
 HOMEBREW_PKG="https://github.com/Homebrew/brew/releases/latest/download/Homebrew.pkg"
+# The Apple team that signs Homebrew.pkg, read from pkgutil --check-signature on
+# 2026-10-22 ("Developer ID Installer: Patrick Linnane (927JGANW46)"). A package
+# signed by anyone else stops the install: when Homebrew changes signer, a person
+# installs Homebrew by hand once and this line follows.
+HOMEBREW_PKG_TEAM="927JGANW46"
 TRELLIS_CLONE_URL="git@github.com:Sage-is/trellis.git"
 DEPLOY_KEY_FILE='$HOME/.ssh/trellis-deploy'
-BOOT_PLIST="/Library/LaunchDaemons/is.sage.colima.plist"
+BOOT_LABEL="is.sage.colima"
+BOOT_PLIST="/Library/LaunchDaemons/$BOOT_LABEL.plist"
 BACKUP_LABEL="is.sage.trellis-backup"
 BACKUP_PLIST="/Library/LaunchDaemons/$BACKUP_LABEL.plist"
-BOX_BACKUPS='$HOME/.sage-is/backups/trellis-crm'
+# Tool constants never start with BOX_: load_box clears every BOX_ variable
+# before it reads a box file, so a constant named BOX_... would vanish there.
+TRELLIS_BACKUPS='$HOME/.sage-is/backups/trellis-crm'
 KEEP_BACKUPS=14
+# A nightly backup older than this is stale: one missed night plus slack.
+BACKUP_STALE_HOURS=26
 AI_UI_CONTAINER="sage-ai"
 AI_UI_NETWORK="sage-network"
 # ai-ui start makes a new sage-ai, off the network Trellis calls it on (http://sage-ai:8080): join it again after every start.
 AI_UI_CONNECT="docker network connect $AI_UI_NETWORK $AI_UI_CONTAINER"
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
+# -F none: no ssh_config. The user's config would offer its own keys (id_rsa)
+# beside the one a door names, even with IdentitiesOnly=yes, and could turn on
+# agent forwarding. Each door adds its own key options (open_*_door).
+SSH_OPTS=(-F none -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
+DOOR=""
+DOOR_OPTS=()
+DOOR_WORDS=""
+MUX_OPTS=()
+# The box this run is about, set once in main. Not BOX_*, which the box file owns.
+THE_BOX=""
 APPLY=0
 REBOOT=0
+AS_ME=0
 CHANGES=0
+
+# --- what the box holds for the doors (step access) -------------------------------
+# Root owns all three, so the box user cannot change them. sudo runs the helper
+# as root, so every folder above it must be root's alone; the access step
+# checks that before it installs anything.
+LIBEXEC_DIR="/usr/local/libexec/sage-box"
+READ_DISPATCHER="$LIBEXEC_DIR/read"
+ROOT_HELPER="$LIBEXEC_DIR/root"
+SUDOERS_FILE="/etc/sudoers.d/sage-box"
+# The read key's verbs, and the root helper's: each list makes the box's case
+# arms, and ROOT_VERBS makes the sudoers line, so a verb lives in one place.
+READ_VERBS="probe backup power containers version"
+ROOT_VERBS="homebrew power boot-daemon backup-daemon docker-sock reboot"
+READ_CAP=65536
+# Every tagged authorized_keys line ends in sage-box:<kind>:<name>; the access
+# step replaces those lines and leaves every other line as it was.
+KEY_TAG="sage-box:"
+WINDOW_PRINCIPAL="sage-window"
+MAX_HOURS=4
+DEFAULT_HOURS=2
+# A CA must need a touch to sign, so it must live on a FIDO device.
+SK_TYPES="sk-ssh-ed25519@openssh.com sk-ecdsa-sha2-nistp256@openssh.com"
+CA_DIR="${SAGE_BOX_CA_DIR:-$SAGE_CONFIG_DIR/ca}"
+UNLOCK_DIR="$SAGE_CONFIG_DIR/unlock"
+# Control sockets for the admin doors, and the read key's public half. A
+# control socket is a logged-in session, so only this user may reach it.
+SSH_DIR="$SAGE_CONFIG_DIR/ssh"
+PERSIST_SECONDS=600
+# The settings that name secrets: each must be a bw: reference, never a value.
+SECRET_SETTINGS="BOX_READ_KEY BOX_SSH_KEY BOX_SUDO BOX_DEPLOY_KEY BOX_GHCR_TOKEN"
+SUDO_PW=""
+SUDO_FROM=""
+READ_PUB=""
+CA_NAMES=()
+CA_KEYS=()
 
 usage() {
   cat <<EOF
-Usage: $PROG <box> [--apply] [--reboot]
-       $PROG <box> update | backup [--nightly] | status
+Usage: $PROG <box> [--as-me] [--apply] [--reboot]
+       $PROG <box> [--as-me] update | backup [--nightly] | mailbox ...
+       $PROG <box> status | read VERB
+       $PROG <box> unlock [--hours N] | lock
        $PROG <box> mailbox list | add NAME ... | check NAME | enable NAME | disable NAME
        $PROG <box> mailbox secret NAME (--from bw:ITEM[/FIELD] | --prompt [--vault ITEM [--replace]] | --clear)
        $PROG local
        $PROG version
 
 A box is named by $BOXES_DIR/<box>.env (mode 600; the example is
-docs/boxes/example.env in the tap). Without --apply, $PROG reaches the box,
-prints what it found and what it would change, and changes nothing.
+docs/boxes/example.env in the tap). Without --apply, $PROG reaches the box
+through its read key, prints what it found and what it would change, and
+changes nothing. docs/boxes/access.md has the doors and their keys.
 
-  --apply     run the plan: tools, runtime, power, code, registry, Trellis,
-              backups, then verify
+  --apply     run the plan: access, keys, tools, runtime, power, code,
+              registry, Trellis, backups, then verify
   --reboot    with --apply: restart the box at the end and verify it comes back
+  --as-me     reach the box with your own SSH agent (a FIDO key) when no window
+              is open; the access step asks for the box's login password once
+  read VERB   the read key only: $READ_VERBS
+  unlock      sign a window certificate with your FIDO CA (\$SAGE_BOX_CA), valid
+              --hours N, 1 to $MAX_HOURS, default $DEFAULT_HOURS; admin verbs use it until it ends
+  lock        close the window now: delete its key and close its connection
   update      brew upgrade our tools; in source mode git pull the checkout;
               trellis-crm update; ai-ui start when the box runs AI-UI, which
               then rejoins sage-network. The first step to fail stops the run.
   backup      pull the box's newest trellis-crm backup, encrypt it with age to
               BOX_BACKUP_TO, keep the last $KEEP_BACKUPS in BOX_BACKUP_DIR;
               --nightly installs a launchd agent on this Mac that does so at 03:30
-  status      both apps, the VM, the boot daemon and the newest backup
+  status      both apps, the VM, the boot daemon, the newest backup and the
+              window, through the read key
   mailbox     trellis-crm mailbox on the box, every argument as typed and its
               exit code back. A new mailbox starts disabled.
   mailbox secret NAME
@@ -84,23 +159,106 @@ EOF
 
 box_file() { echo "$BOXES_DIR/$1.env"; }
 
-# Every value of the box file reaches this process through sage-secret, which
-# resolves the bw: references from the vault into the environment once. The
-# file's own lines pass through as they are, so BOX_HOST and the rest are set.
+# The box file's BOX_ settings, exported as written: a bw: reference stays a
+# reference here. Quotes around a value go, as sage-secret's own reader drops
+# them. Only BOX_ names count, so a box file cannot set PATH or anything else
+# this process runs by.
+read_box() {
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" && "$line" != \#* && "$line" == *=* ]] || continue
+    key="${line%%=*}"; key="${key%"${key##*[![:space:]]}"}"
+    value="${line#*=}"; value="${value#"${value%%[![:space:]]*}"}"
+    while [[ "$value" == \"* ]]; do value="${value#\"}"; done
+    while [[ "$value" == *\" ]]; do value="${value%\"}"; done
+    while [[ "$value" == \'* ]]; do value="${value#\'}"; done
+    while [[ "$value" == *\' ]]; do value="${value%\'}"; done
+    [[ "$key" =~ ^BOX_[A-Z0-9_]+$ ]] || continue
+    export "$key=$value"
+  done < "$1"
+}
+
+# Unsets every bw: reference but the ones named: sage-secret run stops on any
+# item it cannot read, and a read call has no business near the admin key.
+keep_refs() {
+  local key need keep
+  for key in ${!BOX_@}; do
+    [[ "${!key}" == bw:* ]] || continue
+    keep=0
+    for need in "$@"; do [[ "$key" != "$need" ]] || keep=1; done
+    [[ $keep == 1 ]] || unset "$key"
+  done
+}
+
+# The vault items a command needs, by its kind:
+#   none   unlock, lock, backup --nightly: no secret at all
+#   read   status, read, the dry run: the read key
+#   admin  update, backup, mailbox: the admin door's own key, when it is legacy
+#   plan   the dry run with --as-me: the admin door, and the read key for the keys step
+#   apply  --apply: the admin door, the read key, the deploy key, the registry
+#          token, and with the legacy door the sudo password for the access step
+box_needs() {
+  local name="$1" kind="$2" door=""
+  case "$kind" in
+    none) return 0 ;;
+    read) echo BOX_READ_KEY; return 0 ;;
+  esac
+  door="$(admin_door "$name")"
+  [[ "$door" != legacy ]] || echo BOX_SSH_KEY
+  [[ "$kind" == admin ]] || echo BOX_READ_KEY
+  if [[ "$kind" == apply ]]; then
+    echo BOX_DEPLOY_KEY BOX_GHCR_TOKEN
+    [[ "$door" != legacy ]] || echo BOX_SUDO
+  fi
+}
+
+# The box file reaches this process in two passes. The first reads it, keeps
+# only the references this command needs (box_needs), and when one is left
+# runs this tool again under sage-secret run, which resolves them into the
+# environment; the second pass finds them there. A command that needs none
+# never starts sage-secret. Either way the settings then stop being exported:
+# ssh, scp and the rest never see a secret in their environment.
 load_box() {
-  local name="$1" file mode
+  local name="$1" kind="$2" file mode key re
   file="$(box_file "$name")"
   [[ -f "$file" ]] || die "no box file $file. Copy docs/boxes/example.env from the tap and fill it in."
   mode="$(stat -f %Lp "$file" 2>/dev/null || stat -c %a "$file" 2>/dev/null || echo "?")"
   [[ "$mode" == 600 ]] || die "$file must be mode 600, since it names vault items: chmod 600 \"$file\""
   if [[ -z "${BOX_RESOLVED:-}" ]]; then
-    command -v sage-secret &>/dev/null || die "sage-secret is not installed: brew install $TAP/sage-secret"
-    BOX_RESOLVED=1 exec sage-secret run --env "$file" -- "$0" "${ORIGINAL_ARGS[@]}"
+    # Nothing in this shell's environment stands in for the file.
+    unset "${!BOX_@}"
+    read_box "$file"
+    for key in $SECRET_SETTINGS; do
+      [[ -z "${!key:-}" || "${!key}" == bw:?* ]] || die "$key in $file must be a vault reference (bw:ITEM): a secret never sits in the box file"
+    done
+    # A locked box stops here, before the vault is asked for anything.
+    if [[ " admin plan apply " == *" $kind "* && "$(admin_door "$name")" == locked ]]; then open_admin_door "$name"; fi
+    # shellcheck disable=SC2046 # box_needs prints setting names, one word each
+    keep_refs $(box_needs "$name" "$kind")
+    for key in ${!BOX_@}; do
+      if [[ "${!key}" == bw:* ]]; then
+        command -v sage-secret &>/dev/null || die "sage-secret is not installed: brew install $TAP/sage-secret"
+        BOX_RESOLVED=1 exec sage-secret run -- "$0" "${ORIGINAL_ARGS[@]}"
+      fi
+    done
   fi
-  local key
-  for key in BOX_HOST BOX_USER BOX_SSH_KEY BOX_SUDO; do
+  for key in ${!BOX_@}; do export -n "${key?}"; done
+  for key in BOX_HOST BOX_USER; do
     [[ -n "${!key:-}" ]] || die "$file needs $key"
   done
+  # The login goes into sudoers, plists and authorized_keys paths on the box.
+  [[ "$BOX_USER" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "BOX_USER in $file must be the box login's short name (letters, digits, . _ -): $BOX_USER"
+  # It goes into from="..." on the box, where a quote would end the option.
+  BOX_OPERATORS="${BOX_OPERATORS:-}"
+  re='^[0-9A-Fa-f:.]+(/[0-9]{1,3})?(,[0-9A-Fa-f:.]+(/[0-9]{1,3})?)*$'
+  [[ -z "$BOX_OPERATORS" || "$BOX_OPERATORS" =~ $re ]] || die "BOX_OPERATORS in $file is a comma-separated list of addresses or CIDR ranges, no spaces or quotes: $BOX_OPERATORS"
+  READ_PUB=""
+  if [[ -n "${BOX_READ_KEY:-}" ]]; then
+    READ_PUB="$(public_half "$BOX_READ_KEY")"
+    re='^ssh-ed25519 [A-Za-z0-9+/]+=*$'
+    [[ "$READ_PUB" =~ $re ]] || die "BOX_READ_KEY is not an ed25519 private key. Make one with ssh-keygen -t ed25519 and store it in the vault (docs/boxes/access.md)"
+  fi
   BOX_MODE="${BOX_MODE:-image}"
   case "$BOX_MODE" in
     source|image|peer) ;;
@@ -119,9 +277,12 @@ load_box() {
   BOX_BACKUP_DIR="${BOX_BACKUP_DIR:-}"
   BOX_BACKUP_TO="${BOX_BACKUP_TO:-}"
   if [[ "$BOX_MODE" == source ]]; then
-    [[ -n "$BOX_CHECKOUT" && -n "$BOX_DEPLOY_KEY" ]] || die "source mode needs BOX_CHECKOUT and BOX_DEPLOY_KEY in $file"
+    [[ -n "$BOX_CHECKOUT" ]] || die "source mode needs BOX_CHECKOUT in $file"
     case "$BOX_CHECKOUT" in /*) ;; *) die "BOX_CHECKOUT must be an absolute path on the box (no ~): $BOX_CHECKOUT" ;; esac
   fi
+  # The rest only --apply uses; the other commands never resolved them.
+  [[ "$kind" == apply ]] || return 0
+  [[ "$BOX_MODE" != source || -n "$BOX_DEPLOY_KEY" ]] || die "source mode needs BOX_DEPLOY_KEY in $file"
   if [[ "$BOX_MODE" != peer ]]; then
     [[ -n "$BOX_GHCR_USER" && -n "$BOX_GHCR_TOKEN" ]] || die "$BOX_MODE mode needs BOX_GHCR_USER and BOX_GHCR_TOKEN in $file: the Trellis image is private"
   fi
@@ -129,14 +290,150 @@ load_box() {
 
 # --- reaching the box -----------------------------------------------------------
 
-# An ssh-agent of this run's own holds the key from the vault; it dies with the run.
+# An ssh-agent of this run's own holds one key from the vault (KEY, NAME); it
+# dies with the run. The key reaches it on stdin and never touches a disk.
 agent_up() {
   eval "$(ssh-agent -s)" >/dev/null
   trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-  printf '%s\n' "$BOX_SSH_KEY" | ssh-add -q - 2>/dev/null || die "the SSH key in the vault did not load (BOX_SSH_KEY)"
+  printf '%s\n' "$1" | ssh-add -q - 2>/dev/null || die "the SSH key in the vault did not load ($2)"
+}
+
+# "type base64" of a private key from the vault. ssh-keygen -y refuses a key on
+# a pipe, and the key must not touch a disk, so a throwaway agent derives it.
+public_half() {
+  (
+    eval "$(ssh-agent -s)" >/dev/null
+    trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+    printf '%s\n' "$1" | ssh-add -q - 2>/dev/null && ssh-add -L
+  ) | awk 'NR == 1 { print $1, $2 }'
 }
 
 target() { echo "$BOX_USER@$BOX_HOST"; }
+
+# --- the doors -------------------------------------------------------------------
+
+is_sk_type() { [[ " $SK_TYPES " == *" $1 "* ]]; }
+
+# The window certificate's "FROM TO", in seconds since 1970, when the box's
+# unlock folder holds a key and a certificate for sage-window. ssh-keygen -L
+# prints both times in local time, and date -j reads them the same way.
+window_times() {
+  local dir="$UNLOCK_DIR/$1" text from to
+  [[ -f "$dir/key" && -f "$dir/key-cert.pub" ]] || return 1
+  text="$(ssh-keygen -L -f "$dir/key-cert.pub" 2>/dev/null)" || return 1
+  printf '%s\n' "$text" | grep -qx "[[:space:]]*$WINDOW_PRINCIPAL" || return 1
+  from="$(printf '%s\n' "$text" | sed -n 's/^[[:space:]]*Valid: from \([0-9T:-]*\) to [0-9T:-]*$/\1/p')"
+  to="$(printf '%s\n' "$text" | sed -n 's/^[[:space:]]*Valid: from [0-9T:-]* to \([0-9T:-]*\)$/\1/p')"
+  from="$(date -j -f '%Y-%m-%dT%H:%M:%S' "$from" +%s 2>/dev/null)" || return 1
+  to="$(date -j -f '%Y-%m-%dT%H:%M:%S' "$to" +%s 2>/dev/null)" || return 1
+  echo "$from $to"
+}
+
+# The window's end when its certificate is valid now; status 1 otherwise. Any
+# certificate this tool cannot read counts as no window.
+window_end() {
+  local times now
+  times="$(window_times "$1")" || return 1
+  now="$(date +%s)"
+  [[ "${times% *}" -le "$now" && "$now" -lt "${times#* }" ]] || return 1
+  echo "${times#* }"
+}
+
+window_state() {
+  local end times
+  if end="$(window_end "$1")"; then
+    echo "open until $(date -r "$end" +%H:%M)"
+  elif times="$(window_times "$1")" && [[ "${times#* }" -le "$(date +%s)" ]]; then
+    echo "locked (the last window closed at $(date -r "${times#* }" +%H:%M))"
+  else
+    echo "locked"
+  fi
+}
+
+# Sharing one connection per door (ControlMaster) makes a run cost one login:
+# one touch for a FIDO key. Each door has its own socket, so a run never rides
+# on another door's login, and the box's log names the key that did the work.
+mux_opts() {
+  mkdir -p "$SSH_DIR" && chmod 700 "$SSH_DIR"
+  MUX_OPTS=(-o ControlMaster=auto -o "ControlPath=\"$SSH_DIR/$1-%C\"" -o "ControlPersist=$2")
+}
+
+# A shared connection lives on after the run. When its window ends, or lock
+# closes it, the connection must go too: the box checks a certificate only at login.
+close_master() {
+  ssh "${SSH_OPTS[@]}" -o "ControlPath=\"$SSH_DIR/$1-%C\"" -O exit "$(target)" >/dev/null 2>&1 || true
+}
+
+# Which door an admin verb takes: the first of window, me and legacy that is
+# there, else locked. It decides before the vault is asked (box_needs), so it
+# only looks: open_admin_door acts on it.
+admin_door() {
+  if window_end "$1" >/dev/null; then echo window
+  elif [[ $AS_ME == 1 ]]; then echo me
+  elif [[ -n "${BOX_SSH_KEY:-}" ]]; then echo legacy
+  else echo locked
+  fi
+}
+
+open_admin_door() {
+  local name="$1" end persist dir="$UNLOCK_DIR/$1"
+  DOOR="$(admin_door "$name")"
+  case "$DOOR" in
+    window)
+      # The certificate alone: no agent, no other key. Its connection never
+      # outlives the window by more than the rest of a run.
+      end="$(window_end "$name")"
+      persist=$((end - $(date +%s)))
+      [[ $persist -le $PERSIST_SECONDS ]] || persist=$PERSIST_SECONDS
+      mux_opts window "$persist"
+      DOOR_OPTS=(-o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none
+                 -o "IdentityFile=\"$dir/key\"" -o "CertificateFile=\"$dir/key-cert.pub\"" "${MUX_OPTS[@]}")
+      DOOR_WORDS="inside the window until $(date -r "$end" +%H:%M)" ;;
+    me)
+      # The person's own agent and keys. No BatchMode: a FIDO key may ask for its PIN.
+      mux_opts me "$PERSIST_SECONDS"
+      DOOR_OPTS=("${MUX_OPTS[@]}")
+      DOOR_WORDS="as you, with your own SSH agent" ;;
+    legacy)
+      echo "Warning: $name is reached with the legacy admin key (BOX_SSH_KEY, BOX_SUDO), which is going; open a window instead: $PROG $name unlock" >&2
+      agent_up "$BOX_SSH_KEY" BOX_SSH_KEY
+      mux_opts legacy "$PERSIST_SECONDS"
+      DOOR_OPTS=(-o BatchMode=yes "${MUX_OPTS[@]}")
+      DOOR_WORDS="with the legacy admin key" ;;
+    *)
+      close_master window
+      die "locked: run $PROG $name unlock (or $PROG $name --as-me ... with your own key). $name: window $(window_state "$name")" ;;
+  esac
+}
+
+# The read key alone: from the vault into this run's agent, its public half in
+# $SSH_DIR as the one IdentityFile, IdentitiesOnly so the agent offers nothing
+# else. The box answers this key with its read dispatcher and nothing more.
+open_read_door() {
+  local name="$1" pub
+  [[ -n "$READ_PUB" ]] || die "$(box_file "$name") needs BOX_READ_KEY=bw:$name-read-key for status, read and the dry run (docs/boxes/access.md). Or look with your own key: $PROG $name --as-me"
+  agent_up "$BOX_READ_KEY" BOX_READ_KEY
+  mkdir -p "$SSH_DIR" && chmod 700 "$SSH_DIR"
+  pub="$SSH_DIR/$name-read.pub"
+  printf '%s %s%s\n' "$READ_PUB" "$KEY_TAG" "read:$name" > "$pub"
+  DOOR="read"
+  DOOR_OPTS=(-o BatchMode=yes -o IdentitiesOnly=yes -o "IdentityFile=\"$pub\"")
+  DOOR_WORDS="through the read key"
+}
+
+# One read verb through the read door; its output as the box gave it. No
+# fallback: a box that refuses the read key gets a person's fix, never the admin key.
+read_remote() {
+  local name="$1" verb="$2" status=0
+  [[ "$DOOR" == read ]] || die "internal: read_remote outside the read door"
+  ssh "${SSH_OPTS[@]}" "${DOOR_OPTS[@]}" "$(target)" "$verb" </dev/null || status=$?
+  case "$status" in
+    0) ;;
+    2) die "$name refused the read verb $verb: its read dispatcher is older than this $PROG. A person updates it: $PROG $name --as-me --apply" ;;
+    126|127) die "$name took the read key but has no read dispatcher at $READ_DISPATCHER. A person installs it: $PROG $name --as-me --apply" ;;
+    *) die "$name refused the read key, or did not answer (ssh said $status). A box without the read key yet gets it from a person, once: $PROG $name --as-me --apply. Nothing fell back to the admin key." ;;
+  esac
+}
 
 # What every remote script starts with: brew on the PATH (a non-interactive
 # shell has no profile) and the box's settings as variables.
@@ -146,38 +443,67 @@ eval "\$(/opt/homebrew/bin/brew shellenv 2>/dev/null)" 2>/dev/null || true
 export HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1
 BOX_CHECKOUT=$(printf '%q' "$BOX_CHECKOUT") BOX_PORT=$(printf '%q' "$BOX_PORT") BOX_PROFILE=$(printf '%q' "$BOX_PROFILE") BOX_URL=$(printf '%q' "$BOX_URL")
 BOX_REVIEW_AT=$(printf '%q' "$BOX_REVIEW_AT") BOX_SHIFT_END=$(printf '%q' "$BOX_SHIFT_END") BOX_USER=$(printf '%q' "$BOX_USER")
+$(declare -f ups_state)
 EOF
 }
 
-# Run a script on the box. It travels as base64 inside the command, so the
-# box's login shell never parses it, and stdin stays free for one secret.
-remote() {
-  local b64
-  b64="$(printf '%s\n%s' "$(prelude)" "$1" | base64 | tr -d '\n')"
-  ssh "${SSH_OPTS[@]}" "$(target)" "bash -c \"\$(echo $b64 | base64 -d)\""
+# Reads `pmset -g ps` on stdin and prints the UPS fact for the probe: none, unknown, or "<name>, 87%, on AC|on battery".
+# Anything it cannot read is unknown; the name keeps only characters that cannot break a key=value line or the report. Shipped to the box inside the prelude.
+ups_state() {
+  local line source="" name="" pct="" seen=0
+  while IFS= read -r line; do
+    case "$line" in
+      "Now drawing from 'AC Power'"*) source="on AC"; seen=1 ;;
+      "Now drawing from 'Battery Power'"*|"Now drawing from 'UPS Power'"*) source="on battery"; seen=1 ;;
+      " -InternalBattery"*) ;;
+      " -"*)
+        if [[ -z "$name" && "$line" =~ ^\ -(.+)\ \(id=[0-9]+\)[[:space:]]+([0-9]{1,3})% ]]; then
+          name="${BASH_REMATCH[1]//[^A-Za-z0-9 ._-]/}"; pct="${BASH_REMATCH[2]}"; name="${name:-UPS}"
+        fi ;;
+    esac
+  done
+  if [[ $seen == 0 ]]; then echo unknown
+  elif [[ -z "$name" ]]; then echo none
+  else echo "$name, $pct%, $source"
+  fi
 }
 
-# The same, after sudo takes the box's password from stdin once. The script
-# then calls sudo -n: the grant is cached for this shell, and a child process
-# (trellis-crm boot, say) would not see it, so the steps run here by name.
-sudo_remote() {
-  printf '%s\n' "$BOX_SUDO" | remote 'sudo -S -p "" -v 2>/dev/null || { echo "sudo refused the password from the vault (BOX_SUDO)" >&2; exit 97; }
-'"$1"
+# Run a script on the box, through the admin door open_admin_door chose. It
+# travels as base64 inside the command, so the box's login shell never parses
+# it. ssh reads nothing from this terminal: a person's typing stays here.
+remote() { remote_stdin "$1" </dev/null; }
+
+# The same, with this process's stdin passed to the script: one secret, piped
+# in by the caller (remote_with_stdin, run_access, mailbox secret).
+remote_stdin() {
+  local b64
+  [[ "$DOOR" == window || "$DOOR" == me || "$DOOR" == legacy ]] || die "internal: remote without an admin door"
+  b64="$(printf '%s\n%s' "$(prelude)" "$1" | base64 | tr -d '\n')"
+  ssh "${SSH_OPTS[@]}" "${DOOR_OPTS[@]}" "$(target)" "bash -c \"\$(echo $b64 | base64 -d)\""
+}
+
+# The script line that runs one root helper verb. sudo -n: the sudoers drop-in
+# lets the box user run exactly these without a password, so no password
+# travels and none is cached (a grant from sudo -S -v does not reach a later
+# sudo -n over SSH without a terminal). A box without the helper says how.
+root_call() {
+  printf '%s\n' "/usr/bin/sudo -n $ROOT_HELPER $1 || { echo \"the root helper did not run $1. A person installs it once (step access): $PROG $THE_BOX --as-me --apply\" >&2; exit 1; }"
 }
 
 # A secret on stdin for a script that reads it, such as docker login.
-remote_with_stdin() { printf '%s\n' "$2" | remote "$1"; }
+remote_with_stdin() { printf '%s\n' "$2" | remote_stdin "$1"; }
 
 # --- what the box holds ---------------------------------------------------------
 
-# One round trip answers every question; each line becomes found_<key>.
-# The engine is asked only when sage-ai has answered: a half-started engine holds a docker call open for minutes (see ANSWER_SECONDS in lib/sage-runtime.sh).
-probe() {
-  local key value
-  while IFS='=' read -r key value; do
-    [[ -n "$key" ]] || continue
-    printf -v "found_${key//-/_}" '%s' "$value"
-  done < <(remote '
+# The probe: one round trip answers every question, one key=value line each.
+# The read dispatcher on the box runs this same text as its probe verb, so a
+# dry run through the read key sees what --apply sees. It reads; it changes
+# nothing. The engine is asked only when sage-ai has answered: a half-started
+# engine holds a docker call open for minutes (see ANSWER_SECONDS in
+# lib/sage-runtime.sh). access and keys are digests of what step access put
+# on the box, which want_access and want_keys compute here.
+probe_script() {
+  echo '
 echo "arch=$(uname -m)"
 echo "os=$(sw_vers -productVersion 2>/dev/null || uname -s)"
 echo "brew=$(command -v brew || echo missing)"
@@ -185,9 +511,11 @@ for t in sage-runtime trellis-crm ai-ui; do v="$($t version 2>/dev/null | head -
 echo "vm=$(sed -n "s/^vmType: *//p" ~/.colima/default/colima.yaml 2>/dev/null)"
 echo "context=$(docker context show 2>/dev/null)"
 echo "boot=$([ -f '"$BOOT_PLIST"' ] && echo yes || echo no)"
-echo "backup_daemon=$([ -f '"$BACKUP_PLIST"' ] && echo yes || echo no)"
+if [ ! -f '"$BACKUP_PLIST"' ]; then echo "backup_daemon=no"; elif launchctl print system/'"$BACKUP_LABEL"' >/dev/null 2>&1; then echo "backup_daemon=yes"; else echo "backup_daemon=unloaded"; fi
+newest="$(ls -t '"$TRELLIS_BACKUPS"'/*.tar.gz 2>/dev/null | head -1)"; echo "backup_age=$([ -n "$newest" ] && echo $(( ($(date +%s) - $(stat -f %m "$newest")) / 3600 )) || echo none)"
 echo "autorestart=$(pmset -g 2>/dev/null | awk "/^ *autorestart/{print \$2}")"
 echo "sleep=$(pmset -g 2>/dev/null | awk "/^ *sleep /{print \$2}")"
+echo "ups=$(pmset -g ps 2>/dev/null | ups_state)"
 echo "ghcr=$(grep -q ghcr.io ~/.docker/config.json 2>/dev/null && echo yes || echo no)"
 echo "deploy_key=$([ -f '"$DEPLOY_KEY_FILE"' ] && echo yes || echo no)"
 if [ -n "$BOX_CHECKOUT" ] && [ -f "$BOX_CHECKOUT/manage.py" ]; then echo "checkout=$(git -C "$BOX_CHECKOUT" log -1 --format=%h 2>/dev/null || echo present)"; else echo "checkout=none"; fi
@@ -200,12 +528,462 @@ aiui=$(curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1 && ec
 echo "aiui_net=$([ "$aiui" = up ] && docker network inspect '"$AI_UI_NETWORK"' -f "{{range .Containers}}{{println .Name}}{{end}}" 2>/dev/null | grep -qx '"$AI_UI_CONTAINER"' && echo yes || echo no)"
 echo "filevault=$(fdesetup status 2>/dev/null | grep -q " On" && echo on || echo off)"
 echo "leftovers=$(sage-runtime status 2>/dev/null | grep -cE "leads nowhere|leads to Docker Desktop|plugin hooks|buildx not found" || true)"
-')
+echo "access=$([ -f '"$SUDOERS_FILE"' ] && cat '"$READ_DISPATCHER $ROOT_HELPER"' 2>/dev/null | shasum -a 256 | cut -c1-16 || echo none)"
+echo "keys=$(awk "\$NF ~ /^'"$KEY_TAG"'/" ~/.ssh/authorized_keys 2>/dev/null | shasum -a 256 | cut -c1-16)"'
+}
+
+# Each line of the probe becomes found_<key>. The box's answer is data: a key
+# that is not a plain name is dropped, since printf -v would evaluate an array
+# subscript in it.
+probe() {
+  local out key value
+  if [[ "$DOOR" == read ]]; then
+    out="$(read_remote "$THE_BOX" probe)" || exit 1
+  else
+    out="$(remote "$(probe_script)")" || die "$THE_BOX did not answer the probe"
+  fi
+  while IFS='=' read -r key value; do
+    [[ "$key" =~ ^[a-z][a-z0-9_]*$ ]] || continue
+    printf -v "found_$key" '%s' "$value"
+  done < <(printf '%s\n' "$out")
+  : "${found_access:=none}" "${found_keys:=none}"
   : "${found_arch:=?}" "${found_os:=?}" "${found_brew:=missing}" "${found_vm:=}" "${found_boot:=no}" "${found_backup_daemon:=no}"
   : "${found_autorestart:=}" "${found_sleep:=}" "${found_ghcr:=no}" "${found_deploy_key:=no}" "${found_checkout:=none}"
   : "${found_source:=}" "${found_profile:=}" "${found_review_at:=}" "${found_shift_end:=}" "${found_trellis:=down}"
-  : "${found_aiui:=down}" "${found_aiui_net:=no}" "${found_filevault:=off}" "${found_leftovers:=0}" "${found_context:=}"
+  : "${found_aiui:=down}" "${found_aiui_net:=no}" "${found_filevault:=off}" "${found_leftovers:=0}" "${found_context:=}" "${found_ups:=unknown}" "${found_backup_age:=none}"
   : "${found_sage_runtime:=missing}" "${found_trellis_crm:=missing}" "${found_ai_ui:=missing}"
+}
+
+# --- step access and step keys: the box's half of the doors ----------------------
+# What the box holds so the doors work without a person's password:
+#   - the read dispatcher, which the read key's line sends every login through;
+#   - the root helper, the one program sudo lets the box user run as root
+#     without a password, one fixed verb at a time;
+#   - the sudoers drop-in that says so;
+#   - tagged authorized_keys lines for the read key and each CA (step keys).
+# The first three are root's, so installing them takes the login password
+# once (step access). The lines are the box user's own (step keys), so a new CA
+# or a new read key needs no password. Every piece is written here, from this
+# tool's own text and the box file, never from anything the box sends back.
+
+digest() { shasum -a 256 | cut -c1-16; }
+
+# The read dispatcher, as installed at $READ_DISPATCHER: quoted text, with the
+# box file's values set in through printf %q.
+read_dispatcher() {
+  local verb
+  cat <<'EOF'
+#!/bin/bash
+# sage-box read dispatcher. root:wheel 755: the box user cannot change it.
+#
+# The read key's line in the box user's authorized_keys sends every login with
+# that key here: restrict,from="<operators>",command="<this file>". sshd puts
+# what the caller asked for in SSH_ORIGINAL_COMMAND. This file matches that
+# text whole against a fixed list of verbs: no arguments, never evaluated,
+# never a shell. Output stops at 64 KiB. Every call goes to the system log with
+# the tag sage-box-read: log show --predicate 'process == "logger"'.
+#
+# It never prints env files, databases, backup contents, mail or app logs. The
+# probe reads four named settings from trellis-crm's settings file (source,
+# profile, review and shift times), and only whether a registry login or a
+# deploy key exists.
+#
+# sage-box --apply writes this file (step access); docs/boxes/access.md in the
+# sage-is/apps tap is the standard. Change it there, never by hand.
+EOF
+  printf 'VERSION=%q\nCAP=%q\nVERBS=%q\n' "$VERSION" "$READ_CAP" "$READ_VERBS"
+  printf 'BOX_CHECKOUT=%q\nBOX_PORT=%q\nBACKUP_LABEL=%q\n' "$BOX_CHECKOUT" "$BOX_PORT" "$BACKUP_LABEL"
+  cat <<'EOF'
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+BACKUP_DIR="$HOME/.sage-is/backups/trellis-crm"
+BACKUP_LOG="$HOME/.sage-is/logs/trellis-backup.log"
+
+EOF
+  declare -f ups_state
+  printf '\nverb_probe() {%s\n}\n' "$(probe_script)"
+  cat <<'EOF'
+
+verb_backup() {
+  echo "== the last 50 lines of $BACKUP_LOG"
+  tail -n 50 "$BACKUP_LOG" 2>/dev/null || echo "(no log)"
+  echo "== $BACKUP_DIR: date, bytes, name"
+  (cd "$BACKUP_DIR" 2>/dev/null && stat -t '%Y-%m-%d %H:%M' -f '%Sm %12z %N' -- *) 2>/dev/null || echo "(empty or missing)"
+  echo "== launchctl print system/$BACKUP_LABEL"
+  launchctl print "system/$BACKUP_LABEL" 2>/dev/null | grep -E '^[[:space:]](state|runs|last exit code|pid) = ' || echo "(not loaded)"
+}
+
+verb_power() {
+  echo "== pmset -g"; pmset -g
+  echo "== pmset -g ps"; pmset -g ps
+  echo "== uptime"; uptime
+  echo "== last boot"; sysctl -n kern.boottime
+}
+
+# Names and status only: never inspect, never env. A half-started engine holds
+# a docker call open for minutes, so this one gets 15 seconds.
+verb_containers() {
+  local call watch
+  docker ps -a --format '{{.Names}}  {{.Status}}' &
+  call=$!
+  (sleep 15; kill "$call" 2>/dev/null) >/dev/null 2>&1 &
+  watch=$!
+  wait "$call" || echo "(docker did not answer)"
+  kill "$watch" 2>/dev/null || true
+}
+
+verb_version() {
+  echo "sage-box-read $VERSION"
+  echo "macOS $(sw_vers -productVersion 2>/dev/null)"
+}
+
+log() { logger -t sage-box-read "$1 client=${SSH_CLIENT:-none}" 2>/dev/null || true; }
+
+run() {
+  log "verb=$verb"
+  "$1" </dev/null 2>&1 | head -c "$CAP"
+  exit 0
+}
+
+verb="${SSH_ORIGINAL_COMMAND:-}"
+case "$verb" in
+EOF
+  for verb in $READ_VERBS; do printf '  %s) run verb_%s ;;\n' "$verb" "$verb"; done
+  cat <<'EOF'
+  *)
+    # The text came from the caller: the log gets harmless characters only.
+    log "refused=$(printf '%s' "$verb" | LC_ALL=C tr -c 'A-Za-z0-9._-' '?' | head -c 64)"
+    echo "refused: this key runs only: $VERBS" >&2
+    exit 2 ;;
+esac
+EOF
+}
+
+# The boot LaunchDaemon: Colima at power-on as the box user, with nobody
+# signed in. It follows trellis-crm's boot_plist; keep the two in step. The
+# root helper installs this text, not trellis-crm boot --print: root must never
+# load what a program the box user can change has written.
+boot_plist() {
+  local home="/Users/$BOX_USER"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$BOOT_LABEL</string>
+  <key>UserName</key><string>$BOX_USER</string>
+  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/colima</string><string>start</string><string>--foreground</string></array>
+  <key>EnvironmentVariables</key><dict><key>HOME</key><string>$home</string><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>WorkingDirectory</key><string>$home</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ExitTimeOut</key><integer>120</integer>
+  <key>StandardOutPath</key><string>$home/.sage-is/logs/colima-boot.log</string>
+  <key>StandardErrorPath</key><string>$home/.sage-is/logs/colima-boot.log</string>
+</dict></plist>
+EOF
+}
+
+# The root helper, as installed at $ROOT_HELPER. Its verbs are what this tool
+# runs as root: the Homebrew package, power settings, the two LaunchDaemons,
+# Docker's system-wide links, and the restart.
+root_helper() {
+  local verb
+  cat <<'EOF'
+#!/bin/bash
+# sage-box root helper. root:wheel 755: the box user cannot change it.
+#
+# /etc/sudoers.d/sage-box lets the box user run this as root without a
+# password, once per verb, each verb its own sudoers entry. It takes that one
+# verb and nothing else: no other argument, nothing from the environment (sudo
+# resets it, and PATH is set here), nothing on stdin. Every file it installs it
+# writes itself, from text fixed when it was installed, and it never runs a
+# program the box user can change as root.
+#
+# sage-box --apply writes this file (step access); docs/boxes/access.md in the
+# sage-is/apps tap is the standard. Change it there, never by hand.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 022
+EOF
+  printf 'BOX_USER=%q\nHOMEBREW_PKG=%q\nHOMEBREW_PKG_TEAM=%q\nVERBS=%q\n' "$BOX_USER" "$HOMEBREW_PKG" "$HOMEBREW_PKG_TEAM" "$ROOT_VERBS"
+  printf 'BOOT_LABEL=%q\nBACKUP_LABEL=%q\n' "$BOOT_LABEL" "$BACKUP_LABEL"
+  printf '\nboot_plist() {\n  cat <<%s\n%s\nPLIST\n}\n' "'PLIST'" "$(boot_plist)"
+  printf '\nbackup_plist() {\n  cat <<%s\n%s\nPLIST\n}\n' "'PLIST'" "$(backup_plist)"
+  cat <<'EOF'
+
+refuse() { echo "refused: $0 takes one of: $VERBS" >&2; exit 2; }
+
+# A LaunchDaemon from one of the plists above: checked, root's, loaded again.
+daemon() {
+  local label="$1" plist="/Library/LaunchDaemons/$1.plist" tmp
+  tmp="$(mktemp)"
+  "$2" > "$tmp"
+  plutil -lint -s "$tmp"
+  install -m 644 -o root -g wheel "$tmp" "$plist"
+  rm -f "$tmp"
+  launchctl bootout "system/$label" 2>/dev/null || true
+  launchctl bootstrap system "$plist"
+}
+
+# Homebrew's own package, when the box has no Homebrew yet. It runs as root, so
+# a package that is not notarized by Apple and signed by Homebrew's own Apple
+# team stops here.
+verb_homebrew() {
+  local dir sig
+  if [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; then echo "Homebrew is installed"; return 0; fi
+  dir="$(mktemp -d)"
+  curl -fsSL -o "$dir/Homebrew.pkg" "$HOMEBREW_PKG"
+  sig="$(pkgutil --check-signature "$dir/Homebrew.pkg" 2>/dev/null || true)"
+  if ! printf '%s\n' "$sig" | grep -q "Notarization: trusted by the Apple notary service" ||
+     ! printf '%s\n' "$sig" | grep -q "^ *1\. Developer ID Installer: .*($HOMEBREW_PKG_TEAM)\$"; then
+    rm -rf "$dir"
+    echo "refused: $HOMEBREW_PKG is not notarized and signed by Homebrew's team ($HOMEBREW_PKG_TEAM). Install Homebrew by hand once, then check HOMEBREW_PKG_TEAM in sage-box." >&2
+    exit 1
+  fi
+  installer -pkg "$dir/Homebrew.pkg" -target / >/dev/null
+  rm -rf "$dir"
+}
+
+# Sleep off, and start again after a power cut.
+verb_power() { pmset -a sleep 0 autorestart 1; }
+
+verb_boot_daemon() { daemon "$BOOT_LABEL" boot_plist; }
+
+verb_backup_daemon() { daemon "$BACKUP_LABEL" backup_plist; }
+
+# What Docker Desktop leaves for the whole Mac: links in /usr/local/bin that
+# lead nowhere, and /var/run/docker.sock, which now leads to Colima's socket.
+verb_docker_sock() {
+  local link sock="/Users/$BOX_USER/.colima/default/docker.sock"
+  for link in /usr/local/bin/docker*; do
+    if [ -L "$link" ] && [ ! -e "$link" ]; then rm -f "$link"; fi
+  done
+  if [ -S "$sock" ]; then ln -sfn "$sock" /var/run/docker.sock; fi
+}
+
+verb_reboot() { shutdown -r now; }
+
+[ "$#" -eq 1 ] || refuse
+case "$1" in
+EOF
+  for verb in $ROOT_VERBS; do printf '  %s) verb_%s ;;\n' "$verb" "${verb//-/_}"; done
+  cat <<'EOF'
+  *) refuse ;;
+esac
+EOF
+}
+
+# The sudoers drop-in: the root helper with each of its verbs, nothing else.
+# A command named with its arguments in sudoers matches only those arguments,
+# so the helper's own refusal is the second lock, not the only one.
+sudoers_dropin() {
+  local verb cmds=""
+  for verb in $ROOT_VERBS; do cmds="${cmds:+$cmds, }$ROOT_HELPER $verb"; done
+  printf '# sage-box %s, step access: %s runs the root helper as root, one fixed verb at a time, without a password.\n' "$VERSION" "$BOX_USER"
+  printf '# Nothing else: every other sudo still asks for the login password. visudo -c passed it before it went in.\n'
+  printf '%s ALL=(root) NOPASSWD: %s\n' "$BOX_USER" "$cmds"
+}
+
+# What root runs on the box, once per change, with the three files beside it.
+access_install() {
+  cat <<'EOF'
+#!/bin/bash
+# sage-box step access, as root: installs the read dispatcher, the root helper
+# and the sudoers drop-in from the folder named by $1, each root's.
+#
+# The box user wrote that folder, so anything running as the box user could
+# swap a file in it before root reads it. Root therefore copies each file into
+# a folder of its own first, checks the copy against the sha256 that $2, $3 and
+# $4 name (computed on the operator's Mac, and carried on this command line,
+# which the box user cannot change once sudo runs), and installs only copies
+# that match. A swapped file stops the step before anything changes.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 022
+src="$1"
+own="$(mktemp -d)"
+trap 'rm -rf "$own"' EXIT
+check() {
+  cat "$src/$1" > "$own/$1"
+  if [ "$(shasum -a 256 "$own/$1" | cut -d' ' -f1)" != "$2" ]; then
+    echo "access: $1 changed after it was written; nothing installed" >&2
+    exit 3
+  fi
+}
+check read "$2"
+check root "$3"
+check sudoers "$4"
+EOF
+  printf 'LIBEXEC_DIR=%q\nREAD_DISPATCHER=%q\nROOT_HELPER=%q\nSUDOERS_FILE=%q\n' "$LIBEXEC_DIR" "$READ_DISPATCHER" "$ROOT_HELPER" "$SUDOERS_FILE"
+  cat <<'EOF'
+install -d -m 755 -o root -g wheel "$LIBEXEC_DIR"
+# sudo runs whatever sits at $ROOT_HELPER as root. A link, or a folder the box
+# user could write, anywhere on the way there would let them swap it.
+for dir in /usr /usr/local /usr/local/libexec "$LIBEXEC_DIR"; do
+  mode="$(stat -f %Lp "$dir")"
+  if [ -L "$dir" ] || [ "$(stat -f %u "$dir")" != 0 ] || [ $((8#$mode & 8#022)) != 0 ]; then
+    echo "access: $dir is not root's alone (owner $(stat -f %Su "$dir"), mode $mode, or a link); nothing installed" >&2
+    exit 3
+  fi
+done
+install -m 755 -o root -g wheel "$own/read" "$READ_DISPATCHER"
+install -m 755 -o root -g wheel "$own/root" "$ROOT_HELPER"
+# The drop-in goes in once visudo passes it alone, and stays only while sudo's
+# whole configuration passes with it.
+tmp="$(mktemp)"
+cat "$own/sudoers" > "$tmp"
+if ! visudo -cf "$tmp" >/dev/null; then
+  rm -f "$tmp"
+  echo "access: visudo refused the sudoers drop-in; the box keeps the one it had" >&2
+  exit 3
+fi
+install -m 440 -o root -g wheel "$tmp" "$SUDOERS_FILE"
+rm -f "$tmp"
+if ! visudo -c >/dev/null; then
+  rm -f "$SUDOERS_FILE"
+  echo "access: sudo's whole configuration failed visudo -c with the drop-in, so the drop-in is gone again" >&2
+  exit 3
+fi
+echo "  root's now: $READ_DISPATCHER, $ROOT_HELPER, $SUDOERS_FILE"
+EOF
+}
+
+# A script line that writes FILE in the script's folder from what RENDERER
+# prints. It travels as base64, so no quoting on the way can change a byte.
+payload() { printf "echo '%s' | base64 -d > \"\$D/%s\"\n" "$("$2" | base64 | tr -d '\n')" "$1"; }
+
+# The full sha256 of what a renderer prints: what root checks each copy against.
+sha256_of() { "$1" | shasum -a 256 | cut -d' ' -f1; }
+
+# The box user's side, sent through the admin door with the login password on
+# stdin. The password is checked alone first, so a refusal reads as one; then
+# one sudo runs the installer. No sudo -n follows: nothing relies on a cached grant.
+# Where the password meets root, everything is named by its full path: the box
+# user's PATH starts in /opt/homebrew/bin, which the box user owns, so a bare
+# `sudo` there could be a stand-in that keeps the password. The installer rides
+# on sudo's own command line, never in a file the box user could change, and the
+# three files' digests ride with it (see access_install).
+access_script() {
+  echo 'set -e'
+  echo 'IFS= read -r PW || true'
+  echo 'D="$(mktemp -d)"'
+  echo "trap 'rm -rf \"\$D\"' EXIT"
+  payload read read_dispatcher
+  payload root root_helper
+  payload sudoers sudoers_dropin
+  printf "INSTALL=\"\$(echo '%s' | /usr/bin/base64 -d)\"\n" "$(access_install | base64 | tr -d '\n')"
+  printf '%s\n' "printf '%s\\n' \"\$PW\" | /usr/bin/sudo -S -p \"\" -v 2>/dev/null || { echo \"sudo refused the password ($SUDO_FROM)\" >&2; exit 97; }"
+  printf '%s\n' "printf '%s\\n' \"\$PW\" | /usr/bin/sudo -S -p \"\" /bin/bash -c \"\$INSTALL\" sage-box-access \"\$D\" $(sha256_of read_dispatcher) $(sha256_of root_helper) $(sha256_of sudoers_dropin)"
+  echo 'unset PW'
+}
+
+# The login password, once per run, for the one step that needs it. The legacy
+# door takes BOX_SUDO from the vault; the other doors ask the person at the
+# terminal, without echo. An agent in a window has no terminal and stops here:
+# root's files change only with a person.
+sudo_password() {
+  [[ -z "$SUDO_PW" ]] || return 0
+  if [[ "$DOOR" == legacy ]]; then
+    [[ -n "${BOX_SUDO:-}" ]] || die "the legacy door needs BOX_SUDO in $(box_file "$THE_BOX") for the access step"
+    SUDO_PW="$BOX_SUDO"
+    SUDO_FROM="BOX_SUDO from the vault"
+    return 0
+  fi
+  [[ -t 0 ]] || die "the access step installs root's files, so it needs $BOX_USER's login password on $THE_BOX, typed at a terminal: $PROG $THE_BOX --as-me --apply"
+  IFS= read -rs -p "$BOX_USER's login password on $THE_BOX (sudo, once, for the access step): " SUDO_PW || true
+  echo >&2
+  [[ -n "$SUDO_PW" ]] || die "no password; nothing changed"
+  SUDO_FROM="the password typed here"
+}
+
+run_access() {
+  sudo_password
+  printf '%s\n' "$SUDO_PW" | remote_stdin "$(access_script)"
+}
+
+want_access() { { read_dispatcher; root_helper; } | digest; }
+
+step_access() {
+  if [[ "$found_access" == "$(want_access)" ]]; then
+    step access "read dispatcher, root helper and sudoers drop-in, as this $PROG writes them" ""
+  elif [[ "$found_access" == none ]]; then
+    step access "no read dispatcher, root helper or sudoers drop-in" "install them, root's (sudo with the login password, once)" run_access
+  else
+    step access "they differ from what this $PROG writes" "install them again, root's (sudo with the login password, once)" run_access
+  fi
+}
+
+# Each CA this Mac trusts for windows: $CA_DIR/<name>.pub, a FIDO key. A CA
+# that is not a FIDO key would be a file that opens every box, so it stops the run.
+load_cas() {
+  local file label type b64 rest
+  CA_NAMES=()
+  CA_KEYS=()
+  for file in "$CA_DIR"/*.pub; do
+    [[ -f "$file" ]] || continue
+    label="$(basename "$file" .pub)"
+    [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || die "a CA's file name is letters, digits, . _ and - only: $file"
+    read -r type b64 rest < "$file" || true
+    is_sk_type "$type" || die "$file is a ${type:-empty} key. A box trusts only FIDO CAs (ed25519-sk or ecdsa-sk), so every window takes a touch"
+    [[ "$b64" =~ ^[A-Za-z0-9+/]+=*$ ]] && ssh-keygen -l -f "$file" >/dev/null 2>&1 || die "$file is not a public key ssh-keygen can read"
+    CA_NAMES+=("$label")
+    CA_KEYS+=("$type $b64")
+  done
+}
+
+# The tagged lines, in the order step keys writes them: the read key, forced
+# through the dispatcher; then each CA, for window certificates only. restrict
+# turns off forwarding and terminals for both; from= holds them to the operators.
+key_lines() {
+  local i
+  printf 'restrict,from="%s",command="%s" %s %sread:%s\n' "$BOX_OPERATORS" "$READ_DISPATCHER" "$READ_PUB" "$KEY_TAG" "$THE_BOX"
+  for ((i = 0; i < ${#CA_KEYS[@]}; i++)); do
+    printf 'restrict,cert-authority,principals="%s",from="%s" %s %sca:%s\n' "$WINDOW_PRINCIPAL" "$BOX_OPERATORS" "${CA_KEYS[i]}" "$KEY_TAG" "${CA_NAMES[i]}"
+  done
+}
+
+want_keys() { key_lines | digest; }
+
+# The box user's authorized_keys: every tagged line goes and the current set
+# follows the rest, so a run twice changes nothing and a CA gone from $CA_DIR
+# leaves the box. A line that holds one of these keys without its tag goes too:
+# sshd takes the first line that matches a key, and an untagged copy of the
+# read key would be a full login. A dated copy of the file comes first; no
+# change, no copy.
+run_keys() {
+  local blobs i prog
+  blobs="${READ_PUB#* }"
+  for ((i = 0; i < ${#CA_KEYS[@]}; i++)); do blobs="$blobs ${CA_KEYS[i]#* }"; done
+  prog='BEGIN { n = split(blobs, b, " "); for (i = 1; i <= n; i++) ours[b[i]] = 1 }
+$NF ~ /^'"$KEY_TAG"'/ { next }
+{ for (i = 1; i <= NF; i++) if ($i in ours) next; print }'
+  remote 'set -e
+umask 077
+F="$HOME/.ssh/authorized_keys"
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+T="$(mktemp "$F.XXXXXX")"
+{
+  [ ! -f "$F" ] || awk -v blobs='"$(printf '%q' "$blobs")"' '"$(printf '%q' "$prog")"' "$F"
+  echo '"$(key_lines | base64 | tr -d '\n')"' | base64 -d
+} > "$T"
+if [ -f "$F" ] && cmp -s "$T" "$F"; then rm -f "$T"; echo "  authorized_keys holds them already"; exit 0; fi
+[ ! -f "$F" ] || cp -p "$F" "$F.sage-box-$(date +%Y%m%d-%H%M%S)"
+chmod 600 "$T"
+mv "$T" "$F"
+echo "  authorized_keys: '"$((1 + ${#CA_KEYS[@]}))"' tagged line(s); the other lines as they were"'
+}
+
+step_keys() {
+  local cas=${#CA_KEYS[@]}
+  if [[ "$found_keys" == "$(want_keys)" ]]; then
+    step keys "the read key and $cas CA(s), tagged in authorized_keys" ""
+  else
+    step keys "authorized_keys lacks them or differs" "tag the read key and $cas CA(s) in authorized_keys; other lines stay" run_keys
+  fi
+  [[ $cas -gt 0 ]] || echo "  note   no CA in $CA_DIR, so no window can open on $THE_BOX (docs/boxes/access.md)"
 }
 
 # --- the plan ----------------------------------------------------------------------
@@ -240,7 +1018,7 @@ tools_missing() {
 }
 
 run_homebrew() {
-  sudo_remote 'curl -fsSL -o /tmp/Homebrew.pkg '"$HOMEBREW_PKG"' && sudo -n installer -pkg /tmp/Homebrew.pkg -target / >/dev/null && rm -f /tmp/Homebrew.pkg
+  remote "$(root_call homebrew)"'
 grep -q "brew shellenv" ~/.zprofile 2>/dev/null || echo '"'"'eval "$(/opt/homebrew/bin/brew shellenv)"'"'"' >> ~/.zprofile'
 }
 
@@ -286,9 +1064,8 @@ step_runtime() {
 # What sage-runtime status lists after Docker Desktop: the bits this tool
 # knows how to mend. The rest it prints for a person.
 run_leftovers() {
-  sudo_remote 'find ~/.docker/cli-plugins -type l ! -exec test -e {} \; -delete 2>/dev/null || true
-for l in /usr/local/bin/docker*; do [ -L "$l" ] && [ ! -e "$l" ] && sudo -n rm -f "$l"; done; true
-[ -S "$HOME/.colima/default/docker.sock" ] && sudo -n ln -sfn "$HOME/.colima/default/docker.sock" /var/run/docker.sock || true
+  remote 'find ~/.docker/cli-plugins -type l ! -exec test -e {} \; -delete 2>/dev/null || true
+'"$(root_call docker-sock)"'
 command -v docker-buildx >/dev/null 2>&1 || brew list docker-buildx >/dev/null 2>&1 || brew install docker-buildx >/dev/null 2>&1 || true
 plutil -remove features.hooks ~/.docker/config.json >/dev/null 2>&1 || true
 sage-runtime use colima >/dev/null 2>&1 || true
@@ -304,13 +1081,12 @@ step_leftovers() {
 }
 
 run_power() {
-  sudo_remote 'sudo -n pmset -a sleep 0 autorestart 1'
+  remote "$(root_call power)"
 }
 
+# The helper writes the plist itself (boot_plist); the logs folder is the box user's.
 run_boot() {
-  sudo_remote 'T=$(mktemp); trellis-crm boot --print > "$T" && sudo -n install -m 644 -o root -g wheel "$T" '"$BOOT_PLIST"' && rm -f "$T"
-sudo -n launchctl bootout system/is.sage.colima 2>/dev/null || true
-sudo -n launchctl bootstrap system '"$BOOT_PLIST"
+  remote 'mkdir -p ~/.sage-is/logs'$'\n'"$(root_call boot-daemon)"
 }
 
 step_power() {
@@ -322,9 +1098,9 @@ step_power() {
   if [[ "$found_boot" == yes ]]; then
     step boot "Colima starts at power-on" ""
   elif [[ "$found_trellis_crm" == missing && $APPLY == 0 ]]; then
-    step boot "no boot daemon" "install it from trellis-crm boot --print, once trellis-crm is there" run_boot
+    step boot "no boot daemon" "install the LaunchDaemon $BOOT_LABEL (Colima at power-on), once trellis-crm is there" run_boot
   else
-    step boot "no boot daemon" "install the LaunchDaemon from trellis-crm boot --print" run_boot
+    step boot "no boot daemon" "install the LaunchDaemon $BOOT_LABEL (Colima at power-on, as $BOX_USER)" run_boot
   fi
 }
 
@@ -428,18 +1204,16 @@ EOF
 }
 
 run_backup_daemon() {
-  sudo_remote 'mkdir -p ~/.sage-is/logs; T=$(mktemp); cat > "$T" <<'"'"'PLIST'"'"'
-'"$(backup_plist)"'
-PLIST
-sudo -n install -m 644 -o root -g wheel "$T" '"$BACKUP_PLIST"' && rm -f "$T"
-sudo -n launchctl bootout system/'"$BACKUP_LABEL"' 2>/dev/null || true
-sudo -n launchctl bootstrap system '"$BACKUP_PLIST"
+  remote 'mkdir -p ~/.sage-is/logs'$'\n'"$(root_call backup-daemon)"
 }
 
 step_backups() {
   [[ "$BOX_MODE" != peer ]] || return 0
   if [[ "$found_backup_daemon" == yes ]]; then
     step backups "trellis-crm backup runs nightly at 02:00" ""
+  elif [[ "$found_backup_daemon" == unloaded ]]; then
+    # The plist alone proves nothing: 0.1.0 wrote it and its bootstrap failed, so no backup ever ran.
+    step backups "the LaunchDaemon $BACKUP_LABEL is there, but launchd never loaded it" "load it again (02:00, as $BOX_USER)" run_backup_daemon
   else
     step backups "no nightly backup" "install the LaunchDaemon $BACKUP_LABEL (02:00, as $BOX_USER); this Mac pulls it with: $PROG <box> backup --nightly" run_backup_daemon
   fi
@@ -467,12 +1241,14 @@ verify() {
   [[ $ok == 1 ]]
 }
 
+# The connection drops as the box goes down, so ssh's own 255 is the usual answer.
 run_reboot() {
+  local waited=0 status=0
   echo "Restarting the box..."
-  sudo_remote 'sudo -n shutdown -r now >/dev/null 2>&1 || true' || true
-  local waited=0
+  remote "$(root_call reboot)" || status=$?
+  [[ $status == 0 || $status == 255 ]] || die "the box did not restart; the root helper answered $status"
   sleep 20
-  until ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 "$(target)" true 2>/dev/null; do
+  until ssh -o ConnectTimeout=5 "${SSH_OPTS[@]}" "${DOOR_OPTS[@]}" "$(target)" true </dev/null 2>/dev/null; do
     sleep 10; waited=$((waited + 10))
     [[ $waited -lt 420 ]] || die "the box did not answer within 7 minutes of the restart. FileVault on? Someone unlocks it at the screen."
   done
@@ -480,14 +1256,30 @@ run_reboot() {
   sleep 60
 }
 
+# --apply goes through an admin door. The dry run looks through the read key,
+# or with --as-me through an admin door, for a box that has no read key yet.
 cmd_plan() {
   local name="$1"
-  load_box "$name"
-  agent_up
-  echo "$name: $(target), $BOX_MODE mode$([[ "$BOX_AI_UI" == 1 ]] && echo ", with AI-UI")"
+  if [[ $APPLY == 1 ]]; then
+    load_box "$name" apply
+    open_admin_door "$name"
+  elif [[ $AS_ME == 1 ]]; then
+    load_box "$name" plan
+    open_admin_door "$name"
+  else
+    load_box "$name" read
+    open_read_door "$name"
+  fi
+  [[ -n "$READ_PUB" ]] || die "$(box_file "$name") needs BOX_READ_KEY=bw:$name-read-key: the keys step puts its public half on the box (docs/boxes/access.md)"
+  [[ -n "$BOX_OPERATORS" ]] || die "$(box_file "$name") needs BOX_OPERATORS, the addresses the operators reach boxes from (100.64.0.0/10 is the whole tailnet): every key line on the box names them"
+  load_cas
+  echo "$name: $(target), $BOX_MODE mode$([[ "$BOX_AI_UI" == 1 ]] && echo ", with AI-UI"), $DOOR_WORDS"
   probe
   echo "Found: $found_os on $found_arch, FileVault $found_filevault"
   if [[ $APPLY == 1 ]]; then echo "Plan, applying:"; else echo "Plan (nothing changes without --apply):"; fi
+  # First: the helper they install runs every root step after them.
+  step_access
+  step_keys
   step_tools
   if [[ $APPLY == 1 ]]; then probe; fi  # the tools step may have installed what the next ones need
   step_runtime
@@ -523,9 +1315,9 @@ update_remote() {
 
 cmd_update() {
   local name="$1"
-  load_box "$name"
-  agent_up
-  echo "Updating $name..."
+  load_box "$name" admin
+  open_admin_door "$name"
+  echo "Updating $name, $DOOR_WORDS..."
   update_remote "brew upgrade" 'brew update >/dev/null 2>&1 || true; brew upgrade '"$(tools_wanted)"' 2>&1 | grep -vE "^==> (Downloading|Pouring|Fetching)|^\s*$" | tail -3 || true'
   if [[ "$BOX_MODE" != peer ]]; then
     if [[ "$BOX_MODE" == source ]]; then
@@ -543,19 +1335,27 @@ cmd_update() {
 cmd_backup() {
   local name="$1" nightly=0 newest base tmp
   shift
-  [[ "${1:-}" != --nightly ]] || nightly=1
-  load_box "$name"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --nightly) nightly=1 ;;
+      --as-me)   AS_ME=1 ;;
+      *) die "backup takes --nightly and --as-me only" ;;
+    esac
+    shift
+  done
+  # The nightly pull is a file on this Mac: no secret, no door.
+  if [[ $nightly == 1 ]]; then load_box "$name" none; else load_box "$name" admin; fi
   [[ "$BOX_MODE" != peer ]] || die "a peer box has no Trellis to back up"
   [[ -n "$BOX_BACKUP_DIR" && -n "$BOX_BACKUP_TO" ]] || die "backup needs BOX_BACKUP_DIR (on this Mac) and BOX_BACKUP_TO (an age recipient) in $(box_file "$name")"
   if [[ $nightly == 1 ]]; then install_pull_agent "$name"; return; fi
   command -v age &>/dev/null || die "age is not installed here: brew install age"
-  agent_up
-  newest="$(remote 'ls -t '"$BOX_BACKUPS"'/*.tar.gz 2>/dev/null | head -1')"
+  open_admin_door "$name"
+  newest="$(remote 'ls -t '"$TRELLIS_BACKUPS"'/*.tar.gz 2>/dev/null | head -1')"
   [[ -n "$newest" ]] || die "no backup on the box yet. The nightly daemon makes one at 02:00, or on the box: trellis-crm backup"
   base="$(basename "$newest")"
   mkdir -p "$BOX_BACKUP_DIR"
   tmp="$(mktemp -d)"
-  scp -q "${SSH_OPTS[@]}" "$(target):$newest" "$tmp/$base"
+  scp -q "${SSH_OPTS[@]}" "${DOOR_OPTS[@]}" "$(target):$newest" "$tmp/$base"
   age -r "$BOX_BACKUP_TO" -o "$BOX_BACKUP_DIR/$base.age" "$tmp/$base"
   rm -rf "$tmp"
   # shellcheck disable=SC2012 # names are ours, without spaces or newlines
@@ -586,21 +1386,48 @@ EOF
   echo "This Mac pulls $name's backup nightly at 03:30: $plist (log: $SAGE_CONFIG_DIR/logs/box-backup-$name.log)"
 }
 
+# The nightly backup in one line: whether launchd holds the job, and how old the
+# newest backup on the box is. A job that is not loaded, or no backup within
+# BACKUP_STALE_HOURS, says WARNING: a plist on disk once read as "yes" while no
+# backup had ever run.
+backup_words() {
+  local job age
+  case "$found_backup_daemon" in
+    yes) job="loaded (02:00)" ;;
+    unloaded) job="WARNING: installed but not loaded, so it never runs; fix: $PROG $THE_BOX --apply" ;;
+    *) job="WARNING: no LaunchDaemon; fix: $PROG $THE_BOX --apply" ;;
+  esac
+  age="$found_backup_age"
+  if [[ ! "$age" =~ ^[0-9]+$ ]]; then
+    echo "$job; WARNING: no backup on the box yet"
+  elif ((age > BACKUP_STALE_HOURS)); then
+    echo "$job; WARNING: the newest backup is ${age} h old"
+  else
+    echo "$job; newest backup ${age} h old"
+  fi
+}
+
+# Through the read key: status works with BOX_READ_KEY alone in the vault.
 cmd_status() {
   local name="$1"
-  load_box "$name"
-  agent_up
+  load_box "$name" read
+  open_read_door "$name"
   probe
   echo "$name: $(target), $BOX_MODE mode"
   printf '  %-9s %s\n' tools "sage-runtime $found_sage_runtime, trellis-crm $found_trellis_crm$([[ "$BOX_AI_UI" == 1 ]] && echo ", ai-ui $found_ai_ui")"
   printf '  %-9s %s\n' vm "${found_vm:-none} (docker context ${found_context:-none})"
   printf '  %-9s %s\n' boot "$found_boot, autorestart ${found_autorestart:-?}, sleep ${found_sleep:-?}"
-  [[ "$BOX_MODE" == peer ]] || printf '  %-9s %s\n' trellis "$found_trellis, profile ${found_profile:-?}${found_source:+, from $found_source}, nightly backup $found_backup_daemon"
+  printf '  %-9s %s\n' ups "$found_ups"
+  if [[ "$BOX_MODE" != peer ]]; then
+    printf '  %-9s %s\n' trellis "$found_trellis, profile ${found_profile:-?}${found_source:+, from $found_source}"
+    printf '  %-9s %s\n' nightly "$(backup_words)"
+  fi
   [[ "$BOX_AI_UI" != 1 ]] || printf '  %-9s %s\n' ai-ui "$found_aiui"
   if [[ -n "$BOX_BACKUP_DIR" ]]; then
     local last; last="$(ls -t "$BOX_BACKUP_DIR"/*.age 2>/dev/null | head -1 || true)"
     printf '  %-9s %s\n' backups "${last:-none pulled yet} in $BOX_BACKUP_DIR"
   fi
+  printf '  %-9s %s\n' window "$(window_state "$name")"
 }
 
 # --- mailboxes -----------------------------------------------------------------------
@@ -611,9 +1438,9 @@ quoted() {
 }
 
 mailbox_box() {
-  load_box "$1"
+  load_box "$1" admin
   [[ "$BOX_MODE" != peer ]] || die "a peer box runs no Trellis, so it has no mailboxes"
-  agent_up
+  open_admin_door "$1"
 }
 
 # Every mailbox command but secret goes through as typed. stdin stays here:
@@ -677,12 +1504,74 @@ cmd_mailbox_secret() {
       printf '%s' "$password" | "${put[@]}" || { unset password; die "the vault refused $vault; nothing reached the box"; }
     fi
   fi
-  printf '%s' "$password" | remote "trellis-crm mailbox secret $(printf '%q' "$mailbox") --stdin" || status=$?
+  printf '%s' "$password" | remote_stdin "trellis-crm mailbox secret $(printf '%q' "$mailbox") --stdin" || status=$?
   unset password
   if [[ $status != 0 && -n "$vault" ]]; then
     echo "The vault holds it as bw:$vault. Send it again: $PROG $name mailbox secret$(quoted "$mailbox") --from bw:$vault" >&2
   fi
   return "$status"
+}
+
+# --- the read key and the window ------------------------------------------------------
+
+# One read verb through the read key, its output as the box gave it.
+cmd_read() {
+  local name="$1" verb="${2:-}"
+  [[ $# -eq 2 && " $READ_VERBS " == *" $verb "* ]] || die "read takes one verb: $READ_VERBS"
+  load_box "$name" read
+  open_read_door "$name"
+  read_remote "$name" "$verb"
+}
+
+# A window: a fresh key in $UNLOCK_DIR/<box>, and a certificate for it that the
+# person's FIDO CA signs ($SAGE_BOX_CA, a touch). The box checks the principal,
+# the address and the expiry; this Mac only picks the door.
+cmd_unlock() {
+  local name="$1" hours=$DEFAULT_HOURS dir ca_type ca_key id end
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hours) [[ $# -ge 2 ]] || die "--hours needs a number of hours, 1 to $MAX_HOURS"; hours="$2"; shift 2 ;;
+      *) die "unlock takes --hours N and nothing else" ;;
+    esac
+  done
+  # A longer window is refused, never trimmed: whoever asked for six hours decides again.
+  [[ "$hours" =~ ^[0-9]$ && $hours -ge 1 && $hours -le $MAX_HOURS ]] || die "--hours takes a whole number from 1 to $MAX_HOURS; '$hours' is refused, not trimmed"
+  load_box "$name" none
+  [[ -n "$BOX_OPERATORS" ]] || die "$(box_file "$name") needs BOX_OPERATORS: the certificate holds the window to those addresses"
+  [[ -n "${SAGE_BOX_CA:-}" ]] || die "SAGE_BOX_CA names your FIDO CA key's handle, such as ~/.ssh/sage-box-ca (docs/boxes/access.md)"
+  [[ -f "$SAGE_BOX_CA" && -f "$SAGE_BOX_CA.pub" ]] || die "SAGE_BOX_CA: no key handle and .pub at $SAGE_BOX_CA"
+  read -r ca_type ca_key _ < "$SAGE_BOX_CA.pub" || true
+  is_sk_type "$ca_type" || die "$SAGE_BOX_CA is a ${ca_type:-empty} key. A window CA lives on a FIDO device (ed25519-sk or ecdsa-sk), so each window takes a touch"
+  grep -qsF " $ca_key" "$CA_DIR"/*.pub || die "$SAGE_BOX_CA.pub is not in $CA_DIR, so no box trusts it. Copy it there, then a person runs: $PROG $name --as-me --apply"
+  dir="$UNLOCK_DIR/$name"
+  mkdir -p "$dir"
+  chmod 700 "$UNLOCK_DIR" "$dir"
+  close_master window
+  rm -f "$dir/key" "$dir/key.pub" "$dir/key-cert.pub"
+  ssh-keygen -q -t ed25519 -N '' -C "sage-window:$name" -f "$dir/key" || die "ssh-keygen could not make the window's key"
+  chmod 600 "$dir/key"
+  id="$(id -un)-$name-$(date -u +%Y%m%dT%H%M%SZ)"
+  echo "Signing a $hours-hour window for $name with $SAGE_BOX_CA. Touch the key when it blinks."
+  # -O clear: no forwarding and no terminal; source-address: the operators only.
+  # The box's CA line says the same, so the box holds the line either way.
+  if ! ssh-keygen -q -s "$SAGE_BOX_CA" -I "$id" -n "$WINDOW_PRINCIPAL" -V "+${hours}h" -O clear -O "source-address=$BOX_OPERATORS" "$dir/key.pub"; then
+    rm -f "$dir/key" "$dir/key.pub" "$dir/key-cert.pub"
+    die "the CA did not sign (no touch, or the key is not plugged in); $name stays locked"
+  fi
+  chmod 600 "$dir/key-cert.pub"
+  end="$(window_end "$name")" || die "the new certificate is not valid now; check this Mac's clock"
+  echo "$name: window open until $(date -r "$end" +%H:%M) (key ID $id). Admin verbs use it. Close it early: $PROG $name lock"
+}
+
+# Ends the window now: its key goes, and so does the connection it opened.
+cmd_lock() {
+  local name="$1" dir="$UNLOCK_DIR/$1"
+  load_box "$name" none
+  close_master window
+  rm -f "$dir/key" "$dir/key.pub" "$dir/key-cert.pub"
+  rmdir "$dir" 2>/dev/null || true
+  echo "$name: locked."
 }
 
 cmd_local() {
@@ -707,18 +1596,31 @@ case "$name" in
   version|--version|-v) echo "$PROG $VERSION"; exit 0 ;;
   local) cmd_local; exit 0 ;;
 esac
+# The name becomes a file name here and a tag on the box: nothing that walks paths.
+[[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "a box name is letters, digits, - and _: $name"
+THE_BOX="$name"
 shift
+# --as-me stands right after the box, for any admin verb.
+if [[ "${1:-}" == --as-me ]]; then AS_ME=1; shift; fi
 sub="${1:-}"
 case "$sub" in
-  update) cmd_update "$name" ;;
+  update)
+    shift
+    [[ $# -eq 0 || ( $# -eq 1 && "$1" == --as-me ) ]] || die "update takes --as-me only"
+    [[ $# -eq 0 ]] || AS_ME=1
+    cmd_update "$name" ;;
   backup) shift; cmd_backup "$name" "$@" ;;
   status) cmd_status "$name" ;;
+  read) shift; cmd_read "$name" "$@" ;;
+  unlock) shift; cmd_unlock "$name" "$@" ;;
+  lock) cmd_lock "$name" ;;
   mailbox) shift; cmd_mailbox "$name" "$@" ;;
-  ""|--apply|--reboot)
+  ""|--apply|--reboot|--as-me)
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --apply)  APPLY=1 ;;
         --reboot) REBOOT=1 ;;
+        --as-me)  AS_ME=1 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
       esac
       shift
