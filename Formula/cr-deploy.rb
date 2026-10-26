@@ -4,7 +4,6 @@ class CrDeploy < Formula
   desc "Deploy to CapRover by digest, check the new version answers, roll back"
   homepage "https://github.com/Sage-is/homebrew-apps"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/cr-deploy-v0.1.0.tar.gz"
-  version "0.1.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 

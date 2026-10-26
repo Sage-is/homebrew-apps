@@ -2,7 +2,6 @@ class Mdprose < Formula
   desc "Markdown prose hygiene: unwrap hard-wrapped paragraphs, strip stray whitespace"
   homepage "https://github.com/Sage-is/homebrew-apps"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/mdprose-v1.0.0.tar.gz"
-  version "1.0.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 

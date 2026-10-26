@@ -4,7 +4,6 @@ class SageTunnel < Formula
   desc "Cloudflare tunnels with fixed hostnames; connector tokens never reach the screen"
   homepage "https://github.com/Sage-is/homebrew-apps"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/sage-tunnel-v0.1.0.tar.gz"
-  version "0.1.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 

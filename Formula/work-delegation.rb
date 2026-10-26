@@ -2,7 +2,6 @@ class WorkDelegation < Formula
   desc "Hand file edits to cheaper models and review the diff: delegate-edit"
   homepage "https://github.com/Sage-is/work-delegation"
   url "https://github.com/Sage-is/work-delegation/archive/refs/tags/v0.1.0.tar.gz"
-  version "0.1.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "AGPL-3.0-only"
 

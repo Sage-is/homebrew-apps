@@ -2,7 +2,6 @@ class Comicreel < Formula
   desc "Make any movie a comic. Make any comic a movie"
   homepage "https://github.com/Sage-is/comicreel"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/comicreel-v0.1.0.tar.gz"
-  version "0.1.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "AGPL-3.0-or-later"
 
