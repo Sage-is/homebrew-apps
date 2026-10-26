@@ -32,14 +32,24 @@
 .Cm lock
 .Nm
 .Ar box
-.Op Fl -as-me
 .Cm backup
-.Op Fl -nightly
+.Op Fl -init | Fl -nightly
 .Nm
 .Ar box
 .Op Fl -as-me
 .Cm mailbox
 .Ar args ...
+.Nm
+.Ar box
+.Op Fl -as-me
+.Cm manage
+.Ar command
+.Op Ar args ...
+.Nm
+.Ar box
+.Op Fl -as-me
+.Cm tunnel install
+.Fl -env-file Ar path
 .Nm
 .Ar box
 .Cm mailbox secret
@@ -95,6 +105,14 @@ and its one IdentityFile is the read key's public half. The box's
 line forces the key through the read dispatcher, which answers a fixed list of
 verbs. A box that refuses the key gets a message saying how to install it;
 nothing falls back to the admin key.
+.It backup
+.Ev BOX_BACKUP_KEY ,
+a second ed25519 key in the vault, for
+.Cm backup
+alone. ssh runs as for the read key. The box's line forces the key through
+rrsync, read-only, in the staging folder
+.Pa ~/.sage-is/backups/trellis-crm/current ;
+it can write nothing and read nothing else.
 .It window
 A certificate that
 .Cm unlock
@@ -115,8 +133,9 @@ Admin verbs
 .Po
 .Fl -apply ,
 .Cm update ,
-.Cm backup ,
-.Cm mailbox
+.Cm mailbox ,
+.Cm manage ,
+.Cm tunnel install
 .Pc
 take the first of window, me and legacy that is there. With none, the run
 stops before it asks the vault for anything:
@@ -146,10 +165,18 @@ root's files.
 .It keys
 Tagged lines in the box user's
 .Pa authorized_keys :
-the read key, forced through the dispatcher, and one
+the read key, forced through the dispatcher; the backup key, when the box file
+names one, forced through
+.Pa ~/.sage-is/bin/sage-box-rrsync ,
+which this step writes beside it; and one
 .Li cert-authority
 line per CA in
 .Pa ~/.sage-is/ca .
+That script runs brew's rrsync with brew's rsync: as brew ships it, rrsync
+starts
+.Pa /usr/bin/rsync ,
+which on macOS is openrsync and refuses rrsync's
+.Li --confine-root .
 Both carry
 .Li restrict
 and
@@ -169,7 +196,12 @@ the Sage.is and krunkit taps; install
 and, when
 .Ev BOX_AI_UI
 is 1,
-.Nm ai-ui .
+.Nm ai-ui ;
+brew's
+.Nm rsync
+when the box file names a backup key, and
+.Nm cloudflared
+when it names a tunnel.
 A box without Homebrew gets its signed package first.
 .It runtime
 A new Colima VM (krunkit on Apple Silicon) when there is none;
@@ -208,8 +240,14 @@ go into the settings file first. Then
 when the box runs AI-UI.
 .It backups
 A LaunchDaemon on the box runs
-.Li trellis-crm backup
-nightly at 02:00.
+.Li trellis-crm backup --dir ~/.sage-is/backups/trellis-crm/current
+nightly at 02:00. An older one is installed again. When the box's trellis-crm
+has no
+.Li backup --dir ,
+.Fl -apply
+stops here and names
+.Cm update
+as the fix.
 .It verify
 Both apps answer their health checks. When the box runs AI-UI,
 .Li sage-ai
@@ -238,19 +276,57 @@ joins
 again; then verify.
 The first step that fails stops the run.
 .It Cm backup
-Pull the box's newest backup archive, encrypt it with
-.Xr age 1
-to
-.Ev BOX_BACKUP_TO ,
-store it in
+Attach the encrypted sparse bundle
 .Ev BOX_BACKUP_DIR
-and keep the last 14. The private half of the age key lives in the vault.
+at
+.Pa ~/.sage-is/box-backups/<box>
+with its passphrase from the vault on stdin, pull the box's staging folder
+through the backup key with brew's rsync into a snapshot named by the time,
+then detach it. Only what changed crosses the network; every unchanged file is
+a hard link to the snapshot before. A pull that breaks off leaves
+.Pa <time>.partial ,
+which the next pull finishes;
+.Pa latest
+moves only after a pull ends well. Thinning keeps every snapshot of the last 2
+days, then the newest of each day to 30 days, then the newest of each week to
+a year.
+.It Cm backup Fl -init
+Make the bundle: APFS, AES-256, sparse. Its passphrase is made here, stored
+first with
+.Li sage-secret put Ar item Li --stdin
+under the item
+.Ev BOX_BACKUP_SPARSE
+names, then handed to
+.Li hdiutil create -stdinpass .
+An item that exists is never replaced.
 .It Cm backup Fl -nightly
 Install a launchd agent on this Mac that runs
 .Cm backup
-at 03:30, after the box's own run.
+at 03:30, after the box's own run. It checks that the box file names the
+backup key, the passphrase and the bundle.
+.It Cm manage Ar command Op Ar args ...
+Run
+.Li trellis-crm manage
+on the box, every argument as typed, its exit code back. The box runs
+.Cm seed_profile ,
+.Cm loaddata Ar name
+and
+.Cm import_sheet Pa /app/file.csv Fl -sheet Ar name Op Fl -create ,
+and refuses anything else with exit 2.
+.It Cm tunnel install Fl -env-file Ar path
+Send the env file
+.Xr sage-tunnel 1
+wrote, which holds the token, to
+.Pa ~/.sage-is/tunnels/<name>.env
+on the box on stdin, mode 600, then have the root helper load the tunnel's
+LaunchDaemon. The file holds only
+.Li NAME=value
+lines with plain values and a
+.Ev CLOUDFLARED_TUNNEL_TOKEN ;
+a bad line is named by its number, never printed.
 .It Cm status
-Tools, VM, boot daemon, both apps, the newest backup pulled, and the window:
+Tools, VM, boot daemon, both apps, the tunnel, the age of the newest snapshot
+on this Mac, and the window:
 .Dq open until 14:32
 or
 .Dq locked .
@@ -309,7 +385,8 @@ KiB:
 (what the dry run reads),
 .Cm backup
 (the last 50 lines of the backup log, the backup folder's dates, sizes and
-names, and the LaunchDaemon's state),
+names, the staging folder's database date and size and its artifact count,
+and the LaunchDaemon's state),
 .Cm power
 .Pq Li pmset -g , pmset -g ps , uptime , No last boot ,
 .Cm containers
@@ -348,6 +425,7 @@ Its verbs:
 .Cm power ,
 .Cm boot-daemon ,
 .Cm backup-daemon ,
+.Cm tunnel-daemon ,
 .Cm docker-sock ,
 .Cm reboot .
 Only the access step uses the login password, once, to install the helper.
@@ -372,7 +450,16 @@ Box file settings beyond the example's comments:
 .Ev BOX_OPERATORS
 (the addresses operators reach boxes from, such as
 .Li 100.64.0.0/10 ) ,
-and, on the legacy door only,
+.Ev BOX_BACKUP_KEY
+.Pq Li bw:<box>-backup-key ,
+.Ev BOX_BACKUP_SPARSE
+.Pq Li bw:<box>-backup-sparse ,
+.Ev BOX_BACKUP_DIR
+(the bundle's absolute path, ending in
+.Pa .sparsebundle ;
+it may hold spaces),
+.Ev BOX_TUNNEL
+(the tunnel's name), and, on the legacy door only,
 .Ev BOX_SSH_KEY
 and
 .Ev BOX_SUDO .
@@ -387,8 +474,13 @@ The window's key and certificate; folder 700, key 600.
 .It Pa ~/.sage-is/ssh/
 Shared-connection sockets and the read key's public half; mode 700.
 .It Pa ~/Library/LaunchAgents/is.sage.box-backup-<box>.plist
-The nightly pull on this Mac. It runs unattended, so it needs the legacy key
-until boxes have an ops key.
+The nightly pull on this Mac, through the backup key.
+.It Pa ~/.sage-is/box-backups/<box>
+Where the bundle is attached during a pull.
+.It Pa ~/.sage-is/box-backups/<box>.last
+The newest snapshot's name, which
+.Cm status
+reads without the passphrase.
 .El
 .Pp
 On the box, all root's:
@@ -397,10 +489,17 @@ and
 .Pa /usr/local/libexec/sage-box/root
 (755), and
 .Pa /etc/sudoers.d/sage-box
-(440).
+(440). The box user's:
+.Pa ~/.sage-is/bin/sage-box-rrsync
+(700), the backup key's door, and
+.Pa ~/.sage-is/tunnels/<name>.env
+(600), the tunnel's token.
 .Sh SEE ALSO
+.Xr hdiutil 1 ,
+.Xr rsync 1 ,
 .Xr sage-runtime 1 ,
 .Xr sage-secret 1 ,
+.Xr sage-tunnel 1 ,
 .Xr ssh-keygen 1 ,
 .Xr trellis-crm 1 ,
 .Xr sshd 8

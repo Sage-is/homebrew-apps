@@ -60,6 +60,8 @@ SAGE_PROJECTS="${SAGE_CONFIG_DIR}/projects"
 TRELLIS_REMOTE="Sage-is/trellis"
 # The repo is private: SSH, so a read-only deploy key is all a box needs.
 TRELLIS_CLONE_URL="${TRELLIS_CLONE_URL:-git@github.com:Sage-is/trellis.git}"
+# The manage.py commands `manage` runs, each with its own shape of arguments.
+MANAGE_USAGE="manage seed_profile | loaddata NAME | import_sheet /app/FILE.csv --sheet NAME [--create]"
 
 usage() {
   cat <<EOF
@@ -78,6 +80,10 @@ Commands:
   open                  Open Trellis in your browser
   backup [--to DIR]     Copy the database and artifacts into one .tar.gz
                         (default: $BACKUP_DIR)
+  backup --dir DIR      Refresh one folder instead: DIR/trellis.sqlite3, kept
+                        as it was when nothing changed, and DIR/artifacts, which
+                        gains only the artifacts it lacks. A pull with rsync
+                        then copies only what changed
   restore FILE [--yes]  Replace the record with a backup (the current one is backed up first)
   boot   [--print|--remove]
                         Start Colima at power-on with nobody signed in (asks for sudo)
@@ -89,6 +95,10 @@ Commands:
                         mail. The password comes on stdin, never as an argument;
                         at a terminal it is asked for without echo. The exit
                         code is the command's
+  $MANAGE_USAGE
+                        One of a fixed few of Trellis's manage.py commands, in
+                        the container. Anything else is refused with exit 2;
+                        the exit code is otherwise the command's
   nuke   [--dry-run] [--yes] [--force]
                         Remove Trellis and its record from this machine
   dev    [--dir DIR] [--port PORT] [--profile NAME] [--env-file FILE]
@@ -786,18 +796,26 @@ cmd_open() {
 }
 
 # A consistent copy while Trellis runs: SQLite's backup API copies the
-# database, then the copy and the artifacts leave as one .tar.gz.
+# database, then the copy and the artifacts leave as one .tar.gz. With --dir,
+# one folder is refreshed instead (backup_into).
 cmd_backup() {
-  local dir="$BACKUP_DIR" file
+  local dir="$BACKUP_DIR" file into="" to=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --to) dir="$2"; shift 2 ;;
+      --to)  [[ $# -ge 2 && -n "$2" ]] || { echo "Error: --to needs a folder"; exit 1; }; to="$2"; shift 2 ;;
+      --dir) [[ $# -ge 2 && -n "$2" ]] || { echo "Error: --dir needs a folder"; exit 1; }; into="$2"; shift 2 ;;
       *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
+  [[ -z "$to" || -z "$into" ]] || { echo "Error: --to makes an archive and --dir refreshes a folder: pick one"; exit 1; }
+  dir="${to:-$dir}"
   if ! container_running; then
     echo "Trellis is not running; the backup reads through it. Start it first: $PROG start"
     exit 1
+  fi
+  if [[ -n "$into" ]]; then
+    backup_into "$into"
+    return
   fi
 
   mkdir -p "$dir"
@@ -817,6 +835,133 @@ PY
   (umask 077 && docker exec "$CONTAINER" tar -czf - -C /tmp/backup trellis.sqlite3 -C /data artifacts > "$file")
   docker exec "$CONTAINER" rm -rf /tmp/backup
   echo "Backed up to $file ($(du -h "$file" | cut -f1))"
+}
+
+# In the container: a copy of the database through SQLite's backup API, checked,
+# then written to stdout. A missing database is an error: connect would make an
+# empty one, and the backup would look like a good one. The paths come as
+# arguments. It runs on the image's Python, so nothing newer than 3.9.
+DB_COPY_PY='import os, shutil, sqlite3, sys, tempfile
+source_path = sys.argv[1]
+if not os.path.isfile(source_path):
+    sys.exit("trellis-crm backup: no database at " + source_path)
+fd, copy_path = tempfile.mkstemp(suffix=".sqlite3")
+os.close(fd)
+try:
+    source = sqlite3.connect(source_path)
+    copy = sqlite3.connect(copy_path)
+    source.backup(copy)
+    source.close()
+    check = copy.execute("PRAGMA quick_check").fetchone()[0]
+    copy.close()
+    if check != "ok":
+        sys.exit("trellis-crm backup: the copy failed its quick_check: " + check)
+    with open(copy_path, "rb") as f:
+        shutil.copyfileobj(f, sys.stdout.buffer)
+finally:
+    os.unlink(copy_path)
+'
+
+# In the container: a tar stream on stdout of every artifact under the folder
+# in argv[1] whose name is not on stdin (NUL-separated, relative). Artifacts
+# are content-addressed, <sha[:2]>/<sha>, so a name never changes its bytes.
+# Regular files only, never a link.
+NEW_ARTIFACTS_PY='import os, sys, tarfile
+root = sys.argv[1]
+have = set(name for name in sys.stdin.buffer.read().split(b"\0") if name)
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as tar:
+    for folder, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(folder, name)
+            rel = os.path.relpath(path, root)
+            if os.path.islink(path) or not os.path.isfile(path) or os.fsencode(rel) in have:
+                continue
+            tar.add(path, arcname=rel)
+'
+
+# One folder that a pull with rsync copies cheaply, refreshed in place:
+#   DIR/trellis.sqlite3  a checked copy from SQLite's backup API. When it equals
+#                        the copy already there, that one stays, with its time,
+#                        so a pull finds nothing new.
+#   DIR/artifacts/       gains only the artifacts it lacks, and keeps the rest.
+# What is new lands first in a folder beside DIR, never in it, and each file
+# moves into place whole: a name in DIR always holds the whole file, so a run
+# that fails leaves nothing half-copied that the next run would take as done.
+# DIR's own time changes last, on success only: sage-box reads it as the time
+# of the last good backup.
+backup_into() {
+  local dir="$1" tmp db_said found new=0 total
+  umask 077
+  mkdir -p "$dir/artifacts"
+  dir="$(cd "$dir" && pwd)"
+  [[ "$dir" != / ]] || { echo "Error: --dir needs a folder of its own, not /"; exit 1; }
+  tmp="$(mktemp -d "$dir.incoming.XXXXXX")"
+  BACKUP_TMP="$tmp"
+  trap 'rm -rf "$BACKUP_TMP"' EXIT
+  if ! docker exec "$CONTAINER" python -c "$DB_COPY_PY" /data/trellis.sqlite3 > "$tmp/trellis.sqlite3"; then
+    echo "Error: the database copy failed; $dir is as it was."
+    exit 1
+  fi
+  if cmp -s "$tmp/trellis.sqlite3" "$dir/trellis.sqlite3"; then
+    db_said="unchanged, kept"
+  else
+    mv "$tmp/trellis.sqlite3" "$dir/trellis.sqlite3"
+    db_said="a new copy"
+  fi
+  mkdir "$tmp/artifacts"
+  # The names DIR holds, as the container names them: relative, NUL-separated.
+  (cd "$dir/artifacts" && find . -type f -print0) | while IFS= read -r -d '' found; do printf '%s\0' "${found#./}"; done > "$tmp/have"
+  if ! docker exec -i "$CONTAINER" python -c "$NEW_ARTIFACTS_PY" /data/artifacts < "$tmp/have" | tar -xf - -C "$tmp/artifacts"; then
+    echo "Error: copying the new artifacts failed; $dir keeps the ones it had, each whole."
+    exit 1
+  fi
+  while IFS= read -r -d '' found; do
+    found="${found#./}"
+    mkdir -p "$dir/artifacts/$(dirname "$found")"
+    mv "$tmp/artifacts/$found" "$dir/artifacts/$found"
+    new=$((new + 1))
+  done < <(cd "$tmp/artifacts" && find . -type f -print0)
+  rm -rf "$tmp"
+  trap - EXIT
+  touch "$dir"
+  total="$(find "$dir/artifacts" -type f | wc -l | tr -d ' ')"
+  echo "Backed up to $dir: the database ($db_said, $(du -h "$dir/trellis.sqlite3" | cut -f1)), $new new artifact(s), $total in all"
+}
+
+# A fixed few of Trellis's manage.py commands, for a box where an agent runs
+# them through sage-box: each command and the shape of its arguments is
+# checked here, and anything else is refused with exit 2, before Docker hears
+# of it. The arguments reach docker exec as an array: no shell reads them.
+#   seed_profile                                  the active profile's lookups
+#   loaddata NAME                                 a fixture by name, never a path
+#   import_sheet /app/FILE.csv --sheet NAME [--create]
+#                                                 a CSV in the code folder (/app)
+refuse_manage() {
+  echo "Error: $PROG refuses that: $1. It runs only: $MANAGE_USAGE" >&2
+  exit 2
+}
+
+cmd_manage() {
+  local fixture_re='^[A-Za-z0-9][A-Za-z0-9_-]*$' sheet_re='^[A-Za-z0-9][A-Za-z0-9 ._-]*$' file_re='^/app/[A-Za-z0-9_./-]+\.csv$'
+  case "${1:-}" in
+    seed_profile)
+      [[ $# -eq 1 ]] || refuse_manage "seed_profile takes no arguments" ;;
+    loaddata)
+      [[ $# -eq 2 && "$2" =~ $fixture_re ]] || refuse_manage "loaddata takes one fixture name: letters, digits, _ and -" ;;
+    import_sheet)
+      [[ ( $# -eq 4 || ( $# -eq 5 && "${5:-}" == --create ) ) && "$3" == --sheet ]] ||
+        refuse_manage "import_sheet takes /app/FILE.csv --sheet NAME, then --create or nothing"
+      [[ "$2" =~ $file_re && "$2" != *..* ]] || refuse_manage "the file is a .csv under /app/, with no .. in its path"
+      [[ "$4" =~ $sheet_re ]] || refuse_manage "a sheet name is letters, digits, spaces, . _ and -" ;;
+    # Never echo it: the refusal should not carry what someone typed to the terminal.
+    *) refuse_manage "no such command here" ;;
+  esac
+  if ! container_running; then
+    echo "Trellis is not running; manage.py runs in its container. Start it first: $PROG start" >&2
+    exit 1
+  fi
+  exec docker exec "$CONTAINER" python manage.py "$@"
 }
 
 cmd_restore() {
@@ -1026,7 +1171,7 @@ set -- ${args[@]+"${args[@]}"}
 if [[ "$(uname)" == Darwin ]]; then
   case "$command" in
     start|update|restore|dev)               select_runtime ask ;;
-    stop|status|logs|backup|boot|nuke|mailbox) select_runtime ;;
+    stop|status|logs|backup|boot|nuke|mailbox|manage) select_runtime ;;
   esac
 fi
 
@@ -1040,6 +1185,7 @@ case "$command" in
   backup)  cmd_backup "$@" ;;
   restore) cmd_restore "$@" ;;
   mailbox) cmd_mailbox "$@" ;;
+  manage)  cmd_manage "$@" ;;
   boot)    cmd_boot "$@" ;;
   nuke)    cmd_nuke "$@" ;;
   dev)     cmd_dev "$@" ;;

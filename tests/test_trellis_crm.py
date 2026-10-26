@@ -9,6 +9,7 @@ import pty
 import pwd
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -46,7 +47,11 @@ DATA_DISK = ("# krunkit puts the data disk on vdc, where Lima 2.2 looks for vdb;
 # number in $STATE/rm-fails is how many `volume rm` calls fail before one works,
 # as when a container just removed still holds the volume. `exec ... manage.py
 # mailbox` writes its argv NUL-separated to $STATE/exec-argv and a digest of its
-# stdin, never the bytes, to $STATE/exec-stdin, and exits with $STATE/mailbox-exit.
+# stdin, never the bytes, to $STATE/exec-stdin, and exits with $STATE/mailbox-exit;
+# any other manage.py command writes its argv there too and exits with
+# $STATE/manage-exit. `exec ... python -c SCRIPT ARGS` runs SCRIPT here, as the
+# container would, with $STATE/data standing in for /data; with
+# $STATE/fail-artifacts, a tar stream stops after 2 KiB and the exec fails.
 STUBS = {
     # Like docker: --context, else DOCKER_CONTEXT, else the saved context.
     "docker": """ctx="${DOCKER_CONTEXT:-$(cat "$STATE/current-context" 2>/dev/null || echo default)}"
@@ -83,6 +88,21 @@ case "$1 ${2:-}" in
       shasum -a 256 | cut -d' ' -f1 > "$STATE/exec-stdin"
       [[ " $* " != *" --stdin "* ]] || echo stored
       exit "$(cat "$STATE/mailbox-exit" 2>/dev/null || echo 0)"
+    fi
+    if [[ "$*" == "exec trellis-crm python manage.py "* ]]; then
+      printf '%s\\0' "$@" > "$STATE/exec-argv"
+      exit "$(cat "$STATE/manage-exit" 2>/dev/null || echo 0)"
+    fi
+    if [[ " $* " == *" python -c "* ]]; then
+      run=(); after=0
+      for a in "$@"; do
+        if [[ $after == 1 ]]; then
+          case "$a" in /data*) a="$STATE$a" ;; esac
+          run+=("$a")
+        elif [[ "$a" == python ]]; then after=1; fi
+      done
+      if [[ -e "$STATE/fail-artifacts" && "$*" == *tarfile* ]]; then python3 "${run[@]}" | head -c 2048; exit 1; fi
+      exec python3 "${run[@]}"
     fi
     if [[ "$2" == -i ]]; then cat > /dev/null; fi
     if [[ "$*" == *" tar "* ]]; then printf 'TARDATA'; fi ;;
@@ -1291,6 +1311,185 @@ class Mailboxes(Mac):
         usage = self.ok("--help").stdout
         self.assertIn("mailbox list | add NAME ... | check NAME | enable NAME | disable NAME", usage)
         self.assertIn("mailbox secret NAME (--stdin | --clear)", usage)
+
+
+class Manage(Mac):
+    """trellis-crm manage: a fixed few of Trellis's manage.py commands, each in its own shape; the rest refused with 2."""
+
+    PREFIX = ["exec", "trellis-crm", "python", "manage.py"]
+
+    def setUp(self):
+        super().setUp()
+        self.ok("start")
+
+    def container_argv(self):
+        path = self.state / "exec-argv"
+        return path.read_text().split("\0")[:-1] if path.exists() else None
+
+    def test_the_allowed_commands_reach_the_container_as_typed(self):
+        for args in (["seed_profile"], ["loaddata", "isa_page44"],
+                     ["import_sheet", "/app/crm/fixtures/sheet-sample.csv", "--sheet", "pilot"],
+                     ["import_sheet", "/app/team.csv", "--sheet", "Ops sheet 2.b", "--create"]):
+            with self.subTest(args=args):
+                (self.state / "exec-argv").unlink(missing_ok=True)
+                self.ok("manage", *args)
+                self.assertEqual(self.container_argv(), self.PREFIX + args)
+
+    def test_anything_else_is_refused_with_2_before_docker_hears_of_it(self):
+        marker = self.root / "ran"
+        before = len(self.calls())
+        for args in ((), ("",), ("migrate",), ("shell",), ("createsuperuser",), ("mailbox", "list"), ("SEED_PROFILE",),
+                     ("seed_profile", "--settings=x"), (f"seed_profile; touch {marker}",), (f"$(touch {marker})",),
+                     ("loaddata",), ("loaddata", "a", "b"), ("loaddata", "../etc/passwd"), ("loaddata", "/app/x.json"),
+                     ("loaddata", "--help"), ("loaddata", "x.json"), ("loaddata", "a b"), ("loaddata", "hunter2;id"),
+                     ("import_sheet",), ("import_sheet", "/app/x.csv"), ("import_sheet", "/app/x.csv", "--sheet"),
+                     ("import_sheet", "/data/x.csv", "--sheet", "p"), ("import_sheet", "/app/../data/x.csv", "--sheet", "p"),
+                     ("import_sheet", "/app/a..b.csv", "--sheet", "p"), ("import_sheet", "app/x.csv", "--sheet", "p"),
+                     ("import_sheet", "/app/x.txt", "--sheet", "p"), ("import_sheet", "/app/x y.csv", "--sheet", "p"),
+                     ("import_sheet", "/app/x.csv", "--create", "--sheet", "p"), ("import_sheet", "/app/x.csv", "--sheet", "p", "--force"),
+                     ("import_sheet", "/app/x.csv", "--sheet", "-p"), ("import_sheet", "/app/x.csv", "--sheet", "p", "--create", "--create"),
+                     ("import_sheet", "/app/x.csv", "--sheet", "p$(id)")):
+            with self.subTest(args=args):
+                result = self.run_cli("manage", *args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("It runs only: manage seed_profile | loaddata NAME | import_sheet /app/FILE.csv", result.stderr)
+                self.assertNotIn("hunter2", result.stderr, "a refusal never echoes what was typed")
+        self.assertFalse(marker.exists())
+        self.assertFalse([c for c in self.calls()[before:] if " exec " in c], "docker never heard of a refused command")
+        self.assertIsNone(self.container_argv())
+
+    def test_the_exit_code_comes_back(self):
+        for code in (0, 1, 3):
+            with self.subTest(code=code):
+                (self.state / "manage-exit").write_text(str(code))
+                self.assertEqual(self.run_cli("manage", "seed_profile").returncode, code)
+
+    def test_it_needs_trellis_running(self):
+        self.ok("stop")
+        result = self.run_cli("manage", "seed_profile")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Start it first", result.stderr)
+        self.assertIsNone(self.container_argv())
+
+    def test_usage_lists_it(self):
+        self.assertIn("manage seed_profile | loaddata NAME | import_sheet /app/FILE.csv --sheet NAME [--create]", self.ok("--help").stdout)
+
+
+class BackupDir(Mac):
+    """backup --dir: one folder refreshed in place, so that a pull with rsync finds only what changed.
+    The container's python runs here, with $STATE/data as its /data."""
+
+    def setUp(self):
+        super().setUp()
+        self.ok("start")
+        self.data = self.state / "data"
+        (self.data / "artifacts").mkdir(parents=True)
+        self.write_db("first")
+        self.artifact("aa", "one")
+        self.artifact("bb", "two")
+        self.dir = self.backups / "current"
+
+    def write_db(self, value):
+        con = sqlite3.connect(self.data / "trellis.sqlite3")
+        con.execute("create table if not exists t (v text)")
+        con.execute("insert into t values (?)", (value,))
+        con.commit()
+        con.close()
+
+    def rows(self):
+        con = sqlite3.connect(self.dir / "trellis.sqlite3")
+        try:
+            return [v for (v,) in con.execute("select v from t order by rowid")]
+        finally:
+            con.close()
+
+    def artifact(self, sha, text):
+        """A content-addressed artifact, as Trellis stores one: artifacts/<sha[:2]>/<sha>."""
+        path = self.data / "artifacts" / sha[:2] / (sha * 16)
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def backup(self):
+        return self.ok("backup", "--dir", str(self.dir)).stdout
+
+    def files(self):
+        """Each file in the folder, by its relative name: (inode, mtime)."""
+        return {str(p.relative_to(self.dir)): (p.stat().st_ino, p.stat().st_mtime_ns) for p in self.dir.rglob("*") if p.is_file()}
+
+    def leftovers(self):
+        return [p.name for p in self.dir.parent.iterdir() if ".incoming." in p.name]
+
+    def test_the_first_run_copies_the_database_and_every_artifact_privately(self):
+        out = self.backup()
+        self.assertEqual(self.rows(), ["first"])
+        names = sorted(str(p.relative_to(self.data / "artifacts")) for p in (self.data / "artifacts").rglob("*") if p.is_file())
+        self.assertEqual(sorted(n for n in self.files() if n.startswith("artifacts/")), [f"artifacts/{n}" for n in names])
+        self.assertEqual((self.dir / "artifacts" / "aa" / ("aa" * 16)).read_text(), "one")
+        for path in self.dir.rglob("*"):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600, path)
+        self.assertIn("the database (a new copy", out)
+        self.assertIn("2 new artifact(s), 2 in all", out)
+        self.assertEqual(self.leftovers(), [])
+        self.assertFalse([c for c in self.calls() if " cp " in c], "never docker cp of the whole folder")
+
+    def test_a_second_run_with_nothing_new_keeps_every_file_as_it_was(self):
+        self.backup()
+        before = self.files()
+        out = self.backup()
+        self.assertEqual(self.files(), before, "same inodes, same times: a pull finds nothing new")
+        self.assertIn("the database (unchanged, kept", out)
+        self.assertIn("0 new artifact(s), 2 in all", out)
+
+    def test_only_new_artifacts_are_copied_and_a_changed_database_replaces_the_copy(self):
+        self.backup()
+        before = self.files()
+        self.artifact("cc", "three")
+        self.write_db("second")
+        out = self.backup()
+        after = self.files()
+        for name in before:
+            if name.startswith("artifacts/"):
+                self.assertEqual(after[name], before[name], f"{name} was copied again")
+        self.assertIn(f"artifacts/cc/{'cc' * 16}", after)
+        self.assertNotEqual(after["trellis.sqlite3"][0], before["trellis.sqlite3"][0])
+        self.assertEqual(self.rows(), ["first", "second"])
+        self.assertIn("the database (a new copy", out)
+        self.assertIn("1 new artifact(s), 3 in all", out)
+
+    def test_a_failed_copy_leaves_no_half_artifact_and_the_folder_time_alone(self):
+        self.backup()
+        os.utime(self.dir, (1_000_000_000, 1_000_000_000))
+        big = self.artifact("dd", "x" * 300_000)
+        (self.state / "fail-artifacts").touch()
+        result = self.run_cli("backup", "--dir", str(self.dir))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("keeps the ones it had, each whole", result.stdout)
+        self.assertFalse((self.dir / "artifacts" / "dd").exists(), "nothing half-copied under a name the next run would skip")
+        self.assertEqual(self.dir.stat().st_mtime, 1_000_000_000, "the folder's time still says when the last good backup ended")
+        self.assertEqual(self.leftovers(), [])
+        (self.state / "fail-artifacts").unlink()
+        self.assertIn("1 new artifact(s), 3 in all", self.backup())
+        self.assertEqual((self.dir / "artifacts" / "dd" / big.name).read_text(), "x" * 300_000)
+        self.assertGreater(self.dir.stat().st_mtime, 1_000_000_000)
+
+    def test_a_missing_database_is_an_error_not_an_empty_copy(self):
+        (self.data / "trellis.sqlite3").unlink()
+        result = self.run_cli("backup", "--dir", str(self.dir))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the database copy failed", result.stdout)
+        self.assertFalse((self.dir / "trellis.sqlite3").exists())
+
+    def test_dir_and_to_are_one_or_the_other(self):
+        for args in (("--dir", str(self.dir), "--to", str(self.home)), ("--dir",), ("--dir", "")):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_cli("backup", *args).returncode, 1)
+        self.assertFalse(self.dir.exists())
+
+    def test_without_dir_the_archive_stays_as_it_was(self):
+        self.ok("backup")
+        self.assertEqual(len(list(self.backups.glob("trellis-crm-*.tar.gz"))), 1)
+        self.assertFalse(self.dir.exists())
 
 
 class Lib(unittest.TestCase):

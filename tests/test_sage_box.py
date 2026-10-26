@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import os
+import plistlib
 import pty
 import re
 import shutil
@@ -33,13 +34,20 @@ FORMULA = TOOL.parent / "Formula" / "sage-box.rb"
 # -S password line, copies the access step's folder to $STATE/installed, and
 # refuses the root helper while $STATE/no-helper exists. logger logs.
 # With $STATE/exec it runs every other script, as the box would, against the
-# stand-in git, brew, trellis-crm, ai-ui and docker, and returns the script's
+# stand-in git, brew, trellis-crm, ai-ui, docker and sudo, and returns the script's
 # exit status; $STATE/fail-<step> makes one stand-in fail. curl answers a health
 # check, until $STATE/no-health exists. With $STATE/hash-stdin, ssh keeps a
 # digest of its stdin and never the bytes, so a test can scan every file for a
 # secret. On the box, trellis-crm mailbox writes its argv NUL-separated to
 # $STATE/mailbox-argv, a digest of its stdin to $STATE/mailbox-stdin, and exits
-# with the code in $STATE/mailbox-exit.
+# with the code in $STATE/mailbox-exit; trellis-crm manage writes its argv to
+# $STATE/manage-argv and exits with $STATE/manage-exit.
+# An ssh that carries `--server` is an rsync's, so the backup key's: sshd's part is played
+# here, which runs the forced command in $STATE/forced with SSH_ORIGINAL_COMMAND
+# set, on the rsync's own stdin and stdout; $STATE/rsync-refused refuses the key.
+# hdiutil keeps a digest of the passphrase create got in $STATE/bundle-pass, and
+# attach refuses any other; attach puts the bundle's volume, a folder inside
+# the bundle, at the mount point as a link, and detach takes it away.
 # sage-secret run resolves bw:ITEM, from --env FILE or the environment, to
 # secret-ITEM (a mail-* item to one with quotes, spaces and a $, a *-read-key
 # item to the real key in $STATE/read-key), logs each setting it resolved to
@@ -47,6 +55,13 @@ FORMULA = TOOL.parent / "Formula" / "sage-box.rb"
 # $STATE/item-ITEM.
 STUBS = {
     "ssh": r'''echo "ssh $*" >> "$STATE/calls"
+case " $* " in
+  *" --server "*)
+    while [ $# -gt 0 ]; do case "$1" in -o|-F|-l|-p|-i) shift 2 ;; -*) shift ;; *) break ;; esac; done
+    shift
+    [ ! -e "$STATE/rsync-refused" ] || { echo "user@100.64.0.9: Permission denied (publickey)." >&2; exit 255; }
+    SSH_ORIGINAL_COMMAND="$*" SSH_CONNECTION="100.64.0.5 51234 100.64.0.9 22" exec /bin/bash -c "$(cat "$STATE/forced")" ;;
+esac
 for a in "$@"; do [ "$a" != -O ] || exit 0; done
 n=$(( $(cat "$STATE/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE/n"
 input="$(cat; printf x)"; input="${input%x}"
@@ -73,7 +88,7 @@ if grep -q 'sudo -S -p' <<< "$script"; then
 fi
 if grep -q 'echo "arch=' <<< "$script"; then answer_probe; exit 0; fi
 if grep -q 'ls -t' <<< "$script"; then [ -e "$STATE/no-backup" ] || echo "/Users/user/.sage-is/backups/trellis-crm/trellis-20261014-020000.tar.gz"; exit 0; fi
-if [ -e "$STATE/exec" ]; then printf '%s' "$input" | bash -c "$(sed 's#/opt/homebrew/bin/brew#/nonexistent/brew#' <<< "$script")"; exit $?; fi
+if [ -e "$STATE/exec" ]; then printf '%s' "$input" | bash -c "$(sed -e 's#/opt/homebrew/bin/brew#/nonexistent/brew#' -e 's#/usr/bin/sudo #sudo #g' <<< "$script")"; exit $?; fi
 exit 0''',
     "ssh-agent": 'case "${1:-}" in -s) echo "SSH_AUTH_SOCK=/tmp/sage-box-test; export SSH_AUTH_SOCK;" ;; esac; echo "ssh-agent $*" >> "$STATE/calls"',
     "ssh-add": r'''echo "ssh-add $*" >> "$STATE/calls"
@@ -104,6 +119,17 @@ exit 0''',
 while [ $# -gt 0 ]; do case "$1" in -r) shift ;; -o) out="$2"; shift ;; *) in="$1" ;; esac; shift; done
 cp "$in" "$out"''',
     "launchctl": 'echo "launchctl $*" >> "$STATE/calls"',
+    "hdiutil": r'''echo "hdiutil $*" >> "$STATE/calls"
+digest() { input="$(cat; printf x)"; printf '%s' "${input%x}" | shasum -a 256 | cut -d' ' -f1; }
+case "$1" in
+  create) digest > "$STATE/bundle-pass"
+          [ ! -e "$STATE/fail-create" ] || { echo "hdiutil: create failed - No space left on device" >&2; exit 1; }
+          mkdir -p "${@: -1}" ;;
+  attach) [ "$(digest)" = "$(cat "$STATE/bundle-pass" 2>/dev/null)" ] || { echo "hdiutil: attach failed - Authentication error" >&2; exit 1; }
+          prev=""; for a in "$@"; do [ "$prev" != -mountpoint ] || mnt="$a"; prev="$a"; done
+          mkdir -p "${@: -1}/volume"; rmdir "$mnt"; ln -s "${@: -1}/volume" "$mnt"; echo "attach $mnt" >> "$STATE/mounts" ;;
+  detach) [ ! -L "$2" ] || { rm "$2"; mkdir "$2"; }; echo "detach $2" >> "$STATE/mounts" ;;
+esac''',
     "sleep": "true",
     "curl": '[ ! -e "$STATE/no-health" ] || exit 22',
     "sage-secret": r'''echo "sage-secret $*" >> "$STATE/calls"
@@ -113,6 +139,7 @@ value_of() {
   case "$item" in
     mail-*) printf '%s' "secret-$item it's \"quoted\" and spaced \$HOME" ;;
     *-read-key) cat "$STATE/read-key" ;;
+    *-backup-key) cat "$STATE/backup-key" ;;
     *) printf '%s' "secret-$item" ;;
   esac
 }
@@ -154,6 +181,9 @@ esac''',
              *) echo "front-desk  imap.example.test  disabled" ;;
            esac
            exit "$(cat "$STATE/mailbox-exit" 2>/dev/null || echo 0)" ;;
+  manage) shift; echo "trellis-crm manage $*" >> "$STATE/calls"
+          printf '%s\0' "$@" > "$STATE/manage-argv"
+          exit "$(cat "$STATE/manage-exit" 2>/dev/null || echo 0)" ;;
 esac''',
     "ai-ui": r'''case "${1:-}" in
   version) echo "ai-ui 3.2.0_2" ;;
@@ -176,6 +206,9 @@ case "${1:-} ${2:-}" in
 esac''',
 }
 
+# A connector token as sage-tunnel writes one: base64 JSON, a, t and s.
+TUNNEL_TOKEN = base64.b64encode(b'{"a":"acct","t":"tunnel-id","s":"c2VjcmV0LXR1bm5lbC1zZWNyZXQ="}').decode()
+
 BARE = {"arch": "arm64", "os": "15.6", "brew": "missing", "sage_runtime": "missing", "trellis_crm": "missing",
         "ai_ui": "missing", "vm": "", "context": "", "boot": "no", "backup_daemon": "no", "autorestart": "0",
         "sleep": "1", "ghcr": "no", "deploy_key": "no", "checkout": "none", "source": "", "profile": "",
@@ -183,13 +216,17 @@ BARE = {"arch": "arm64", "os": "15.6", "brew": "missing", "sage_runtime": "missi
 DONE = {**BARE, "brew": "/opt/homebrew/bin/brew", "sage_runtime": "0.1.0", "trellis_crm": "0.1.1", "ai_ui": "3.2.0_2",
         "vm": "krunkit", "context": "colima", "boot": "yes", "backup_daemon": "yes", "autorestart": "1", "sleep": "0",
         "ghcr": "yes", "deploy_key": "yes", "checkout": "28d5622", "source": "/Users/user/src/trellis",
-        "profile": "realestate", "review_at": "15:00", "shift_end": "18:00", "trellis": "up", "aiui": "up", "aiui_net": "yes"}
+        "profile": "realestate", "review_at": "15:00", "shift_end": "18:00", "trellis": "up", "aiui": "up", "aiui_net": "yes",
+        "backup_dir": "yes"}
 
 BOX = {"BOX_HOST": "100.64.0.9", "BOX_USER": "user", "BOX_SSH_KEY": "bw:pilot-ssh-key", "BOX_SUDO": "bw:pilot-user",
        "BOX_READ_KEY": "bw:pilot-read-key", "BOX_OPERATORS": "100.64.0.0/10",
        "BOX_MODE": "source", "BOX_AI_UI": "1", "BOX_CHECKOUT": "/Users/user/src/trellis",
        "BOX_DEPLOY_KEY": "bw:pilot-deploy", "BOX_GHCR_USER": "octo", "BOX_GHCR_TOKEN": "bw:github-packages-read",
-       "BOX_PROFILE": "realestate", "BOX_REVIEW_AT": "15:00", "BOX_SHIFT_END": "18:00", "BOX_BACKUP_TO": "age1test"}
+       "BOX_PROFILE": "realestate", "BOX_REVIEW_AT": "15:00", "BOX_SHIFT_END": "18:00"}
+# What a box that is backed up nightly adds: the backup key, the bundle's passphrase, and the bundle.
+BACKED_UP = {"BOX_BACKUP_KEY": "bw:pilot-backup-key", "BOX_BACKUP_SPARSE": "bw:pilot-backup-sparse"}
+SPARSE_SECRET = "secret-pilot-backup-sparse"
 
 
 # Real keys, made once: the box's read key (the vault item pilot-read-key), and
@@ -198,11 +235,17 @@ KEYS = {}
 HELPER = "/usr/local/libexec/sage-box/root"
 DISPATCHER = "/usr/local/libexec/sage-box/read"
 READ_VERBS = ["probe", "backup", "power", "containers", "version"]
-ROOT_VERBS = ["homebrew", "power", "boot-daemon", "backup-daemon", "docker-sock", "reboot"]
+ROOT_VERBS = ["homebrew", "power", "boot-daemon", "backup-daemon", "tunnel-daemon", "docker-sock", "reboot"]
 
 
 def sha16(data):
     return hashlib.sha256(data).hexdigest()[:16]
+
+
+def plist_in(helper, function):
+    """The plist a root helper's function writes, as the box's installed file holds it."""
+    found = re.search(rb"\n" + function.encode() + rb"\(\) \{\n  cat <<'PLIST'\n(.*?)\nPLIST\n\}", helper, re.S)
+    return found.group(1) + b"\n"
 
 
 def sk_pub(seed, comment="alex-ca"):
@@ -216,10 +259,12 @@ def sk_pub(seed, comment="alex-ca"):
 def setUpModule():
     folder = Path(tempfile.mkdtemp())
     KEYS["folder"] = folder
-    for name in ("read", "ca"):
+    for name in ("read", "ca", "backup"):
         subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"test {name}", "-f", str(folder / name)], check=True)
     KEYS["read"] = (folder / "read").read_text()
     KEYS["read_pub"] = " ".join((folder / "read.pub").read_text().split()[:2])
+    KEYS["backup"] = (folder / "backup").read_text()
+    KEYS["backup_pub"] = " ".join((folder / "backup.pub").read_text().split()[:2])
     # A finished box holds what --apply puts there: the probe's access and keys lines are digests of it.
     mac = Mac()
     mac.setUp()
@@ -230,6 +275,19 @@ def setUpModule():
         files = mac.payloads()
         DONE["access"] = sha16(files["read"] + files["root"])
         DONE["keys"] = sha16(files["lines"])
+        DONE["backup_plist"] = sha16(plist_in(files["root"], "backup_plist"))
+    finally:
+        mac.doCleanups()
+    # A box backed up nightly: the backup key's door and lines, as step keys writes them.
+    mac = Mac()
+    mac.setUp()
+    try:
+        mac.box(**BACKED_UP)
+        mac.probe({**DONE, "keys": "stale"})
+        mac.ok("pilot", "--apply")
+        files = mac.payloads()
+        KEYS["door"] = files["door"]
+        KEYS["backed_up_lines"] = files["lines"]
     finally:
         mac.doCleanups()
 
@@ -256,11 +314,19 @@ class Mac(unittest.TestCase):
         self.boxes = self.home / ".sage-is" / "boxes"
         self.boxes.mkdir(parents=True)
         (self.state / "read-key").write_text(KEYS["read"])
+        (self.state / "backup-key").write_text(KEYS["backup"])
         shutil.copy(KEYS["folder"] / "ca", self.state / "test-ca")
         (self.state / "test-ca").chmod(0o600)
-        self.backups = root / "backups"
+        self.backups = root / "Somma 02" / "Backups" / "pilot.sparsebundle"
         self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin", "STATE": str(self.state),
                     "SAGE_BOXES_DIR": str(self.boxes), "LAUNCH_AGENTS_DIR": str(self.agents)}
+
+    def tunnel_env(self, text=None, mode=0o600):
+        """The env file sage-tunnel create writes: the connector token and the hostname."""
+        path = self.root / "tunnel.env"
+        path.write_text(text if text is not None else f"CLOUDFLARED_TUNNEL_TOKEN={TUNNEL_TOKEN}\nCLOUDFLARED_HOSTNAME=crm.example.test\n")
+        path.chmod(mode)
+        return path
 
     def box(self, name="pilot", mode=0o600, **overrides):
         values = {**BOX, "BOX_BACKUP_DIR": str(self.backups), **overrides}
@@ -320,6 +386,8 @@ class Mac(unittest.TestCase):
                 files["install"] = base64.b64decode(b64)
             for b64 in re.findall(r"^  echo ([A-Za-z0-9+/=]+) \| base64 -d$", script, re.M):
                 files["lines"] = base64.b64decode(b64)
+            for b64 in re.findall(r"^echo '([A-Za-z0-9+/=]+)' \| base64 -d > \"\$T\"$", script, re.M):
+                files["door"] = base64.b64decode(b64)
         return files
 
     def ca(self, name="alex", seed=None):
@@ -459,43 +527,6 @@ class Upkeep(Mac):
         for script in scripts[:4]:
             self.assertIn("\nset -eo pipefail\n", script, "each step stops the update when it fails, also behind | tail")
         self.assertNotIn("pipefail", scripts[4], "not in prelude, which the probe's grep | tail lines share")
-
-    def test_backup_pulls_the_newest_archive_encrypts_it_and_keeps_fourteen(self):
-        self.box()
-        (self.state / "archive").write_text("the record")
-        self.backups.mkdir()
-        for i in range(15):
-            old = self.backups / f"trellis-202609{i:02d}-020000.tar.gz.age"
-            old.write_text("old")
-            stamp = time.time() - 86400 * (20 - i)
-            os.utime(old, (stamp, stamp))
-        out = self.ok("pilot", "backup").stdout
-        new = self.backups / "trellis-20261014-020000.tar.gz.age"
-        self.assertEqual(new.read_text(), "the record")
-        self.assertEqual(len(list(self.backups.glob("*.age"))), 14)
-        self.assertFalse((self.backups / "trellis-20260900-020000.tar.gz.age").exists(), "the oldest went")
-        self.assertTrue(any(c.startswith("age -r age1test -o") for c in self.calls()))
-        self.assertIn("keeping the last 14", out)
-
-    def test_backup_needs_an_archive_on_the_box_and_the_two_settings(self):
-        self.box()
-        (self.state / "no-backup").touch()
-        result = self.run_cli("pilot", "backup")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no backup on the box yet", result.stderr)
-        self.box(BOX_BACKUP_TO=None)
-        result = self.run_cli("pilot", "backup")
-        self.assertIn("BOX_BACKUP_TO", result.stderr)
-
-    def test_backup_nightly_installs_an_agent_on_this_mac(self):
-        self.box()
-        out = self.ok("pilot", "backup", "--nightly").stdout
-        plist = self.agents / "is.sage.box-backup-pilot.plist"
-        text = plist.read_text()
-        self.assertIn("<string>pilot</string><string>backup</string>", text)
-        self.assertIn("<key>Hour</key><integer>3</integer><key>Minute</key><integer>30</integer>", text)
-        self.assertIn(str(plist), out)
-        self.assertTrue(any("launchctl bootstrap gui/" in c for c in self.calls()))
 
     def test_status_reads_the_box_once(self):
         self.box()
@@ -1059,6 +1090,14 @@ class OnTheBoxAccess(Mac):
                 self.assertIn("refused", result.stderr)
         self.assertEqual(self.new_calls(), [], "nothing ran")
 
+    def test_the_root_helper_refuses_tunnel_daemon_on_a_box_without_a_tunnel(self):
+        result = subprocess.run(["/bin/bash", str(self.script("root")), "tunnel-daemon"], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("no tunnel was named (BOX_TUNNEL)", result.stderr)
+        self.assertNotIn("tunnel_plist()", self.files["root"].decode(), "no plist for a tunnel nobody named")
+        self.assertEqual(self.new_calls(), [], "nothing ran")
+
     def test_the_sudoers_drop_in_names_only_the_helper_and_passes_visudo(self):
         rules = [line for line in self.files["sudoers"].decode().splitlines() if line.strip() and not line.startswith("#")]
         self.assertEqual(len(rules), 1, rules)
@@ -1303,7 +1342,8 @@ class Window(Mac):
         self.assertFalse((self.state / "ssh-added").exists(), "no agent: the certificate alone")
 
     def test_admin_verbs_stop_when_locked(self):
-        for args in (("update",), ("--apply",), ("backup",), ("mailbox", "list"), ("--apply", "--reboot")):
+        for args in (("update",), ("--apply",), ("mailbox", "list"), ("manage", "seed_profile"),
+                     ("tunnel", "install", "--env-file", str(self.tunnel_env())), ("--apply", "--reboot")):
             with self.subTest(args=args):
                 result = self.run_cli("pilot", *args)
                 self.assertNotEqual(result.returncode, 0)
@@ -1369,19 +1409,522 @@ class Doors(Mac):
         self.assertEqual(self.resolved(), [])
 
 
+class Manage(Mac):
+    """trellis-crm manage on the box: every argument as typed, the exit code back. The box holds the list."""
+
+    def setUp(self):
+        super().setUp()
+        self.box()
+        self.probe(DONE)
+        (self.state / "exec").touch()
+
+    def box_argv(self):
+        path = self.state / "manage-argv"
+        return path.read_text().split("\0")[:-1] if path.exists() else None
+
+    def test_arguments_reach_the_box_as_typed_and_the_exit_code_comes_back(self):
+        args = ["import_sheet", "/app/crm/fixtures/sheet.csv", "--sheet", "O'Neil \"desk\" $HOME", "--create"]
+        self.ok("pilot", "manage", *args)
+        self.assertEqual(self.box_argv(), args)
+        for code in (0, 1, 2):
+            with self.subTest(code=code):
+                (self.state / "manage-exit").write_text(str(code))
+                self.assertEqual(self.run_cli("pilot", "manage", "seed_profile").returncode, code)
+
+    def test_nothing_in_the_arguments_runs_on_the_way(self):
+        marker = self.root / "ran"
+        for arg in (f"$(touch {marker})", f"`touch {marker}`", f"x; touch {marker}", f"x\ntouch {marker}", "*"):
+            with self.subTest(arg=arg):
+                self.ok("pilot", "manage", "loaddata", arg)
+                self.assertEqual(self.box_argv(), ["loaddata", arg])
+        self.assertFalse(marker.exists())
+
+    def test_no_command_is_refused_before_the_vault_and_a_peer_box_has_none(self):
+        result = self.run_cli("pilot", "manage")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manage takes a command", result.stderr)
+        self.assertEqual(self.resolved(), [])
+        self.box(BOX_MODE="peer", BOX_CHECKOUT=None, BOX_DEPLOY_KEY=None, BOX_GHCR_USER=None, BOX_GHCR_TOKEN=None)
+        result = self.run_cli("pilot", "manage", "seed_profile")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("peer box", result.stderr)
+        self.assertIsNone(self.box_argv())
+
+
+class Tunnel(Mac):
+    """tunnel install: the env file on stdin to the box at mode 600, then the root helper's tunnel-daemon."""
+
+    def setUp(self):
+        super().setUp()
+        self.box(BOX_TUNNEL="pilot-box")
+        self.probe(DONE)
+        for marker in ("exec", "hash-stdin"):
+            (self.state / marker).touch()
+
+    def test_the_env_file_reaches_the_box_on_stdin_at_mode_600_then_the_daemon_loads(self):
+        env = self.tunnel_env()
+        result = self.ok("pilot", "tunnel", "install", "--env-file", str(env))
+        sent = self.home / ".sage-is" / "tunnels" / "pilot-box.env"
+        self.assertEqual(sent.read_text(), env.read_text())
+        self.assertEqual(stat.S_IMODE(sent.stat().st_mode), 0o600)
+        [script] = [s for s in self.remote() if ".sage-is/tunnels" in s]
+        self.assertIn(f"sudo -n {HELPER} tunnel-daemon", script)
+        self.assertLess(script.index('mv "$T" "$F"'), script.index("tunnel-daemon"), "the file is there before launchd starts the tunnel")
+        self.assertIn(f"sudo -n {HELPER} tunnel-daemon", self.calls())
+        for text in (result.stdout + result.stderr, "\n".join(self.calls()), "\n".join(self.remote())):
+            self.assertNotIn(TUNNEL_TOKEN, text)
+        self.assertIn(digest(env.read_text()), self.stdins(), "it travelled on stdin")
+
+    def test_a_bad_env_file_is_refused_by_line_number_and_never_printed(self):
+        for text, mode, said in (
+                (None, 0o644, "mode 644"),
+                (f"CLOUDFLARED_TUNNEL_TOKEN={TUNNEL_TOKEN}$(id)\n", 0o600, "line 1 is not NAME=value"),
+                (f"# from sage-tunnel\nCLOUDFLARED_TUNNEL_TOKEN='{TUNNEL_TOKEN}'\n", 0o600, "line 2 is not NAME=value"),
+                (f"CLOUDFLARED_TUNNEL_TOKEN={TUNNEL_TOKEN} x\n", 0o600, "line 1 is not NAME=value"),
+                ("CLOUDFLARED_HOSTNAME=crm.example.test\n", 0o600, "has no CLOUDFLARED_TUNNEL_TOKEN"),
+                ("CLOUDFLARED_TUNNEL_TOKEN=\n", 0o600, "has no CLOUDFLARED_TUNNEL_TOKEN")):
+            with self.subTest(said=said, text=text):
+                result = self.run_cli("pilot", "tunnel", "install", "--env-file", str(self.tunnel_env(text, mode)))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(said, result.stderr)
+                self.assertNotIn(TUNNEL_TOKEN, result.stdout + result.stderr)
+        for args in ((), ("install",), ("install", "--env-file"), ("start", "--env-file", "x"), ("install", "--token", "x")):
+            with self.subTest(args=args):
+                self.assertNotEqual(self.run_cli("pilot", "tunnel", *args).returncode, 0)
+        self.assertNotEqual(self.run_cli("pilot", "tunnel", "install", "--env-file", str(self.root / "missing.env")).returncode, 0)
+        self.assertEqual(self.ssh_calls(), [])
+        self.assertEqual(self.resolved(), [], "refused before the vault")
+
+    def test_the_box_file_names_the_tunnel_and_nothing_that_walks_paths(self):
+        self.box()
+        result = self.run_cli("pilot", "tunnel", "install", "--env-file", str(self.tunnel_env()))
+        self.assertIn("needs BOX_TUNNEL", result.stderr)
+        for name in ("../x", "a/b", "-x", "a b", "a.env"):
+            with self.subTest(name=name):
+                self.box(BOX_TUNNEL=name)
+                result = self.run_cli("pilot", "status")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("BOX_TUNNEL", result.stderr)
+        self.assertEqual(self.remote(), [])
+
+    def apply_access(self):
+        """An apply that writes the access step's files: the box's stdin as it came, for the sudo check."""
+        for marker in ("exec", "hash-stdin"):
+            (self.state / marker).unlink()
+        self.probe({**DONE, "access": "stale"})
+        self.ok("pilot", "--apply")
+
+    def test_the_daemon_hands_cloudflared_the_token_in_its_environment_only(self):
+        self.apply_access()
+        files = self.payloads()
+        text = plist_in(files["root"], "tunnel_plist")
+        lint = subprocess.run(["/usr/bin/plutil", "-lint", "-"], input=text, capture_output=True)
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+        plist = plistlib.loads(text)
+        self.assertEqual(plist["Label"], "is.sage.tunnel")
+        self.assertEqual(plist["UserName"], "user")
+        self.assertEqual(plist["EnvironmentVariables"]["HOME"], "/Users/user")
+        self.assertIs(plist["KeepAlive"], True)
+        self.assertIs(plist["RunAtLoad"], True)
+        self.assertEqual(plist["StandardErrorPath"], "/Users/user/.sage-is/logs/tunnel.log")
+        self.assertEqual(plist["ProgramArguments"][:2], ["/bin/bash", "-c"])
+        script = plist["ProgramArguments"][2]
+        self.assertIn('"$HOME/.sage-is/tunnels/pilot-box.env"', script)
+        self.assertNotIn(TUNNEL_TOKEN, text.decode())
+        # Run it here, with a cloudflared that says what it got.
+        fake = self.bin / "cloudflared-said"
+        fake.write_text('#!/bin/bash\necho "argv=$*"\necho "env=$TUNNEL_TOKEN"\n')
+        fake.chmod(0o755)
+        folder = self.home / ".sage-is" / "tunnels"
+        folder.mkdir(parents=True)
+        (folder / "pilot-box.env").write_text(self.tunnel_env().read_text())
+        result = subprocess.run(["/bin/bash", "-c", script.replace("/opt/homebrew/bin/cloudflared", str(fake))],
+                                env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.stdout.splitlines(), ["argv=tunnel --no-autoupdate run", f"env={TUNNEL_TOKEN}"], result.stderr)
+        self.assertEqual(re.findall(r"(?m)^  ([a-z-]+)\) verb_", files["root"].decode()), ROOT_VERBS)
+
+    def test_the_helper_needs_the_file_before_it_loads_the_daemon(self):
+        self.apply_access()
+        helper = self.root / "root"
+        helper.write_bytes(self.payloads()["root"].replace(b"\nPATH=/", f"\nPATH={self.bin}:/".encode(), 1))
+        result = subprocess.run(["/bin/bash", str(helper), "tunnel-daemon"], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("no env file at /Users/user/.sage-is/tunnels/pilot-box.env", result.stderr)
+        self.assertFalse([c for c in self.calls() if c.startswith("launchctl")], "nothing loaded")
+
+    def test_tools_bring_cloudflared_and_status_shows_the_daemon(self):
+        (self.state / "exec").unlink()
+        out = self.ok("pilot").stdout
+        self.assertRegex(out, r"would +tools +.*brew install cloudflared \(found")
+        for found, said in (("yes", "tunnel    pilot-box: loaded, cloudflared at power-on"),
+                            ("unloaded", "WARNING: pilot-box is installed but not loaded"),
+                            ("no", "WARNING: no LaunchDaemon for pilot-box; fix: sage-box pilot tunnel install --env-file PATH")):
+            with self.subTest(found=found):
+                self.probe({**DONE, "cloudflared": "2026.10.0", "tunnel_daemon": found})
+                self.assertIn(said, self.ok("pilot", "status").stdout)
+
+
+class BackupKey(Mac):
+    """Step keys with a backup key: its line, forced through rrsync read-only in the staging folder, and the door it names."""
+
+    def setUp(self):
+        super().setUp()
+        (self.state / "exec").touch()
+        self.ssh = self.home / ".ssh"
+        self.ssh.mkdir(mode=0o700)
+        self.auth = self.ssh / "authorized_keys"
+        self.door = self.home / ".sage-is" / "bin" / "sage-box-rrsync"
+
+    def apply(self):
+        """An apply whose keys step runs: the probe answers stale until after the tools step, every time."""
+        (self.state / "probes").unlink(missing_ok=True)
+        self.probe({**DONE, "keys": "stale", "rsync": "3.5.1"}, after={**DONE, "rsync": "3.5.1"})
+        return self.ok("pilot", "--apply")
+
+    def test_the_line_and_its_door_go_in_once_and_go_with_the_key(self):
+        self.box(**BACKED_UP)
+        backup_b64 = KEYS["backup_pub"].split()[1]
+        self.auth.write_text(f"ssh-ed25519 {backup_b64} pasted by hand\n")
+        self.auth.chmod(0o600)
+        self.apply()
+        first = self.auth.read_text()
+        self.apply()
+        self.assertEqual(self.auth.read_text(), first, "a second apply changes nothing")
+        lines = first.splitlines()
+        self.assertEqual(sum(backup_b64 in line for line in lines), 1, "an untagged copy of the backup key would be a full login")
+        self.assertEqual([line for line in lines if line.endswith(" sage-box:backup:pilot")],
+                         ['restrict,from="100.64.0.0/10",command="/Users/user/.sage-is/bin/sage-box-rrsync -ro '
+                          f'/Users/user/.sage-is/backups/trellis-crm/current" {KEYS["backup_pub"]} sage-box:backup:pilot'])
+        self.assertEqual([line.split()[-1] for line in lines], ["sage-box:read:pilot", "sage-box:backup:pilot"])
+        self.assertEqual(self.door.read_bytes(), KEYS["door"])
+        self.assertEqual(stat.S_IMODE(self.door.stat().st_mode), 0o700)
+        # The probe's keys line, run on what is here, gives the digest step keys wants: the next dry run says ok.
+        probe = self.remote()[0]
+        line = next(l for l in probe.splitlines() if l.startswith('echo "keys='))
+        result = subprocess.run(["/bin/bash", "-c", line], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "keys=" + sha16(KEYS["backed_up_lines"] + KEYS["door"]))
+        # The key leaves the box file: its line and its door leave the box.
+        self.box()
+        self.apply()
+        self.assertFalse(self.door.exists())
+        self.assertNotIn("sage-box:backup:", self.auth.read_text())
+
+    def test_the_door_passes_bash_3_and_shellcheck(self):
+        path = self.root / "sage-box-rrsync"
+        path.write_bytes(KEYS["door"])
+        result = subprocess.run(["/bin/bash", "-n", str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shellcheck = shutil.which("shellcheck", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin")
+        if shellcheck:
+            result = subprocess.run([shellcheck, "-S", "warning", "-s", "bash", str(path)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_the_backup_key_and_the_read_key_are_two_keys(self):
+        self.box(**{**BACKED_UP, "BOX_BACKUP_KEY": "bw:pilot-read-key"})
+        self.probe(DONE)
+        result = self.run_cli("pilot")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("are the same key", result.stderr)
+
+    def test_the_dry_run_resolves_the_backup_key_and_status_does_not(self):
+        self.box(**BACKED_UP)
+        self.probe({**DONE, "rsync": "3.5.1"})
+        self.ok("pilot")
+        self.assertEqual(sorted(set(self.resolved())), ["BOX_BACKUP_KEY", "BOX_READ_KEY"], "its public half, for the keys step")
+        (self.state / "resolved").unlink()
+        self.ok("pilot", "status")
+        self.assertEqual(self.resolved(), ["BOX_READ_KEY"])
+        out = self.ok("pilot").stdout
+        self.assertRegex(out, r"would +keys ", "the box lacks the backup key's line")
+        self.assertRegex(out, r"ok +tools +.*rsync 3\.5\.1")
+
+
+class BackupDaemon(Mac):
+    """The box's 02:00 LaunchDaemon refreshes the staging folder; --apply installs it again when it is an older one."""
+
+    def test_it_runs_trellis_crm_backup_into_the_staging_folder(self):
+        self.box()
+        self.probe({**DONE, "access": "stale"})
+        self.ok("pilot", "--apply")
+        plist = plistlib.loads(plist_in(self.payloads()["root"], "backup_plist"))
+        self.assertEqual(plist["ProgramArguments"],
+                         ["/opt/homebrew/bin/trellis-crm", "backup", "--dir", "/Users/user/.sage-is/backups/trellis-crm/current"])
+
+    def test_an_older_daemon_is_installed_again(self):
+        self.box()
+        self.probe({**DONE, "backup_plist": "0123456789abcdef"}, after=DONE)
+        out = self.ok("pilot", "--apply").stdout
+        self.assertRegex(out, r"doing +backups +install it again: trellis-crm backup --dir")
+        self.assertIn(f"sudo -n {HELPER} backup-daemon", "\n".join(self.remote()))
+
+    def test_apply_stops_before_a_daemon_the_box_s_trellis_crm_cannot_run(self):
+        self.box()
+        self.probe({**DONE, "backup_dir": "no", "backup_plist": "0123456789abcdef"})
+        self.assertRegex(self.ok("pilot").stdout, r"would +backups +stop: upgrade trellis-crm first")
+        result = self.run_cli("pilot", "--apply")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trellis-crm 0.1.1 on pilot has no backup --dir", result.stderr)
+        self.assertIn("sage-box pilot update", result.stderr)
+        self.assertNotIn(f"sudo -n {HELPER} backup-daemon", "\n".join(self.remote()))
+
+
+SNAPSHOT = re.compile(r"^\d{4}-\d\d-\d\d-\d{6}$")
+
+
+@unittest.skipUnless(Path("/opt/homebrew/bin/rrsync").exists() and Path("/opt/homebrew/bin/rsync").exists(),
+                     "the pull runs brew's rsync, and the box's door brew's rrsync")
+class Backups(Mac):
+    """The pull: brew's rsync through the backup key into dated snapshots in the bundle. The box's sshd is played
+    here, which runs the door as step keys writes it, so brew's real rrsync answers, -ro in a staging folder."""
+
+    def setUp(self):
+        super().setUp()
+        self.box(**BACKED_UP)
+        self.probe(DONE)
+        (self.bin / "rsync").symlink_to("/opt/homebrew/bin/rsync")
+        self.staging = self.root / "box" / "current"
+        (self.staging / "artifacts").mkdir(parents=True)
+        (self.staging / "trellis.sqlite3").write_text("the record, night one")
+        self.artifact("aa", "a letter")
+        self.artifact("bb", "a photo")
+        door = self.root / "box" / "sage-box-rrsync"
+        door.write_bytes(KEYS["door"])
+        door.chmod(0o700)
+        (self.state / "forced").write_text(f'"{door}" -ro "{self.staging}"')
+        self.backups.mkdir(parents=True)
+        (self.state / "bundle-pass").write_text(digest(SPARSE_SECRET))
+        self.volume = self.backups / "volume"
+        self.mount = self.home / ".sage-is" / "box-backups" / "pilot"
+
+    def artifact(self, sha, text):
+        path = self.staging / "artifacts" / sha[:2] / (sha * 16)
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(text)
+        return path.relative_to(self.staging)
+
+    def pull(self):
+        return self.ok("pilot", "backup").stdout
+
+    def snaps(self):
+        return sorted(p.name for p in self.volume.iterdir() if SNAPSHOT.match(p.name)) if self.volume.exists() else []
+
+    def test_a_second_pull_of_unchanged_data_transfers_no_file_and_links_every_one(self):
+        self.assertIn("Number of regular files transferred: 3", self.pull())
+        second = self.pull()
+        self.assertIn("Number of regular files transferred: 0", second)
+        one, two = self.snaps()
+        for name in ("trellis.sqlite3", f"artifacts/aa/{'aa' * 16}"):
+            a, b = (self.volume / one / name).stat(), (self.volume / two / name).stat()
+            self.assertEqual(a.st_ino, b.st_ino, f"{name} is one file in both snapshots")
+            self.assertGreaterEqual(b.st_nlink, 2)
+        self.assertIn(f"files unchanged since {one} are linked", second)
+        self.assertEqual(os.readlink(self.volume / "latest"), two)
+        self.assertEqual((self.mount.parent / "pilot.last").read_text().strip(), two)
+        self.assertEqual([line.split()[0] for line in self.lines_of("mounts")], ["attach", "detach"] * 2, "attached for each pull alone")
+        self.assertFalse(self.mount.is_symlink())
+        self.assertIn("backups   newest snapshot 0 h old", self.ok("pilot", "status").stdout)
+
+    def test_only_what_changed_crosses(self):
+        self.pull()
+        (self.staging / "trellis.sqlite3").write_text("the record, night two")
+        new = self.artifact("cc", "a contract")
+        self.assertIn("Number of regular files transferred: 2", self.pull())
+        one, two = self.snaps()
+        old = f"artifacts/aa/{'aa' * 16}"
+        self.assertEqual((self.volume / one / old).stat().st_ino, (self.volume / two / old).stat().st_ino)
+        self.assertNotEqual((self.volume / one / "trellis.sqlite3").stat().st_ino, (self.volume / two / "trellis.sqlite3").stat().st_ino)
+        self.assertEqual((self.volume / two / "trellis.sqlite3").read_text(), "the record, night two")
+        self.assertEqual((self.volume / one / "trellis.sqlite3").read_text(), "the record, night one", "a snapshot never changes")
+        self.assertEqual((self.volume / two / new).read_text(), "a contract")
+
+    def test_the_pull_takes_the_backup_key_alone_and_plain_rsync_on_the_box(self):
+        self.pull()
+        [call] = [c for c in self.ssh_calls() if " rsync --server " in c]
+        self.assertTrue(call.startswith("ssh -F none -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o IdentitiesOnly=yes "), call)
+        self.assertEqual(len(re.findall("IdentityFile=", call)), 1)
+        path = re.search(r'IdentityFile="([^"]+)"', call).group(1)
+        self.assertEqual(Path(path).read_text().split()[:2], KEYS["backup_pub"].split(), "the backup key's public half")
+        self.assertRegex(call, r" -l user 100\.64\.0\.9 rsync --server --sender -[A-Za-z.]+ \. \.$",
+                         "plain rsync: rrsync refuses any other first word, and the box's door picks brew's")
+        self.assertNotIn("ControlMaster", call)
+        self.assertEqual(sorted(set(self.resolved())), ["BOX_BACKUP_KEY", "BOX_BACKUP_SPARSE"], "nothing of the admin doors or the read key")
+        self.assertEqual((self.state / "ssh-key").read_text().strip(), KEYS["backup"].strip())
+
+    def test_no_secret_reaches_a_command_line_the_output_or_a_file_here(self):
+        result = self.ok("pilot", "backup")
+        own = {self.state / name for name in ("backup-key", "read-key", "ssh-key", "ssh-added")}
+        # The private key's own line: every OpenSSH key starts with the same header line.
+        for secret in (SPARSE_SECRET, KEYS["backup"].splitlines()[4]):
+            self.assertNotIn(secret, result.stdout + result.stderr)
+            for call in self.calls():
+                self.assertNotIn(secret, call)
+            for path in self.root.rglob("*"):
+                if path.is_file() and not path.is_symlink() and path not in own:
+                    self.assertNotIn(secret.encode(), path.read_bytes(), path)
+        self.assertTrue([c for c in self.calls() if c.startswith("hdiutil attach -stdinpass ")], "the passphrase went on stdin")
+
+    def test_a_wrong_passphrase_pulls_nothing(self):
+        (self.state / "bundle-pass").write_text(digest("another passphrase"))
+        result = self.run_cli("pilot", "backup")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not attach", result.stderr)
+        self.assertFalse([c for c in self.calls() if " rsync --server " in c])
+        self.assertEqual(self.snaps(), [])
+
+    def test_a_failed_pull_keeps_its_partial_for_the_next_and_latest_where_it_was(self):
+        self.pull()
+        [one] = self.snaps()
+        (self.state / "rsync-refused").touch()
+        result = self.run_cli("pilot", "backup")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the next pull finishes it; the newest snapshot is still " + one, result.stderr)
+        self.assertEqual(len([p for p in self.volume.iterdir() if p.name.endswith(".partial")]), 1)
+        self.assertEqual(os.readlink(self.volume / "latest"), one)
+        self.assertEqual((self.mount.parent / "pilot.last").read_text().strip(), one)
+        self.assertFalse(self.mount.is_symlink(), "detached after a failure too")
+        (self.state / "rsync-refused").unlink()
+        self.assertIn("Finishing the pull that broke off", self.pull())
+        self.assertEqual([p.name for p in self.volume.iterdir() if p.name.endswith(".partial")], [])
+        self.assertEqual(len(self.snaps()), 2)
+
+    def test_thinning_keeps_two_days_then_one_a_day_then_one_a_week_for_a_year(self):
+        now = datetime.now()
+
+        def name(when):
+            return when.strftime("%Y-%m-%d-%H%M%S")
+
+        day = (now - timedelta(days=5)).replace(hour=8, minute=0, second=0, microsecond=0)
+        week = now - timedelta(days=60)
+        monday = (week - timedelta(days=week.weekday())).replace(hour=10, minute=0, second=0, microsecond=0)
+        made = {"20 h": name(now - timedelta(hours=20)), "40 h": name(now - timedelta(hours=40)),
+                "morning": name(day), "evening": name(day.replace(hour=20)),
+                "monday": name(monday), "wednesday": name(monday + timedelta(days=2)),
+                "400 days": name(now - timedelta(days=400))}
+        self.volume.mkdir()
+        for snap in made.values():
+            (self.volume / snap).mkdir()
+        out = self.pull()
+        kept = set(self.snaps())
+        for which in ("20 h", "40 h", "evening", "wednesday"):
+            self.assertIn(made[which], kept, which)
+        for which in ("morning", "monday", "400 days"):
+            self.assertNotIn(made[which], kept, which)
+            self.assertIn(f"thinned {made[which]}", out)
+        self.assertEqual(len(kept), 5, "the four above and the new one")
+
+    def test_init_stores_a_new_passphrase_then_makes_the_bundle_with_it(self):
+        shutil.rmtree(self.backups)
+        (self.state / "bundle-pass").unlink()
+        out = self.ok("pilot", "backup", "--init").stdout
+        calls = self.calls()
+        put = calls.index("sage-secret put pilot-backup-sparse --stdin")
+        [create] = [i for i, c in enumerate(calls) if c.startswith("hdiutil create")]
+        self.assertLess(put, create, "the vault holds the passphrase before a bundle needs it")
+        self.assertEqual(calls[create], "hdiutil create -size 1t -type SPARSEBUNDLE -fs APFS -encryption AES-256 -stdinpass "
+                                        f"-volname pilot snapshots {self.backups}")
+        stored = (self.state / "item-pilot-backup-sparse").read_text().strip()
+        self.assertEqual((self.state / "bundle-pass").read_text().strip(), stored, "the bundle takes the passphrase the vault holds")
+        for call in calls:
+            for word in call.split():
+                self.assertNotEqual(hashlib.sha256(word.encode()).hexdigest(), stored, "the passphrase on a command line")
+        self.assertIn("bw:pilot-backup-sparse", out)
+        self.assertEqual(self.resolved(), [], "init resolves nothing")
+        result = self.run_cli("pilot", "backup", "--init")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exists already", result.stderr)
+
+    def test_init_makes_no_bundle_the_vault_cannot_open(self):
+        shutil.rmtree(self.backups)
+        (self.state / "item-pilot-backup-sparse").write_text("an older passphrase\n")
+        result = self.run_cli("pilot", "backup", "--init")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the vault refused pilot-backup-sparse, so no bundle was made", result.stderr)
+        self.assertFalse([c for c in self.calls() if c.startswith("hdiutil create")])
+        self.assertFalse(self.backups.exists())
+        (self.state / "item-pilot-backup-sparse").unlink()
+        (self.state / "fail-create").touch()
+        result = self.run_cli("pilot", "backup", "--init")
+        self.assertIn("remove that item, then --init again", result.stderr)
+        self.box(**{**BACKED_UP, "BOX_BACKUP_SPARSE": "bw:pilot-backup-sparse/password"})
+        self.assertIn("no /FIELD", self.run_cli("pilot", "backup", "--init").stderr)
+
+    def test_the_bundle_is_a_sparse_bundle_named_by_its_absolute_path(self):
+        for where in ("Backups/pilot.sparsebundle", "/Volumes/Somma 02/pilot.dmg", "/Volumes/Somma 02/pilot"):
+            for args in ((), ("--init",), ("--nightly",)):
+                with self.subTest(where=where, args=args):
+                    self.box(**BACKED_UP, BOX_BACKUP_DIR=where)
+                    result = self.run_cli("pilot", "backup", *args)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("ending in .sparsebundle", result.stderr)
+        self.box(**BACKED_UP, BOX_BACKUP_DIR=str(self.root / "elsewhere.sparsebundle"))
+        self.assertIn("backup --init", self.run_cli("pilot", "backup").stderr)
+
+    def test_nightly_installs_the_agent_once_the_box_file_names_what_it_resolves(self):
+        out = self.ok("pilot", "backup", "--nightly").stdout
+        plist = self.agents / "is.sage.box-backup-pilot.plist"
+        text = plist.read_text()
+        self.assertIn("<string>pilot</string><string>backup</string></array>", text)
+        self.assertIn("<key>Hour</key><integer>3</integer><key>Minute</key><integer>30</integer>", text)
+        self.assertIn("/opt/homebrew/bin", text, "brew's rsync comes first on the agent's PATH")
+        self.assertIn(str(plist), out)
+        self.assertEqual(self.resolved(), [])
+        for missing in ("BOX_BACKUP_KEY", "BOX_BACKUP_SPARSE"):
+            with self.subTest(missing=missing):
+                self.box(**{**BACKED_UP, missing: None})
+                result = self.run_cli("pilot", "backup", "--nightly")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(missing, result.stderr)
+
+    def test_status_says_how_old_the_newest_snapshot_is(self):
+        self.assertIn("backups   none pulled yet into", self.ok("pilot", "status").stdout)
+        self.mount.parent.mkdir(parents=True)
+        for hours, said in ((3, "backups   newest snapshot 3 h old"), (30, "backups   WARNING: the newest snapshot is 30 h old")):
+            with self.subTest(hours=hours):
+                stamp = (datetime.now() - timedelta(hours=hours, minutes=5)).strftime("%Y-%m-%d-%H%M%S")
+                (self.mount.parent / "pilot.last").write_text(stamp + "\n")
+                self.assertIn(said, self.ok("pilot", "status").stdout)
+        self.assertEqual(set(self.resolved()), {"BOX_READ_KEY"}, "status needs no backup secret")
+
+    def test_the_door_reads_its_folder_and_nothing_else(self):
+        before = sorted(str(p.relative_to(self.staging)) for p in self.staging.rglob("*"))
+        rsh = f"{self.bin / 'ssh'} -F none"
+        got = self.root / "got"
+        for args, said in ((["-rlpt", str(self.home) + "/", "user@100.64.0.9:"], "sending to read-only server is not allowed"),
+                           (["-rlpt", "user@100.64.0.9:../", str(got)], "do not use .."),
+                           (["-rlpt", "--remove-source-files", "user@100.64.0.9:", str(got)], "has been disabled on this server"),
+                           (["-rlpt", "--delete", "--rsync-path=/bin/sh", "user@100.64.0.9:", str(got)], "does not run rsync")):
+            with self.subTest(said=said):
+                result = subprocess.run(["/opt/homebrew/bin/rsync", "-e", rsh, *args], env=self.env, capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(said, result.stderr)
+        self.assertEqual(sorted(str(p.relative_to(self.staging)) for p in self.staging.rglob("*")), before)
+
+
 class Shape(unittest.TestCase):
     def test_the_formula_installs_the_tool_beside_its_lib_and_the_example(self):
         text = FORMULA.read_text()
         for line in ('libexec.install "sage-box"', '(libexec/"lib").install "lib/sage-runtime.sh"',
                      'bin.write_exec_script libexec/"sage-box"', 'man1.install "sage-box.1"',
-                     '(pkgshare/"boxes").install "docs/boxes/example.env"', 'depends_on "age"'):
+                     '(pkgshare/"boxes").install "docs/boxes/example.env"', 'depends_on "rsync"'):
             self.assertIn(f"  {line}\n", text, line)
+
+    def test_the_probe_finds_backup_dir_in_the_trellis_crm_beside_it(self):
+        # The probe asks the box's trellis-crm whether its --help names "backup --dir"; --apply stops when it does not.
+        probe = TOOL.read_text()
+        self.assertIn('trellis-crm --help 2>/dev/null | grep -q "backup --dir"', probe)
+        result = subprocess.run([TOOL.parent / "trellis-crm", "--help"], capture_output=True, text=True, timeout=30,
+                                env={"HOME": tempfile.gettempdir(), "PATH": "/usr/bin:/bin"})
+        self.assertIn("backup --dir", result.stdout)
 
     def test_the_example_names_no_host_login_or_secret(self):
         example = (TOOL.parent / "docs" / "boxes" / "example.env").read_text()
         self.assertIn("BOX_READ_KEY=bw:", example)
         self.assertIn("BOX_OPERATORS=100.64.0.0/10", example)
         self.assertIn("BOX_SSH_KEY=bw:", example)
+        for setting in ("BOX_BACKUP_KEY=bw:<box>-backup-key", "BOX_BACKUP_SPARSE=bw:<box>-backup-sparse",
+                        "BOX_BACKUP_DIR=/Volumes/<drive>/Backups/boxes/<box>.sparsebundle", "# BOX_TUNNEL=<box>"):
+            self.assertIn(setting, example)
+        self.assertNotIn("BOX_BACKUP_TO", example, "age is gone from the pull")
         self.assertNotIn("100.109", example)
         self.assertNotIn("realtor", example.lower())
 

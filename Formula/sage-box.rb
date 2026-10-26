@@ -8,8 +8,8 @@ class SageBox < Formula
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
 
-  depends_on "age"
   depends_on :macos
+  depends_on "rsync"
   depends_on "sage-is/apps/sage-secret"
 
   def install

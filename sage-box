@@ -14,6 +14,8 @@ set -euo pipefail
 # (docs/boxes/access.md is the standard):
 #   read    the box's read key, for status, read and the dry run. The box
 #           itself holds it to a fixed list of read verbs.
+#   backup  the box's backup key, for the nightly pull. The box holds it to
+#           rrsync, read-only, in one staging folder.
 #   window  a certificate that `unlock` signs with a person's FIDO CA for one
 #           to four hours. The box checks the expiry, not this Mac.
 #   me      --as-me: the person's own SSH agent, such as a FIDO key.
@@ -48,12 +50,25 @@ BOOT_LABEL="is.sage.colima"
 BOOT_PLIST="/Library/LaunchDaemons/$BOOT_LABEL.plist"
 BACKUP_LABEL="is.sage.trellis-backup"
 BACKUP_PLIST="/Library/LaunchDaemons/$BACKUP_LABEL.plist"
+TUNNEL_LABEL="is.sage.tunnel"
+TUNNEL_PLIST="/Library/LaunchDaemons/$TUNNEL_LABEL.plist"
 # Tool constants never start with BOX_: load_box clears every BOX_ variable
 # before it reads a box file, so a constant named BOX_... would vanish there.
 TRELLIS_BACKUPS='$HOME/.sage-is/backups/trellis-crm'
-KEEP_BACKUPS=14
+# The folder trellis-crm backup --dir refreshes at 02:00, and the backup key's
+# door on the box (step keys): both under the box user's home.
+STAGING_REL=".sage-is/backups/trellis-crm/current"
+RRSYNC_DOOR_REL=".sage-is/bin/sage-box-rrsync"
 # A nightly backup older than this is stale: one missed night plus slack.
 BACKUP_STALE_HOURS=26
+# On this Mac: the box's snapshots live in an encrypted sparse bundle
+# (BOX_BACKUP_DIR), mounted for each pull at $SNAPSHOT_MOUNTS/<box>, a path
+# with no spaces of its own. <box>.last beside it names the newest snapshot, so
+# status reads its age without the passphrase.
+SNAPSHOT_MOUNTS="$SAGE_CONFIG_DIR/box-backups"
+SNAPSHOT_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$'
+# A sparse bundle's size is a ceiling: it takes only the space its files use.
+BUNDLE_SIZE="1t"
 AI_UI_CONTAINER="sage-ai"
 AI_UI_NETWORK="sage-network"
 # ai-ui start makes a new sage-ai, off the network Trellis calls it on (http://sage-ai:8080): join it again after every start.
@@ -84,7 +99,7 @@ SUDOERS_FILE="/etc/sudoers.d/sage-box"
 # The read key's verbs, and the root helper's: each list makes the box's case
 # arms, and ROOT_VERBS makes the sudoers line, so a verb lives in one place.
 READ_VERBS="probe backup power containers version"
-ROOT_VERBS="homebrew power boot-daemon backup-daemon docker-sock reboot"
+ROOT_VERBS="homebrew power boot-daemon backup-daemon tunnel-daemon docker-sock reboot"
 READ_CAP=65536
 # Every tagged authorized_keys line ends in sage-box:<kind>:<name>; the access
 # step replaces those lines and leaves every other line as it was.
@@ -101,17 +116,27 @@ UNLOCK_DIR="$SAGE_CONFIG_DIR/unlock"
 SSH_DIR="$SAGE_CONFIG_DIR/ssh"
 PERSIST_SECONDS=600
 # The settings that name secrets: each must be a bw: reference, never a value.
-SECRET_SETTINGS="BOX_READ_KEY BOX_SSH_KEY BOX_SUDO BOX_DEPLOY_KEY BOX_GHCR_TOKEN"
+SECRET_SETTINGS="BOX_READ_KEY BOX_BACKUP_KEY BOX_BACKUP_SPARSE BOX_SSH_KEY BOX_SUDO BOX_DEPLOY_KEY BOX_GHCR_TOKEN"
 SUDO_PW=""
 SUDO_FROM=""
 READ_PUB=""
+BACKUP_PUB=""
+# The box file's bw: references as written, "NAME=bw:ITEM ...", from the first
+# pass of load_box: what a command that resolves nothing may still name.
+NAMED_REFS=""
+# What the run does as it ends, in order: kill its agent, detach a bundle.
+EXIT_STEPS=()
+# Where attach_bundle mounted the box's sparse bundle.
+MOUNTED=""
 CA_NAMES=()
 CA_KEYS=()
 
 usage() {
   cat <<EOF
 Usage: $PROG <box> [--as-me] [--apply] [--reboot]
-       $PROG <box> [--as-me] update | backup [--nightly] | mailbox ...
+       $PROG <box> [--as-me] update | mailbox ... | manage CMD [ARGS]
+       $PROG <box> [--as-me] tunnel install --env-file PATH
+       $PROG <box> backup [--init | --nightly]
        $PROG <box> status | read VERB
        $PROG <box> unlock [--hours N] | lock
        $PROG <box> mailbox list | add NAME ... | check NAME | enable NAME | disable NAME
@@ -136,13 +161,22 @@ changes nothing. docs/boxes/access.md has the doors and their keys.
   update      brew upgrade our tools; in source mode git pull the checkout;
               trellis-crm update; ai-ui start when the box runs AI-UI, which
               then rejoins sage-network. The first step to fail stops the run.
-  backup      pull the box's newest trellis-crm backup, encrypt it with age to
-              BOX_BACKUP_TO, keep the last $KEEP_BACKUPS in BOX_BACKUP_DIR;
-              --nightly installs a launchd agent on this Mac that does so at 03:30
+  backup      pull the box's staging folder through its backup key with rsync,
+              into a dated snapshot in the encrypted sparse bundle BOX_BACKUP_DIR:
+              only what changed crosses, the rest is hard-linked to the last one;
+              --init creates the bundle, its passphrase stored in the vault;
+              --nightly installs a launchd agent on this Mac that pulls at 03:30
   status      both apps, the VM, the boot daemon, the newest backup and the
               window, through the read key
   mailbox     trellis-crm mailbox on the box, every argument as typed and its
               exit code back. A new mailbox starts disabled.
+  manage      trellis-crm manage on the box, the same way: seed_profile,
+              loaddata NAME, import_sheet /app/FILE.csv --sheet NAME [--create];
+              the box refuses anything else with exit 2
+  tunnel install --env-file PATH
+              send the env file sage-tunnel create wrote (it holds the token)
+              to the box on stdin, mode 600, then load the tunnel LaunchDaemon
+              for BOX_TUNNEL
   mailbox secret NAME
               the password reaches the box on stdin, never on a command line:
               --from resolves a vault item on this Mac; --prompt asks twice,
@@ -192,21 +226,27 @@ keep_refs() {
 }
 
 # The vault items a command needs, by its kind:
-#   none   unlock, lock, backup --nightly: no secret at all
-#   read   status, read, the dry run: the read key
-#   admin  update, backup, mailbox: the admin door's own key, when it is legacy
-#   plan   the dry run with --as-me: the admin door, and the read key for the keys step
-#   apply  --apply: the admin door, the read key, the deploy key, the registry
-#          token, and with the legacy door the sudo password for the access step
+#   none    unlock, lock, backup --init and --nightly: no secret at all
+#   read    status, read: the read key
+#   look    the dry run: the read key, and the backup key's public half for the keys step
+#   backup  the pull: the backup key and the sparse bundle's passphrase
+#   admin   update, mailbox, manage, tunnel: the admin door's own key, when it is legacy
+#   plan    the dry run with --as-me: the admin door, and the read and backup
+#           keys for the keys step
+#   apply   --apply: the admin door, the read and backup keys, the deploy key,
+#           the registry token, and with the legacy door the sudo password for
+#           the access step
 box_needs() {
   local name="$1" kind="$2" door=""
   case "$kind" in
     none) return 0 ;;
     read) echo BOX_READ_KEY; return 0 ;;
+    look) echo BOX_READ_KEY BOX_BACKUP_KEY; return 0 ;;
+    backup) echo BOX_BACKUP_KEY BOX_BACKUP_SPARSE; return 0 ;;
   esac
   door="$(admin_door "$name")"
   [[ "$door" != legacy ]] || echo BOX_SSH_KEY
-  [[ "$kind" == admin ]] || echo BOX_READ_KEY
+  [[ "$kind" == admin ]] || echo BOX_READ_KEY BOX_BACKUP_KEY
   if [[ "$kind" == apply ]]; then
     echo BOX_DEPLOY_KEY BOX_GHCR_TOKEN
     [[ "$door" != legacy ]] || echo BOX_SUDO
@@ -232,6 +272,13 @@ load_box() {
     for key in $SECRET_SETTINGS; do
       [[ -z "${!key:-}" || "${!key}" == bw:?* ]] || die "$key in $file must be a vault reference (bw:ITEM): a secret never sits in the box file"
     done
+    # Names only reach the second pass, which runs under sage-secret: tools_wanted
+    # asks whether the file names a backup key even where it resolves none.
+    SAGE_BOX_NAMED=""
+    for key in ${!BOX_@}; do
+      [[ "${!key}" != bw:* ]] || { NAMED_REFS="$NAMED_REFS $key=${!key}"; SAGE_BOX_NAMED="$SAGE_BOX_NAMED $key"; }
+    done
+    export SAGE_BOX_NAMED
     # A locked box stops here, before the vault is asked for anything.
     if [[ " admin plan apply " == *" $kind "* && "$(admin_door "$name")" == locked ]]; then open_admin_door "$name"; fi
     # shellcheck disable=SC2046 # box_needs prints setting names, one word each
@@ -254,10 +301,17 @@ load_box() {
   re='^[0-9A-Fa-f:.]+(/[0-9]{1,3})?(,[0-9A-Fa-f:.]+(/[0-9]{1,3})?)*$'
   [[ -z "$BOX_OPERATORS" || "$BOX_OPERATORS" =~ $re ]] || die "BOX_OPERATORS in $file is a comma-separated list of addresses or CIDR ranges, no spaces or quotes: $BOX_OPERATORS"
   READ_PUB=""
+  BACKUP_PUB=""
+  re='^ssh-ed25519 [A-Za-z0-9+/]+=*$'
   if [[ -n "${BOX_READ_KEY:-}" ]]; then
     READ_PUB="$(public_half "$BOX_READ_KEY")"
-    re='^ssh-ed25519 [A-Za-z0-9+/]+=*$'
     [[ "$READ_PUB" =~ $re ]] || die "BOX_READ_KEY is not an ed25519 private key. Make one with ssh-keygen -t ed25519 and store it in the vault (docs/boxes/access.md)"
+  fi
+  if [[ -n "${BOX_BACKUP_KEY:-}" ]]; then
+    BACKUP_PUB="$(public_half "$BOX_BACKUP_KEY")"
+    [[ "$BACKUP_PUB" =~ $re ]] || die "BOX_BACKUP_KEY is not an ed25519 private key. Make one with ssh-keygen -t ed25519 and store it in the vault (docs/boxes/access.md)"
+    # Two doors on one key would give the pull the read verbs, or the reads the backups.
+    [[ "$BACKUP_PUB" != "$READ_PUB" ]] || die "BOX_BACKUP_KEY and BOX_READ_KEY are the same key. Each door has its own (docs/boxes/access.md)"
   fi
   BOX_MODE="${BOX_MODE:-image}"
   case "$BOX_MODE" in
@@ -275,7 +329,9 @@ load_box() {
   BOX_REVIEW_AT="${BOX_REVIEW_AT:-}"
   BOX_SHIFT_END="${BOX_SHIFT_END:-}"
   BOX_BACKUP_DIR="${BOX_BACKUP_DIR:-}"
-  BOX_BACKUP_TO="${BOX_BACKUP_TO:-}"
+  BOX_TUNNEL="${BOX_TUNNEL:-}"
+  # The name goes into a file name and a LaunchDaemon on the box: nothing that walks paths.
+  [[ -z "$BOX_TUNNEL" || "$BOX_TUNNEL" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "BOX_TUNNEL in $file is the tunnel's name: letters, digits, - and _: $BOX_TUNNEL"
   if [[ "$BOX_MODE" == source ]]; then
     [[ -n "$BOX_CHECKOUT" ]] || die "source mode needs BOX_CHECKOUT in $file"
     case "$BOX_CHECKOUT" in /*) ;; *) die "BOX_CHECKOUT must be an absolute path on the box (no ~): $BOX_CHECKOUT" ;; esac
@@ -294,8 +350,31 @@ load_box() {
 # dies with the run. The key reaches it on stdin and never touches a disk.
 agent_up() {
   eval "$(ssh-agent -s)" >/dev/null
-  trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+  at_exit 'ssh-agent -k >/dev/null 2>&1 || true'
   printf '%s\n' "$1" | ssh-add -q - 2>/dev/null || die "the SSH key in the vault did not load ($2)"
+}
+
+# One EXIT trap runs every step a run asked for, so a second never replaces the
+# first: a bundle left attached, or an agent left holding a key, outlives the run.
+run_exit_steps() {
+  local step
+  for step in ${EXIT_STEPS[@]+"${EXIT_STEPS[@]}"}; do eval "$step"; done
+}
+
+at_exit() {
+  EXIT_STEPS+=("$1")
+  trap run_exit_steps EXIT
+}
+
+# Whether the box file names the setting as a vault reference, resolved or not.
+named() { [[ " ${SAGE_BOX_NAMED:-} " == *" $1 "* ]]; }
+
+# A bw: reference as the box file wrote it, from the first pass of load_box.
+named_ref() {
+  local pair
+  for pair in $NAMED_REFS; do
+    [[ "${pair%%=*}" != "$1" ]] || { echo "${pair#*=}"; return 0; }
+  done
 }
 
 # "type base64" of a private key from the vault. ssh-keygen -y refuses a key on
@@ -406,19 +485,32 @@ open_admin_door() {
   esac
 }
 
-# The read key alone: from the vault into this run's agent, its public half in
-# $SSH_DIR as the one IdentityFile, IdentitiesOnly so the agent offers nothing
-# else. The box answers this key with its read dispatcher and nothing more.
-open_read_door() {
-  local name="$1" pub
-  [[ -n "$READ_PUB" ]] || die "$(box_file "$name") needs BOX_READ_KEY=bw:$name-read-key for status, read and the dry run (docs/boxes/access.md). Or look with your own key: $PROG $name --as-me"
-  agent_up "$BOX_READ_KEY" BOX_READ_KEY
+# One of the box's forced-command keys, KIND read or backup, alone: from the
+# vault into this run's agent, its public half in $SSH_DIR as the one
+# IdentityFile, IdentitiesOnly so the agent offers nothing else. The box answers
+# the key with its forced command and nothing more.
+open_key_door() {
+  local name="$1" kind="$2" key="$3" pub_half="$4" setting="$5" pub
+  agent_up "$key" "$setting"
   mkdir -p "$SSH_DIR" && chmod 700 "$SSH_DIR"
-  pub="$SSH_DIR/$name-read.pub"
-  printf '%s %s%s\n' "$READ_PUB" "$KEY_TAG" "read:$name" > "$pub"
-  DOOR="read"
+  pub="$SSH_DIR/$name-$kind.pub"
+  printf '%s %s%s\n' "$pub_half" "$KEY_TAG" "$kind:$name" > "$pub"
+  DOOR="$kind"
   DOOR_OPTS=(-o BatchMode=yes -o IdentitiesOnly=yes -o "IdentityFile=\"$pub\"")
+}
+
+# The read key: the box's read dispatcher answers it.
+open_read_door() {
+  [[ -n "$READ_PUB" ]] || die "$(box_file "$1") needs BOX_READ_KEY=bw:$1-read-key for status, read and the dry run (docs/boxes/access.md). Or look with your own key: $PROG $1 --as-me"
+  open_key_door "$1" read "$BOX_READ_KEY" "$READ_PUB" BOX_READ_KEY
   DOOR_WORDS="through the read key"
+}
+
+# The backup key: rrsync on the box answers it, read-only, in the staging folder.
+open_backup_door() {
+  [[ -n "$BACKUP_PUB" ]] || die "$(box_file "$1") needs BOX_BACKUP_KEY=bw:$1-backup-key for the pull; the keys step puts its line on the box (docs/boxes/access.md)"
+  open_key_door "$1" backup "$BOX_BACKUP_KEY" "$BACKUP_PUB" BOX_BACKUP_KEY
+  DOOR_WORDS="through the backup key"
 }
 
 # One read verb through the read door; its output as the box gave it. No
@@ -500,19 +592,27 @@ remote_with_stdin() { printf '%s\n' "$2" | remote_stdin "$1"; }
 # dry run through the read key sees what --apply sees. It reads; it changes
 # nothing. The engine is asked only when sage-ai has answered: a half-started
 # engine holds a docker call open for minutes (see ANSWER_SECONDS in
-# lib/sage-runtime.sh). access and keys are digests of what step access put
-# on the box, which want_access and want_keys compute here.
+# lib/sage-runtime.sh). access and keys are digests of what steps access and
+# keys put on the box, which want_access and want_keys compute here, and
+# backup_plist is the backup LaunchDaemon's, which step backups computes.
+# backup_age is the age of the newest archive or of the staging folder, whose
+# time trellis-crm backup --dir sets only when a run ends well.
 probe_script() {
   echo '
 echo "arch=$(uname -m)"
 echo "os=$(sw_vers -productVersion 2>/dev/null || uname -s)"
 echo "brew=$(command -v brew || echo missing)"
 for t in sage-runtime trellis-crm ai-ui; do v="$($t version 2>/dev/null | head -1 | awk "{print \$2}")"; echo "$(echo "$t" | tr - _)=${v:-missing}"; done
+v="$(/opt/homebrew/bin/rsync --version 2>/dev/null | awk "NR == 1 {print \$3}")"; [ -x /opt/homebrew/bin/rrsync ] || v=""; echo "rsync=${v:-missing}"
+v="$(/opt/homebrew/bin/cloudflared --version 2>/dev/null | awk "NR == 1 {print \$3}")"; echo "cloudflared=${v:-missing}"
+echo "backup_dir=$(trellis-crm --help 2>/dev/null | grep -q "backup --dir" && echo yes || echo no)"
 echo "vm=$(sed -n "s/^vmType: *//p" ~/.colima/default/colima.yaml 2>/dev/null)"
 echo "context=$(docker context show 2>/dev/null)"
 echo "boot=$([ -f '"$BOOT_PLIST"' ] && echo yes || echo no)"
 if [ ! -f '"$BACKUP_PLIST"' ]; then echo "backup_daemon=no"; elif launchctl print system/'"$BACKUP_LABEL"' >/dev/null 2>&1; then echo "backup_daemon=yes"; else echo "backup_daemon=unloaded"; fi
-newest="$(ls -t '"$TRELLIS_BACKUPS"'/*.tar.gz 2>/dev/null | head -1)"; echo "backup_age=$([ -n "$newest" ] && echo $(( ($(date +%s) - $(stat -f %m "$newest")) / 3600 )) || echo none)"
+echo "backup_plist=$(shasum -a 256 < '"$BACKUP_PLIST"' 2>/dev/null | cut -c1-16)"
+if [ ! -f '"$TUNNEL_PLIST"' ]; then echo "tunnel_daemon=no"; elif launchctl print system/'"$TUNNEL_LABEL"' >/dev/null 2>&1; then echo "tunnel_daemon=yes"; else echo "tunnel_daemon=unloaded"; fi
+newest="$(ls -td '"$TRELLIS_BACKUPS"'/*.tar.gz "$HOME/'"$STAGING_REL"'" 2>/dev/null | head -1)"; echo "backup_age=$([ -n "$newest" ] && echo $(( ($(date +%s) - $(stat -f %m "$newest")) / 3600 )) || echo none)"
 echo "autorestart=$(pmset -g 2>/dev/null | awk "/^ *autorestart/{print \$2}")"
 echo "sleep=$(pmset -g 2>/dev/null | awk "/^ *sleep /{print \$2}")"
 echo "ups=$(pmset -g ps 2>/dev/null | ups_state)"
@@ -529,7 +629,7 @@ echo "aiui_net=$([ "$aiui" = up ] && docker network inspect '"$AI_UI_NETWORK"' -
 echo "filevault=$(fdesetup status 2>/dev/null | grep -q " On" && echo on || echo off)"
 echo "leftovers=$(sage-runtime status 2>/dev/null | grep -cE "leads nowhere|leads to Docker Desktop|plugin hooks|buildx not found" || true)"
 echo "access=$([ -f '"$SUDOERS_FILE"' ] && cat '"$READ_DISPATCHER $ROOT_HELPER"' 2>/dev/null | shasum -a 256 | cut -c1-16 || echo none)"
-echo "keys=$(awk "\$NF ~ /^'"$KEY_TAG"'/" ~/.ssh/authorized_keys 2>/dev/null | shasum -a 256 | cut -c1-16)"'
+echo "keys=$({ awk "\$NF ~ /^'"$KEY_TAG"'/" ~/.ssh/authorized_keys; cat "$HOME/'"$RRSYNC_DOOR_REL"'"; } 2>/dev/null | shasum -a 256 | cut -c1-16)"'
 }
 
 # Each line of the probe becomes found_<key>. The box's answer is data: a key
@@ -551,7 +651,8 @@ probe() {
   : "${found_autorestart:=}" "${found_sleep:=}" "${found_ghcr:=no}" "${found_deploy_key:=no}" "${found_checkout:=none}"
   : "${found_source:=}" "${found_profile:=}" "${found_review_at:=}" "${found_shift_end:=}" "${found_trellis:=down}"
   : "${found_aiui:=down}" "${found_aiui_net:=no}" "${found_filevault:=off}" "${found_leftovers:=0}" "${found_context:=}" "${found_ups:=unknown}" "${found_backup_age:=none}"
-  : "${found_sage_runtime:=missing}" "${found_trellis_crm:=missing}" "${found_ai_ui:=missing}"
+  : "${found_sage_runtime:=missing}" "${found_trellis_crm:=missing}" "${found_ai_ui:=missing}" "${found_rsync:=missing}" "${found_cloudflared:=missing}"
+  : "${found_backup_plist:=}" "${found_backup_dir:=no}" "${found_tunnel_daemon:=no}"
 }
 
 # --- step access and step keys: the box's half of the doors ----------------------
@@ -609,6 +710,9 @@ verb_backup() {
   tail -n 50 "$BACKUP_LOG" 2>/dev/null || echo "(no log)"
   echo "== $BACKUP_DIR: date, bytes, name"
   (cd "$BACKUP_DIR" 2>/dev/null && stat -t '%Y-%m-%d %H:%M' -f '%Sm %12z %N' -- *) 2>/dev/null || echo "(empty or missing)"
+  echo "== $BACKUP_DIR/current, the folder the pull copies: the database's date and bytes, and how many artifacts"
+  (cd "$BACKUP_DIR/current" 2>/dev/null && stat -t '%Y-%m-%d %H:%M' -f '%Sm %12z %N' trellis.sqlite3 &&
+    echo "$(find artifacts -type f 2>/dev/null | wc -l | tr -d ' ') artifacts") 2>/dev/null || echo "(no staging folder yet)"
   echo "== launchctl print system/$BACKUP_LABEL"
   launchctl print "system/$BACKUP_LABEL" 2>/dev/null | grep -E '^[[:space:]](state|runs|last exit code|pid) = ' || echo "(not loaded)"
 }
@@ -683,8 +787,33 @@ boot_plist() {
 EOF
 }
 
+# The tunnel LaunchDaemon: cloudflared at power-on as the box user, with
+# nobody signed in, and KeepAlive, so a dropped tunnel comes back. bash reads the
+# token from the box user's env file at each start, so it never sits in the
+# plist or on a command line, and cloudflared takes it as TUNNEL_TOKEN from its
+# environment. sage-tunnel create writes it as CLOUDFLARED_TUNNEL_TOKEN.
+# load_box checked BOX_TUNNEL, so the name is safe in XML and in the script.
+tunnel_plist() {
+  local home="/Users/$BOX_USER"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$TUNNEL_LABEL</string>
+  <key>UserName</key><string>$BOX_USER</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string><string>set -a; . "\$HOME/.sage-is/tunnels/$BOX_TUNNEL.env"; set +a; TUNNEL_TOKEN="\$CLOUDFLARED_TUNNEL_TOKEN" exec /opt/homebrew/bin/cloudflared tunnel --no-autoupdate run</string></array>
+  <key>EnvironmentVariables</key><dict><key>HOME</key><string>$home</string><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>WorkingDirectory</key><string>$home</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$home/.sage-is/logs/tunnel.log</string>
+  <key>StandardErrorPath</key><string>$home/.sage-is/logs/tunnel.log</string>
+</dict></plist>
+EOF
+}
+
 # The root helper, as installed at $ROOT_HELPER. Its verbs are what this tool
-# runs as root: the Homebrew package, power settings, the two LaunchDaemons,
+# runs as root: the Homebrew package, power settings, the three LaunchDaemons,
 # Docker's system-wide links, and the restart.
 root_helper() {
   local verb
@@ -707,9 +836,11 @@ export PATH
 umask 022
 EOF
   printf 'BOX_USER=%q\nHOMEBREW_PKG=%q\nHOMEBREW_PKG_TEAM=%q\nVERBS=%q\n' "$BOX_USER" "$HOMEBREW_PKG" "$HOMEBREW_PKG_TEAM" "$ROOT_VERBS"
-  printf 'BOOT_LABEL=%q\nBACKUP_LABEL=%q\n' "$BOOT_LABEL" "$BACKUP_LABEL"
+  printf 'BOOT_LABEL=%q\nBACKUP_LABEL=%q\nTUNNEL_LABEL=%q\nTUNNEL_NAME=%q\n' "$BOOT_LABEL" "$BACKUP_LABEL" "$TUNNEL_LABEL" "$BOX_TUNNEL"
   printf '\nboot_plist() {\n  cat <<%s\n%s\nPLIST\n}\n' "'PLIST'" "$(boot_plist)"
   printf '\nbackup_plist() {\n  cat <<%s\n%s\nPLIST\n}\n' "'PLIST'" "$(backup_plist)"
+  # A box with no tunnel gets no tunnel plist, and its verb refuses.
+  [[ -z "$BOX_TUNNEL" ]] || printf '\ntunnel_plist() {\n  cat <<%s\n%s\nPLIST\n}\n' "'PLIST'" "$(tunnel_plist)"
   cat <<'EOF'
 
 refuse() { echo "refused: $0 takes one of: $VERBS" >&2; exit 2; }
@@ -751,6 +882,21 @@ verb_power() { pmset -a sleep 0 autorestart 1; }
 verb_boot_daemon() { daemon "$BOOT_LABEL" boot_plist; }
 
 verb_backup_daemon() { daemon "$BACKUP_LABEL" backup_plist; }
+
+# cloudflared at power-on, for the tunnel the box file named when this helper
+# was installed. The token stays in the box user's own file: root only checks
+# that the file is there, so launchd does not restart a tunnel that cannot start.
+verb_tunnel_daemon() {
+  if [ -z "$TUNNEL_NAME" ]; then
+    echo "refused: no tunnel was named (BOX_TUNNEL) when this helper was installed" >&2
+    exit 2
+  fi
+  if [ ! -f "/Users/$BOX_USER/.sage-is/tunnels/$TUNNEL_NAME.env" ]; then
+    echo "no env file at /Users/$BOX_USER/.sage-is/tunnels/$TUNNEL_NAME.env: send it first (sage-box <box> tunnel install --env-file PATH)" >&2
+    exit 1
+  fi
+  daemon "$TUNNEL_LABEL" tunnel_plist
+}
 
 # What Docker Desktop leaves for the whole Mac: links in /usr/local/bin that
 # lead nowhere, and /var/run/docker.sock, which now leads to Colima's socket.
@@ -934,17 +1080,54 @@ load_cas() {
 }
 
 # The tagged lines, in the order step keys writes them: the read key, forced
-# through the dispatcher; then each CA, for window certificates only. restrict
-# turns off forwarding and terminals for both; from= holds them to the operators.
+# through the dispatcher; the backup key, when the box file names one, forced
+# through rrsync, read-only, in the staging folder; then each CA, for window
+# certificates only. restrict turns off forwarding and terminals for all;
+# from= holds them to the operators.
 key_lines() {
-  local i
+  local i home="/Users/$BOX_USER"
   printf 'restrict,from="%s",command="%s" %s %sread:%s\n' "$BOX_OPERATORS" "$READ_DISPATCHER" "$READ_PUB" "$KEY_TAG" "$THE_BOX"
+  if [[ -n "$BACKUP_PUB" ]]; then
+    printf 'restrict,from="%s",command="%s -ro %s" %s %sbackup:%s\n' "$BOX_OPERATORS" "$home/$RRSYNC_DOOR_REL" "$home/$STAGING_REL" "$BACKUP_PUB" "$KEY_TAG" "$THE_BOX"
+  fi
   for ((i = 0; i < ${#CA_KEYS[@]}; i++)); do
     printf 'restrict,cert-authority,principals="%s",from="%s" %s %sca:%s\n' "$WINDOW_PRINCIPAL" "$BOX_OPERATORS" "${CA_KEYS[i]}" "$KEY_TAG" "${CA_NAMES[i]}"
   done
 }
 
-want_keys() { key_lines | digest; }
+# The backup key's door, at ~/$RRSYNC_DOOR_REL on the box: the key's line runs
+# it with rrsync's own arguments. rrsync as brew ships it (rsync 3.5.1) starts
+# /usr/bin/rsync, which on macOS is openrsync, and openrsync refuses the
+# --confine-root that rrsync adds for a folder: every pull would fail. So the
+# door runs brew's rrsync with brew's rsync in its place. The box user owns it,
+# as it owns the key's line, and step keys writes both from this text. It
+# reads brew's rrsync at each pull, so an upgrade of rsync reaches it.
+backup_door() {
+  cat <<'EOF'
+#!/bin/bash
+# sage-box backup door: the backup key's line in authorized_keys runs this with
+# rrsync's arguments (-ro and the staging folder). It runs brew's rrsync with
+# brew's rsync in place of /usr/bin/rsync, which on macOS is openrsync and
+# refuses rrsync's --confine-root. sage-box --apply writes this file (step
+# keys); docs/boxes/access.md in the sage-is/apps tap is the standard.
+exec /usr/bin/python3 -c '
+import sys
+path = "/opt/homebrew/bin/rrsync"
+text = open(path).read()
+ours = "RSYNC = \x27/opt/homebrew/bin/rsync\x27"
+if ours not in text:
+    stock = "RSYNC = \x27/usr/bin/rsync\x27"
+    if stock not in text:
+        sys.exit("sage-box-rrsync: " + path + " starts an rsync this door does not know")
+    text = text.replace(stock, ours, 1)
+sys.argv[0] = path
+exec(compile(text, path, "exec"), {"__name__": "__main__", "__file__": path})
+' "$@"
+EOF
+}
+
+# What the probe's keys line reads: the tagged lines, then the door when there is a backup key.
+want_keys() { { key_lines; [[ -z "$BACKUP_PUB" ]] || backup_door; } | digest; }
 
 # The box user's authorized_keys: every tagged line goes and the current set
 # follows the rest, so a run twice changes nothing and a CA gone from $CA_DIR
@@ -953,14 +1136,28 @@ want_keys() { key_lines | digest; }
 # read key would be a full login. A dated copy of the file comes first; no
 # change, no copy.
 run_keys() {
-  local blobs i prog
+  local blobs i prog door
   blobs="${READ_PUB#* }"
+  [[ -z "$BACKUP_PUB" ]] || blobs="$blobs ${BACKUP_PUB#* }"
   for ((i = 0; i < ${#CA_KEYS[@]}; i++)); do blobs="$blobs ${CA_KEYS[i]#* }"; done
   prog='BEGIN { n = split(blobs, b, " "); for (i = 1; i <= n; i++) ours[b[i]] = 1 }
 $NF ~ /^'"$KEY_TAG"'/ { next }
 { for (i = 1; i <= NF; i++) if ($i in ours) next; print }'
+  # The door goes in before the line that names it, and goes with the backup key.
+  if [[ -n "$BACKUP_PUB" ]]; then
+    door='mkdir -p "$(dirname "$DOOR")"
+T="$(mktemp "$DOOR.XXXXXX")"
+echo '"'$(backup_door | base64 | tr -d '
+')'"' | base64 -d > "$T"
+chmod 700 "$T"
+if cmp -s "$T" "$DOOR"; then rm -f "$T"; else mv "$T" "$DOOR"; echo "  $DOOR: the backup key'"'"'s door"; fi'
+  else
+    door='[ ! -e "$DOOR" ] || { rm -f "$DOOR"; echo "  $DOOR: gone, with the backup key"; }'
+  fi
   remote 'set -e
 umask 077
+DOOR="$HOME/'"$RRSYNC_DOOR_REL"'"
+'"$door"'
 F="$HOME/.ssh/authorized_keys"
 mkdir -p "$HOME/.ssh"
 chmod 700 "$HOME/.ssh"
@@ -973,15 +1170,16 @@ if [ -f "$F" ] && cmp -s "$T" "$F"; then rm -f "$T"; echo "  authorized_keys hol
 [ ! -f "$F" ] || cp -p "$F" "$F.sage-box-$(date +%Y%m%d-%H%M%S)"
 chmod 600 "$T"
 mv "$T" "$F"
-echo "  authorized_keys: '"$((1 + ${#CA_KEYS[@]}))"' tagged line(s); the other lines as they were"'
+echo "  authorized_keys: '"$(key_lines | wc -l | tr -d ' ')"' tagged line(s); the other lines as they were"'
 }
 
 step_keys() {
-  local cas=${#CA_KEYS[@]}
+  local cas=${#CA_KEYS[@]} keys="the read key"
+  [[ -z "$BACKUP_PUB" ]] || keys="the read key, the backup key (and its door)"
   if [[ "$found_keys" == "$(want_keys)" ]]; then
-    step keys "the read key and $cas CA(s), tagged in authorized_keys" ""
+    step keys "$keys and $cas CA(s), tagged in authorized_keys" ""
   else
-    step keys "authorized_keys lacks them or differs" "tag the read key and $cas CA(s) in authorized_keys; other lines stay" run_keys
+    step keys "authorized_keys lacks them or differs" "tag $keys and $cas CA(s) in authorized_keys; other lines stay" run_keys
   fi
   [[ $cas -gt 0 ]] || echo "  note   no CA in $CA_DIR, so no window can open on $THE_BOX (docs/boxes/access.md)"
 }
@@ -1005,7 +1203,20 @@ step() {
 tools_wanted() {
   local list="sage-runtime trellis-crm"
   [[ "$BOX_AI_UI" != 1 ]] || list="$list ai-ui"
+  # The backup key's door runs rrsync, which ships with brew's rsync.
+  if named BOX_BACKUP_KEY; then list="$list rsync"; fi
+  [[ -z "$BOX_TUNNEL" ]] || list="$list cloudflared"
   echo "$list"
+}
+
+# "sage-runtime 0.1.0, trellis-crm 0.1.2, ...": each tool this box wants, as the probe found it.
+tools_found() {
+  local t v found=""
+  for t in $(tools_wanted); do
+    v="found_$(echo "$t" | tr - _)"
+    found="${found:+$found, }$t ${!v}"
+  done
+  echo "$found"
 }
 
 tools_missing() {
@@ -1031,9 +1242,9 @@ brew install '"$(tools_missing)"' 2>&1 | grep -vE "^==> (Downloading|Pouring|Fet
 }
 
 step_tools() {
-  local missing; missing="$(tools_missing)"
-  local found="sage-runtime $found_sage_runtime, trellis-crm $found_trellis_crm"
-  [[ "$BOX_AI_UI" != 1 ]] || found="$found, ai-ui $found_ai_ui"
+  local missing found
+  missing="$(tools_missing)"
+  found="$(tools_found)"
   [[ "$found_brew" != missing ]] || found="no Homebrew; $found"
   if [[ -z "$missing" ]]; then step tools "$found" ""; return; fi
   local action="brew install $missing"
@@ -1194,7 +1405,7 @@ backup_plist() {
 <plist version="1.0"><dict>
   <key>Label</key><string>$BACKUP_LABEL</string>
   <key>UserName</key><string>$BOX_USER</string>
-  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/trellis-crm</string><string>backup</string></array>
+  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/trellis-crm</string><string>backup</string><string>--dir</string><string>/Users/$BOX_USER/$STAGING_REL</string></array>
   <key>EnvironmentVariables</key><dict><key>HOME</key><string>/Users/$BOX_USER</string><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StartCalendarInterval</key><dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer></dict>
   <key>StandardOutPath</key><string>/Users/$BOX_USER/.sage-is/logs/trellis-backup.log</string>
@@ -1207,10 +1418,21 @@ run_backup_daemon() {
   remote 'mkdir -p ~/.sage-is/logs'$'\n'"$(root_call backup-daemon)"
 }
 
+# A trellis-crm without backup --dir would fail every night under the new
+# LaunchDaemon, as quietly as 0.1.0's unloaded one did: --apply stops first.
+old_trellis_crm() {
+  die "trellis-crm $found_trellis_crm on $THE_BOX has no backup --dir, so the nightly backup would fail. Upgrade it first: $PROG $THE_BOX update, then --apply again"
+}
+
 step_backups() {
   [[ "$BOX_MODE" != peer ]] || return 0
-  if [[ "$found_backup_daemon" == yes ]]; then
-    step backups "trellis-crm backup runs nightly at 02:00" ""
+  if [[ "$found_backup_dir" != yes && "$found_trellis_crm" != missing ]]; then
+    step backups "trellis-crm $found_trellis_crm has no backup --dir" "stop: upgrade trellis-crm first ($PROG $THE_BOX update)" old_trellis_crm
+  elif [[ "$found_backup_daemon" == yes && "$found_backup_plist" == "$(backup_plist | digest)" ]]; then
+    step backups "trellis-crm backup --dir runs nightly at 02:00" ""
+  elif [[ "$found_backup_daemon" == yes ]]; then
+    # The old one wrote a whole .tar.gz each night; the pull wants the staging folder.
+    step backups "the LaunchDaemon $BACKUP_LABEL differs from this $PROG's" "install it again: trellis-crm backup --dir ~/$STAGING_REL (02:00, as $BOX_USER)" run_backup_daemon
   elif [[ "$found_backup_daemon" == unloaded ]]; then
     # The plist alone proves nothing: 0.1.0 wrote it and its bootstrap failed, so no backup ever ran.
     step backups "the LaunchDaemon $BACKUP_LABEL is there, but launchd never loaded it" "load it again (02:00, as $BOX_USER)" run_backup_daemon
@@ -1267,7 +1489,7 @@ cmd_plan() {
     load_box "$name" plan
     open_admin_door "$name"
   else
-    load_box "$name" read
+    load_box "$name" look
     open_read_door "$name"
   fi
   [[ -n "$READ_PUB" ]] || die "$(box_file "$name") needs BOX_READ_KEY=bw:$name-read-key: the keys step puts its public half on the box (docs/boxes/access.md)"
@@ -1332,35 +1554,193 @@ cmd_update() {
   verify || die "something is down after the update; see above"
 }
 
+# --- backups on this Mac: snapshots that never recopy --------------------------------
+# The box refreshes one staging folder at 02:00 (trellis-crm backup --dir): the
+# database, kept as it was when nothing changed, and each artifact once. This
+# Mac pulls that folder with brew's rsync through the backup key into a dated
+# snapshot inside an encrypted APFS sparse bundle (BOX_BACKUP_DIR), attached for
+# the pull alone. Only what changed crosses the network: a changed database as
+# rsync's changed blocks, a new artifact whole. Every file that did not change
+# is a hard link to the snapshot before (--link-dest), so it takes no space
+# twice, and the bundle's unchanged bands never upload again.
+#
+# Not rsync_tmbackup.sh, which this Mac's own snapshots use. With a remote
+# source it runs nothing over ssh but rsync, so rrsync would take it. But its
+# ssh is fixed, -e 'ssh -p PORT -o StrictHostKeyChecking=no -o
+# UserKnownHostsFile=/dev/null': it checks no host key, and it cannot hold the
+# pull to the backup key, so ssh would offer the person's own keys first. Its
+# --strategy sets a variable nothing reads, so it cannot thin as below, and it
+# moves `latest` after a failed run.
+
+bundle_mount() { echo "$SNAPSHOT_MOUNTS/$1"; }
+newest_file() { echo "$SNAPSHOT_MOUNTS/$1.last"; }
+
+# BOX_BACKUP_DIR names the bundle by its absolute path; it may hold spaces.
+check_bundle_path() {
+  [[ -n "$BOX_BACKUP_DIR" ]] || die "$(box_file "$1") needs BOX_BACKUP_DIR: the encrypted sparse bundle on this Mac that holds $1's snapshots, such as /Volumes/<drive>/Backups/boxes/$1.sparsebundle"
+  [[ "$BOX_BACKUP_DIR" == /*.sparsebundle ]] || die "BOX_BACKUP_DIR in $(box_file "$1") names an encrypted sparse bundle by its absolute path, ending in .sparsebundle: $BOX_BACKUP_DIR"
+}
+
+# The pull needs brew's rsync here. Apple's /usr/bin/rsync is openrsync, an
+# older protocol without the options the box's rrsync is built for.
+check_rsync_here() {
+  local first
+  first="$(rsync --version 2>/dev/null | head -1 || true)"
+  [[ "$first" =~ ^rsync\ +version\ +[3-9]\. ]] || die "the pull needs brew's rsync 3 here, first on the PATH (brew install rsync). This Mac's rsync says: ${first:-nothing}"
+}
+
+# The snapshot folders in MNT, oldest first: their names sort by time. Never
+# latest, a link, nor a pull that broke off.
+snapshots() {
+  local path
+  for path in "$1"/*; do
+    if [[ -d "$path" && ! -L "$path" && "${path##*/}" =~ $SNAPSHOT_RE ]]; then echo "${path##*/}"; fi
+  done
+}
+
+detach_bundle() {
+  hdiutil detach "$1" -quiet 2>/dev/null || hdiutil detach "$1" -force -quiet 2>/dev/null ||
+    echo "Warning: the bundle is still attached at $1. Detach it: hdiutil detach \"$1\"" >&2
+}
+
+# The passphrase reaches hdiutil on stdin, never on a command line. The bundle
+# is detached as the run ends, however it ends.
+attach_bundle() {
+  local name="$1" mnt
+  mnt="$(bundle_mount "$name")"
+  [[ -d "$BOX_BACKUP_DIR" ]] || die "no sparse bundle at $BOX_BACKUP_DIR (is its drive attached?). Make it once: $PROG $name backup --init"
+  mkdir -p "$mnt"
+  chmod 700 "$SNAPSHOT_MOUNTS" "$mnt"
+  # A run that died while attached left the bundle there.
+  if /sbin/mount | grep -qF " on $mnt ("; then detach_bundle "$mnt"; fi
+  printf '%s' "$BOX_BACKUP_SPARSE" | hdiutil attach -stdinpass -nobrowse -noautoopen -owners on -mountpoint "$mnt" "$BOX_BACKUP_DIR" >/dev/null ||
+    die "hdiutil could not attach $BOX_BACKUP_DIR with the passphrase from the vault (BOX_BACKUP_SPARSE); nothing was pulled"
+  at_exit "detach_bundle $(printf '%q' "$mnt")"
+  MOUNTED="$mnt"
+}
+
+# Every snapshot of the last 2 days stays; then the newest of each day, to 30
+# days; then the newest of each week, to a year; older ones go. The newest of
+# all always stays, whatever its age.
+thin_snapshots() {
+  local mnt="$1" now snap when age bucket kept="" newest=1
+  now="$(date +%s)"
+  for snap in $(snapshots "$mnt" | sort -r); do
+    if [[ $newest == 1 ]]; then newest=0; continue; fi
+    when="$(date -j -f %Y-%m-%d-%H%M%S "$snap" +%s 2>/dev/null)" || continue
+    age=$((now - when))
+    if ((age < 2 * 86400)); then continue
+    elif ((age < 30 * 86400)); then bucket="day-${snap:0:10}"
+    elif ((age < 365 * 86400)); then bucket="week-$(date -j -f %Y-%m-%d-%H%M%S "$snap" +%G-%V)"
+    else bucket=""
+    fi
+    if [[ -n "$bucket" && " $kept " != *" $bucket "* ]]; then kept="$kept $bucket"; continue; fi
+    rm -rf "${mnt:?}/$snap"
+    echo "  thinned $snap"
+  done
+}
+
+backup_pull() {
+  local name="$1" mnt prev stamp work out word leftover rsh="ssh" status=0
+  load_box "$name" backup
+  [[ "$BOX_MODE" != peer ]] || die "a peer box has no Trellis to back up"
+  check_bundle_path "$name"
+  [[ -n "${BOX_BACKUP_SPARSE:-}" ]] || die "$(box_file "$name") needs BOX_BACKUP_SPARSE=bw:$name-backup-sparse, the bundle's passphrase in the vault (backup --init stores it)"
+  check_rsync_here
+  open_backup_door "$name"
+  # rsync starts ssh itself, so the door's options ride in its -e, each word
+  # quoted for rsync's own splitting. A quote inside one could not ride.
+  for word in "${SSH_OPTS[@]}" "${DOOR_OPTS[@]}"; do
+    [[ "$word" != *"'"* ]] || die "an ssh option holds a single quote, which rsync's -e cannot carry: $word"
+    rsh="$rsh '$word'"
+  done
+  attach_bundle "$name"
+  mnt="$MOUNTED"
+  prev="$(snapshots "$mnt" | tail -1)"
+  stamp="$(date +%Y-%m-%d-%H%M%S)"
+  # A name a second: a second pull within the same second waits for the next.
+  while [[ -e "$mnt/$stamp" ]]; do sleep 1; stamp="$(date +%Y-%m-%d-%H%M%S)"; done
+  work="$mnt/$stamp.partial"
+  # A pull that broke off left its folder: this one finishes it, so what
+  # crossed then does not cross again.
+  for leftover in "$mnt"/*.partial; do
+    if [[ -d "$leftover" ]]; then
+      [[ "$leftover" == "$work" ]] || mv "$leftover" "$work"
+      echo "Finishing the pull that broke off in ${leftover##*/}"
+      break
+    fi
+  done
+  mkdir -p "$work"
+  out="$(mktemp)"
+  at_exit "rm -f $(printf '%q' "$out")"
+  echo "Pulling $name's staging folder $DOOR_WORDS${prev:+; files unchanged since $prev are linked, not copied}..."
+  # No --rsync-path: the box's door picks brew's rsync, and rrsync refuses a
+  # command that does not start with plain rsync.
+  rsync -rlpt --compress --stats ${prev:+"--link-dest=$mnt/$prev"} -e "$rsh" "$(target):" "$work/" > "$out" || status=$?
+  if [[ $status != 0 ]]; then
+    die "the pull from $name failed (rsync said $status). ${work##*/} stays, and the next pull finishes it; the newest snapshot is still ${prev:-none}"
+  fi
+  mv "$work" "$mnt/$stamp"
+  ln -sfn "$stamp" "$mnt/latest"
+  echo "$stamp" > "$(newest_file "$name")"
+  grep -E '^(Number of regular files transferred|Total transferred file size|Total bytes received):' "$out" | sed 's/^/  /' || true
+  thin_snapshots "$mnt"
+  echo "Snapshot $stamp in $BOX_BACKUP_DIR; $(snapshots "$mnt" | wc -l | tr -d ' ') kept."
+}
+
+# A new bundle, and its passphrase in the vault before the bundle exists: a
+# bundle whose passphrase lives nowhere else is lost. The passphrase is made
+# here and travels on stdin alone. An item that exists is never replaced from
+# here, since it may open a bundle already.
+backup_init() {
+  local name="$1" ref item pass
+  load_box "$name" none
+  [[ "$BOX_MODE" != peer ]] || die "a peer box has no Trellis to back up"
+  check_bundle_path "$name"
+  ref="$(named_ref BOX_BACKUP_SPARSE)"
+  [[ "$ref" =~ ^bw:[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "$(box_file "$name") needs BOX_BACKUP_SPARSE=bw:$name-backup-sparse, a vault item of its own (no /FIELD): --init stores the bundle's passphrase there"
+  item="${ref#bw:}"
+  [[ ! -e "$BOX_BACKUP_DIR" ]] || die "$BOX_BACKUP_DIR exists already; --init makes a new bundle only. Its passphrase is bw:$item"
+  [[ -d "$(dirname "$BOX_BACKUP_DIR")" ]] || die "no folder $(dirname "$BOX_BACKUP_DIR") for the bundle (is its drive attached?)"
+  command -v sage-secret &>/dev/null || die "sage-secret is not installed: brew install $TAP/sage-secret"
+  pass="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+  if ! printf '%s' "$pass" | sage-secret put "$item" --stdin; then
+    unset pass
+    die "the vault refused $item, so no bundle was made"
+  fi
+  if ! printf '%s' "$pass" | hdiutil create -size "$BUNDLE_SIZE" -type SPARSEBUNDLE -fs APFS -encryption AES-256 -stdinpass -volname "$name snapshots" "$BOX_BACKUP_DIR" >/dev/null; then
+    unset pass
+    die "hdiutil could not create $BOX_BACKUP_DIR. The vault holds its new passphrase as $item, which opens nothing: remove that item, then --init again"
+  fi
+  unset pass
+  echo "Created $BOX_BACKUP_DIR: APFS, AES-256, $BUNDLE_SIZE at most. Its passphrase is in the vault as bw:$item."
+  echo "Pull into it: $PROG $name backup. Nightly at 03:30: $PROG $name backup --nightly"
+}
+
 cmd_backup() {
-  local name="$1" nightly=0 newest base tmp
+  local name="$1" mode=pull
   shift
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --nightly) nightly=1 ;;
-      --as-me)   AS_ME=1 ;;
-      *) die "backup takes --nightly and --as-me only" ;;
+      --init)    mode=init ;;
+      --nightly) mode=nightly ;;
+      *) die "backup takes --init, --nightly, or nothing" ;;
     esac
     shift
   done
-  # The nightly pull is a file on this Mac: no secret, no door.
-  if [[ $nightly == 1 ]]; then load_box "$name" none; else load_box "$name" admin; fi
-  [[ "$BOX_MODE" != peer ]] || die "a peer box has no Trellis to back up"
-  [[ -n "$BOX_BACKUP_DIR" && -n "$BOX_BACKUP_TO" ]] || die "backup needs BOX_BACKUP_DIR (on this Mac) and BOX_BACKUP_TO (an age recipient) in $(box_file "$name")"
-  if [[ $nightly == 1 ]]; then install_pull_agent "$name"; return; fi
-  command -v age &>/dev/null || die "age is not installed here: brew install age"
-  open_admin_door "$name"
-  newest="$(remote 'ls -t '"$TRELLIS_BACKUPS"'/*.tar.gz 2>/dev/null | head -1')"
-  [[ -n "$newest" ]] || die "no backup on the box yet. The nightly daemon makes one at 02:00, or on the box: trellis-crm backup"
-  base="$(basename "$newest")"
-  mkdir -p "$BOX_BACKUP_DIR"
-  tmp="$(mktemp -d)"
-  scp -q "${SSH_OPTS[@]}" "${DOOR_OPTS[@]}" "$(target):$newest" "$tmp/$base"
-  age -r "$BOX_BACKUP_TO" -o "$BOX_BACKUP_DIR/$base.age" "$tmp/$base"
-  rm -rf "$tmp"
-  # shellcheck disable=SC2012 # names are ours, without spaces or newlines
-  ls -t "$BOX_BACKUP_DIR"/*.age 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f "$old"; done
-  echo "Stored $BOX_BACKUP_DIR/$base.age ($(du -h "$BOX_BACKUP_DIR/$base.age" | cut -f1)); keeping the last $KEEP_BACKUPS."
+  case "$mode" in
+    init) backup_init "$name" ;;
+    pull) backup_pull "$name" ;;
+    nightly)
+      # The nightly pull is a file on this Mac: no secret, no door. It checks
+      # what the 03:30 run will resolve, so that run does not fail alone.
+      load_box "$name" none
+      [[ "$BOX_MODE" != peer ]] || die "a peer box has no Trellis to back up"
+      check_bundle_path "$name"
+      named BOX_BACKUP_KEY && named BOX_BACKUP_SPARSE ||
+        die "$(box_file "$name") needs BOX_BACKUP_KEY=bw:$name-backup-key and BOX_BACKUP_SPARSE=bw:$name-backup-sparse: the 03:30 pull resolves both"
+      install_pull_agent "$name" ;;
+  esac
 }
 
 # A launchd agent on this Mac pulls the box's backup at 03:30, after the box's 02:00 run.
@@ -1414,7 +1794,7 @@ cmd_status() {
   open_read_door "$name"
   probe
   echo "$name: $(target), $BOX_MODE mode"
-  printf '  %-9s %s\n' tools "sage-runtime $found_sage_runtime, trellis-crm $found_trellis_crm$([[ "$BOX_AI_UI" == 1 ]] && echo ", ai-ui $found_ai_ui")"
+  printf '  %-9s %s\n' tools "$(tools_found)"
   printf '  %-9s %s\n' vm "${found_vm:-none} (docker context ${found_context:-none})"
   printf '  %-9s %s\n' boot "$found_boot, autorestart ${found_autorestart:-?}, sleep ${found_sleep:-?}"
   printf '  %-9s %s\n' ups "$found_ups"
@@ -1423,11 +1803,36 @@ cmd_status() {
     printf '  %-9s %s\n' nightly "$(backup_words)"
   fi
   [[ "$BOX_AI_UI" != 1 ]] || printf '  %-9s %s\n' ai-ui "$found_aiui"
-  if [[ -n "$BOX_BACKUP_DIR" ]]; then
-    local last; last="$(ls -t "$BOX_BACKUP_DIR"/*.age 2>/dev/null | head -1 || true)"
-    printf '  %-9s %s\n' backups "${last:-none pulled yet} in $BOX_BACKUP_DIR"
-  fi
+  [[ -z "$BOX_TUNNEL" ]] || printf '  %-9s %s\n' tunnel "$(tunnel_words)"
+  [[ -z "$BOX_BACKUP_DIR" ]] || printf '  %-9s %s\n' backups "$(snapshot_words "$name")"
   printf '  %-9s %s\n' window "$(window_state "$name")"
+}
+
+# The newest snapshot on this Mac, from the note each pull leaves beside the
+# bundle's mount point: status reads it without the bundle's passphrase.
+snapshot_words() {
+  local last when age
+  last="$(cat "$(newest_file "$1")" 2>/dev/null || true)"
+  when=""
+  [[ ! "$last" =~ $SNAPSHOT_RE ]] || when="$(date -j -f %Y-%m-%d-%H%M%S "$last" +%s 2>/dev/null || true)"
+  if [[ -z "$when" ]]; then
+    echo "none pulled yet into $BOX_BACKUP_DIR"
+    return 0
+  fi
+  age=$((($(date +%s) - when) / 3600))
+  if ((age > BACKUP_STALE_HOURS)); then
+    echo "WARNING: the newest snapshot is $age h old ($last), in $BOX_BACKUP_DIR"
+  else
+    echo "newest snapshot $age h old ($last), in $BOX_BACKUP_DIR"
+  fi
+}
+
+tunnel_words() {
+  case "$found_tunnel_daemon" in
+    yes) echo "$BOX_TUNNEL: loaded, cloudflared at power-on" ;;
+    unloaded) echo "WARNING: $BOX_TUNNEL is installed but not loaded; fix: $PROG $THE_BOX tunnel install --env-file PATH" ;;
+    *) echo "WARNING: no LaunchDaemon for $BOX_TUNNEL; fix: $PROG $THE_BOX tunnel install --env-file PATH" ;;
+  esac
 }
 
 # --- mailboxes -----------------------------------------------------------------------
@@ -1437,9 +1842,10 @@ quoted() {
   [[ $# -eq 0 ]] || printf ' %q' "$@"
 }
 
-mailbox_box() {
+# A box that runs Trellis, through an admin door. WHAT names what a peer box lacks.
+trellis_box() {
   load_box "$1" admin
-  [[ "$BOX_MODE" != peer ]] || die "a peer box runs no Trellis, so it has no mailboxes"
+  [[ "$BOX_MODE" != peer ]] || die "a peer box runs no Trellis, so it has no $2"
   open_admin_door "$1"
 }
 
@@ -1449,7 +1855,7 @@ cmd_mailbox() {
   local name="$1"
   shift
   if [[ "${1:-}" == secret ]]; then shift; cmd_mailbox_secret "$name" "$@"; return; fi
-  mailbox_box "$name"
+  trellis_box "$name" mailboxes
   remote "trellis-crm mailbox$(quoted "$@")" </dev/null
 }
 
@@ -1478,7 +1884,7 @@ cmd_mailbox_secret() {
   [[ $replace == 0 || -n "$vault" ]] || die "--replace goes with --vault"
   [[ -z "$from" || "$from" == bw:?* ]] || die "--from takes a vault reference, bw:ITEM or bw:ITEM/FIELD. A password never goes on a command line."
   [[ $prompt == 0 || -t 0 ]] || die "--prompt reads from a terminal. From a script, put the password in the vault and use --from bw:ITEM"
-  mailbox_box "$name"
+  trellis_box "$name" mailboxes
   if [[ $clear == 1 ]]; then
     remote "trellis-crm mailbox secret $(printf '%q' "$mailbox") --clear" </dev/null
     return
@@ -1510,6 +1916,73 @@ cmd_mailbox_secret() {
     echo "The vault holds it as bw:$vault. Send it again: $PROG $name mailbox secret$(quoted "$mailbox") --from bw:$vault" >&2
   fi
   return "$status"
+}
+
+# --- Trellis's manage.py, a fixed few -------------------------------------------------
+
+# trellis-crm manage on the box holds the list and refuses the rest with exit
+# 2: seed_profile, loaddata NAME, import_sheet /app/FILE.csv --sheet NAME
+# [--create]. Here every argument travels quoted, as mailbox's do, and the exit
+# code comes back. Nothing reads stdin on the box.
+cmd_manage() {
+  local name="$1"
+  shift
+  [[ $# -gt 0 ]] || die "manage takes a command: seed_profile, loaddata NAME, or import_sheet /app/FILE.csv --sheet NAME [--create]"
+  trellis_box "$name" "manage.py commands"
+  remote "trellis-crm manage$(quoted "$@")" </dev/null
+}
+
+# --- the tunnel ------------------------------------------------------------------------
+
+# What the box sources at each start of the tunnel: NAME=value lines, comments
+# and blank lines. bash reads the file with `.`, so a value takes only what
+# needs no quoting, and a $ or a quote could not run anything there. A bad line
+# is named by its number, never printed: it may hold the token.
+check_tunnel_env() {
+  local file="$1" mode line n=0 token=0
+  local skip_re='^[[:space:]]*(#.*)?$' line_re='^[A-Z_][A-Z0-9_]*=[A-Za-z0-9+/=._:-]*$'
+  [[ -f "$file" ]] || die "no env file at $file. sage-tunnel create NAME HOSTNAME --service URL --env-file $file writes one"
+  mode="$(stat -f %Lp "$file" 2>/dev/null || stat -c %a "$file")"
+  [[ "$mode" == 600 || "$mode" == 400 ]] || die "$file is mode $mode and holds a tunnel token. First: chmod 600 \"$file\""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ ! "$line" =~ $skip_re ]] || continue
+    [[ "$line" =~ $line_re ]] || die "$file: line $n is not NAME=value with a plain value (letters, digits, + / = . _ : -)"
+    [[ "$line" != CLOUDFLARED_TUNNEL_TOKEN=?* ]] || token=1
+  done < "$file"
+  [[ $token == 1 ]] || die "$file has no CLOUDFLARED_TUNNEL_TOKEN, which the tunnel's LaunchDaemon reads"
+}
+
+# The env file reaches the box on stdin, at mode 600 from its first byte, then
+# the root helper loads the LaunchDaemon for BOX_TUNNEL. The token never rides
+# on a command line, and no output here prints it.
+cmd_tunnel() {
+  local name="$1" file=""
+  shift
+  [[ "${1:-}" == install ]] || die "tunnel takes: install --env-file PATH"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --env-file) [[ $# -ge 2 && -n "$2" ]] || die "--env-file needs the file sage-tunnel create wrote"; file="$2"; shift 2 ;;
+      *) die "tunnel install takes --env-file PATH and nothing else" ;;
+    esac
+  done
+  [[ -n "$file" ]] || die "tunnel install needs --env-file PATH, the file sage-tunnel create wrote"
+  check_tunnel_env "$file"
+  load_box "$name" admin
+  [[ -n "$BOX_TUNNEL" ]] || die "$(box_file "$name") needs BOX_TUNNEL=<the tunnel's name>: the root helper's LaunchDaemon names it"
+  open_admin_door "$name"
+  echo "Sending the tunnel's env file to $name, $DOOR_WORDS..."
+  remote_stdin 'set -e
+umask 077
+mkdir -p "$HOME/.sage-is/tunnels" "$HOME/.sage-is/logs"
+F="$HOME/.sage-is/tunnels/'"$BOX_TUNNEL"'.env"
+T="$(mktemp "$F.XXXXXX")"
+cat > "$T"
+mv "$T" "$F"
+echo "  $F, mode 600"
+'"$(root_call tunnel-daemon)"'
+echo "  the LaunchDaemon '"$TUNNEL_LABEL"' runs cloudflared for '"$BOX_TUNNEL"' at power-on, as '"$BOX_USER"'"' < "$file"
 }
 
 # --- the read key and the window ------------------------------------------------------
@@ -1615,6 +2088,8 @@ case "$sub" in
   unlock) shift; cmd_unlock "$name" "$@" ;;
   lock) cmd_lock "$name" ;;
   mailbox) shift; cmd_mailbox "$name" "$@" ;;
+  manage) shift; cmd_manage "$name" "$@" ;;
+  tunnel) shift; cmd_tunnel "$name" "$@" ;;
   ""|--apply|--reboot|--as-me)
     while [[ $# -gt 0 ]]; do
       case "$1" in
