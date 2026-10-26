@@ -10,6 +10,16 @@
 # then installs and tests the formula from the tap.
 set -euo pipefail
 
+# The version a tarball url names: v<X.Y.Z>.tar.gz (brew scans that one) or
+# <tool>-v<X.Y.Z>.tar.gz (a tool kept in this tap). Nothing else counts. Prints nothing otherwise.
+version_of_url() {  # URL TOOL
+  local name
+  name=$(basename "$1" .tar.gz)
+  name=${name#"$2"-}  # a tool's own tag carries its name
+  printf '%s\n' "$name" | sed -n 's/^v\([0-9][0-9.]*\)$/\1/p'
+}
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0  # sourced by the tests: the function is all they need
+
 BRANCH=develop  # the tap's default branch: the one `brew update` reads
 
 usage="usage: tool-release.sh --dry-run|--apply TOOL VERSION"
@@ -41,10 +51,8 @@ case "$tool" in ai-ui*) die "ai-ui ships inside AI-UI's releases: run \`make ai_
 
 url=$(field url)
 pinned_version=$(field version)
-# No version line: brew scans it from a v<X.Y.Z>.tar.gz url (brew audit --strict
-# calls an explicit one redundant there). Tap-hosted <tool>-vX tarballs keep theirs.
-[ -n "$pinned_version" ] || pinned_version=$(basename "$url" .tar.gz | sed -n 's/^v\([0-9][0-9.]*\)$/\1/p')
-[ -n "$pinned_version" ] || die "$formula needs a version line or a v<X.Y.Z>.tar.gz url"
+[ -n "$pinned_version" ] || pinned_version=$(version_of_url "$url" "$tool")
+[ -n "$pinned_version" ] || die "$formula needs a version line, or a v<X.Y.Z> or $tool-v<X.Y.Z> tarball url"
 url=${url//$pinned_version/$version}
 tag=$(basename "$url" .tar.gz)
 

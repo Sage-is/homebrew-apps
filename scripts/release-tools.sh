@@ -15,11 +15,12 @@ mode=${1:---dry-run}
 case "$mode" in --apply|--dry-run) ;; *) echo "usage: release-tools.sh [--dry-run|--apply]" >&2; exit 2 ;; esac
 ARCHIVE="$HOME/bin/_archive/replaced-by-brew-$(date +%F)"
 
+. "$(dirname "$0")/tool-release.sh"  # version_of_url
 field() { sed -n "s/^  $2 \"\(.*\)\"$/\1/p" "$1" | head -1; }
 has_placeholder_sha() { grep -qE '^  sha256 "0{64}"' "$1"; }
-pinned_version() {  # the version line, or the v<X.Y.Z> of the url's tarball when there is none
+pinned_version() {  # the version line, or the one the url's tarball names when there is none
   local v; v=$(field "$1" version)
-  [ -n "$v" ] || v=$(basename "$(field "$1" url)" .tar.gz | sed -n 's/^v\([0-9][0-9.]*\)$/\1/p')
+  [ -n "$v" ] || v=$(version_of_url "$(field "$1" url)" "$(basename "$1" .rb)")
   echo "$v"
 }
 wanted_version() {  # what a tool kept in this tap says; for another repo's tool, what its formula asks for
