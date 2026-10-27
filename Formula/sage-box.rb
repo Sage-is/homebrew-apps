@@ -1,9 +1,9 @@
 class SageBox < Formula
   desc "Set up a Mac as a Sage.is box over SSH, from one file per box"
   homepage "https://github.com/Sage-is/homebrew-apps"
-  url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/sage-box-v0.1.1.tar.gz"
-  version "0.1.1"
-  sha256 "a1c31072031fcc47b3c321bad8d4eeb4588c9aa9130bb1e0fb530b8196c2b866"
+  url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/sage-box-v0.1.2.tar.gz"
+  version "0.1.2"
+  sha256 "d09abeca80a05782c491da8a9a5583c6bcb7d54f2934c4cb6b12db86db5c89ec"
   license "MIT"
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
