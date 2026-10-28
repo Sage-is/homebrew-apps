@@ -18,7 +18,18 @@ version_of_url() {  # URL TOOL
   name=${name#"$2"-}  # a tool's own tag carries its name
   printf '%s\n' "$name" | sed -n 's/^v\([0-9][0-9.]*\)$/\1/p'
 }
-[ "${BASH_SOURCE[0]}" = "$0" ] || return 0  # sourced by the tests: the function is all they need
+# The image a release pins must already be in the registry. trellis-crm pins
+# the Trellis image of its own version (the formula's inreplace), so a
+# trellis-crm whose image is missing breaks every box that updates: it did on
+# 2026-10-28. Prints why and fails; any other tool passes.
+image_pushed() {  # TOOL VERSION
+  [ "$1" = trellis-crm ] || return 0
+  gh api "/orgs/sage-is/packages/container/trellis/versions" --paginate \
+    -q '.[].metadata.container.tags[]' 2>/dev/null | grep -qxF "$2" && return 0
+  echo "ghcr.io/sage-is/trellis:$2 is not in the registry: ship Trellis $2 first (its make ship pushes the image)" >&2
+  return 1
+}
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0  # sourced by the tests: the functions are all they need
 
 BRANCH=develop  # the tap's default branch: the one `brew update` reads
 
@@ -48,6 +59,7 @@ wait_for_archive() {  # GitHub serves a new tag's archive within seconds
 
 [ -f "$formula" ] || die "no $formula"
 case "$tool" in ai-ui*) die "ai-ui ships inside AI-UI's releases: run \`make ai_ui_formula\` after one" ;; esac
+image_pushed "$tool" "$version" || exit 1
 
 url=$(field url)
 pinned_version=$(field version)

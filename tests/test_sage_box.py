@@ -1451,6 +1451,57 @@ class Manage(Mac):
         self.assertIsNone(self.box_argv())
 
 
+class ImportPush(Mac):
+    """import push: a capture folder into the checkout's mockups/imports/NAME, as base64 on stdin."""
+
+    def setUp(self):
+        super().setUp()
+        self.checkout = self.root / "box checkout"
+        self.box(BOX_CHECKOUT=str(self.checkout))
+        self.probe(DONE)
+        (self.state / "exec").touch()
+        self.capture = self.root / "capture"
+        (self.capture / "raw").mkdir(parents=True)
+        (self.capture / "raw" / "a.json").write_bytes(b'{"x": 1}\x00\xff binary')
+        (self.capture / ".verify.json").write_text("{}")
+
+    def landed(self, label):
+        return self.checkout / "mockups" / "imports" / label
+
+    def test_the_folder_lands_byte_for_byte_and_a_new_push_replaces_it(self):
+        self.ok("pilot", "import", "push", str(self.capture), "cap-1")
+        self.assertEqual((self.landed("cap-1") / "raw" / "a.json").read_bytes(), b'{"x": 1}\x00\xff binary')
+        self.assertTrue((self.landed("cap-1") / ".verify.json").exists())
+        (self.capture / "raw" / "a.json").unlink()
+        (self.capture / "b.txt").write_text("second")
+        self.ok("pilot", "import", "push", str(self.capture), "cap-1")
+        self.assertFalse((self.landed("cap-1") / "raw" / "a.json").exists(), "a push replaces the folder")
+        self.assertEqual((self.landed("cap-1") / "b.txt").read_text(), "second")
+        self.assertFalse(self.landed("cap-1.new").exists())
+        self.assertNotIn("binary", "".join(self.calls()), "the data rides stdin, never a command line")
+
+    def test_bad_arguments_are_refused_before_the_vault(self):
+        for args in ((), ("pull", str(self.capture), "cap"), ("push", str(self.capture)),
+                     ("push", str(self.root / "missing"), "cap"), ("push", str(self.capture), "../cap"),
+                     ("push", str(self.capture), "a b"), ("push", str(self.capture), "-cap"),
+                     ("push", str(self.capture), "cap$(id)"), ("push", str(self.capture), "cap", "extra")):
+            with self.subTest(args=args):
+                result = self.run_cli("pilot", "import", *args)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.resolved(), [])
+        self.assertFalse((self.checkout / "mockups").exists())
+
+    def test_only_a_source_mode_box_takes_a_push(self):
+        for overrides in ({"BOX_MODE": "image", "BOX_CHECKOUT": None, "BOX_DEPLOY_KEY": None},
+                          {"BOX_MODE": "peer", "BOX_CHECKOUT": None, "BOX_DEPLOY_KEY": None,
+                           "BOX_GHCR_USER": None, "BOX_GHCR_TOKEN": None}):
+            with self.subTest(mode=overrides["BOX_MODE"]):
+                self.box(**overrides)
+                result = self.run_cli("pilot", "import", "push", str(self.capture), "cap")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.checkout / "mockups").exists())
+
+
 class Tunnel(Mac):
     """tunnel install: the env file on stdin to the box at mode 600, then the root helper's tunnel-daemon."""
 

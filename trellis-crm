@@ -23,7 +23,7 @@ source "$here/lib/sage-runtime.sh"
 IMAGE_REGISTRY="ghcr.io/sage-is/trellis"
 # The tool's own version; the release bumps it. The image tag is separate: the
 # formula pins it to the same version at install, and a checkout runs latest.
-VERSION="0.1.3"
+VERSION="0.1.4"
 DEFAULT_TAG="latest"
 IMAGE="$IMAGE_REGISTRY:$DEFAULT_TAG"
 CONTAINER="trellis-crm"
@@ -61,7 +61,7 @@ TRELLIS_REMOTE="Sage-is/trellis"
 # The repo is private: SSH, so a read-only deploy key is all a box needs.
 TRELLIS_CLONE_URL="${TRELLIS_CLONE_URL:-git@github.com:Sage-is/trellis.git}"
 # The manage.py commands `manage` runs, each with its own shape of arguments.
-MANAGE_USAGE="manage seed_profile | loaddata NAME | import_sheet /app/FILE.csv --sheet NAME [--create]"
+MANAGE_USAGE="manage seed_profile | loaddata NAME | import_sheet /app/FILE.csv --sheet NAME [--create] | import_incumbent /app/mockups/imports/NAME --source SOURCE [--apply]"
 
 usage() {
   cat <<EOF
@@ -937,6 +937,9 @@ backup_into() {
 #   loaddata NAME                                 a fixture by name, never a path
 #   import_sheet /app/FILE.csv --sheet NAME [--create]
 #                                                 a CSV in the code folder (/app)
+#   import_incumbent /app/mockups/imports/NAME --source SOURCE [--apply]
+#                                                 a capture `sage-box BOX import push` sent;
+#                                                 a dry run unless --apply
 refuse_manage() {
   echo "Error: $PROG refuses that: $1. It runs only: $MANAGE_USAGE" >&2
   exit 2
@@ -944,6 +947,7 @@ refuse_manage() {
 
 cmd_manage() {
   local fixture_re='^[A-Za-z0-9][A-Za-z0-9_-]*$' sheet_re='^[A-Za-z0-9][A-Za-z0-9 ._-]*$' file_re='^/app/[A-Za-z0-9_./-]+\.csv$'
+  local import_re='^/app/mockups/imports/[A-Za-z0-9][A-Za-z0-9_-]*$'
   case "${1:-}" in
     seed_profile)
       [[ $# -eq 1 ]] || refuse_manage "seed_profile takes no arguments" ;;
@@ -954,6 +958,11 @@ cmd_manage() {
         refuse_manage "import_sheet takes /app/FILE.csv --sheet NAME, then --create or nothing"
       [[ "$2" =~ $file_re && "$2" != *..* ]] || refuse_manage "the file is a .csv under /app/, with no .. in its path"
       [[ "$4" =~ $sheet_re ]] || refuse_manage "a sheet name is letters, digits, spaces, . _ and -" ;;
+    import_incumbent)
+      [[ ( $# -eq 4 || ( $# -eq 5 && "${5:-}" == --apply ) ) && "$3" == --source ]] ||
+        refuse_manage "import_incumbent takes /app/mockups/imports/NAME --source SOURCE, then --apply or nothing"
+      [[ "$2" =~ $import_re ]] || refuse_manage "the folder is /app/mockups/imports/NAME, where sage-box import push puts it"
+      [[ "$4" =~ $fixture_re ]] || refuse_manage "a source is letters, digits, _ and -" ;;
     # Never echo it: the refusal should not carry what someone typed to the terminal.
     *) refuse_manage "no such command here" ;;
   esac

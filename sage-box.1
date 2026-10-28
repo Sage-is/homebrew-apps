@@ -48,6 +48,11 @@
 .Nm
 .Ar box
 .Op Fl -as-me
+.Cm import push
+.Ar dir name
+.Nm
+.Ar box
+.Op Fl -as-me
 .Cm tunnel install
 .Fl -env-file Ar path
 .Nm
@@ -309,10 +314,20 @@ Run
 .Li trellis-crm manage
 on the box, every argument as typed, its exit code back. The box runs
 .Cm seed_profile ,
-.Cm loaddata Ar name
+.Cm loaddata Ar name ,
+.Cm import_sheet Pa /app/file.csv Fl -sheet Ar name Op Fl -create
 and
-.Cm import_sheet Pa /app/file.csv Fl -sheet Ar name Op Fl -create ,
+.Cm import_incumbent Pa /app/mockups/imports/name Fl -source Ar source Op Fl -apply ,
 and refuses anything else with exit 2.
+.It Cm import push Ar dir name
+Send the folder
+.Ar dir
+to a source-mode box's checkout as
+.Pa mockups/imports/ Ns Ar name ,
+which git ignores and Trellis reads as
+.Pa /app/mockups/imports/ Ns Ar name .
+It travels as base64 on stdin through the admin door, unpacks beside the old
+copy and only then replaces it, at umask 077.
 .It Cm tunnel install Fl -env-file Ar path
 Send the env file
 .Xr sage-tunnel 1

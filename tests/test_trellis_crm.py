@@ -1329,7 +1329,9 @@ class Manage(Mac):
     def test_the_allowed_commands_reach_the_container_as_typed(self):
         for args in (["seed_profile"], ["loaddata", "isa_page44"],
                      ["import_sheet", "/app/crm/fixtures/sheet-sample.csv", "--sheet", "pilot"],
-                     ["import_sheet", "/app/team.csv", "--sheet", "Ops sheet 2.b", "--create"]):
+                     ["import_sheet", "/app/team.csv", "--sheet", "Ops sheet 2.b", "--create"],
+                     ["import_incumbent", "/app/mockups/imports/agentlocator-2026-10-28", "--source", "agentlocator"],
+                     ["import_incumbent", "/app/mockups/imports/cap_1", "--source", "agentlocator", "--apply"]):
             with self.subTest(args=args):
                 (self.state / "exec-argv").unlink(missing_ok=True)
                 self.ok("manage", *args)
@@ -1348,7 +1350,22 @@ class Manage(Mac):
                      ("import_sheet", "/app/x.txt", "--sheet", "p"), ("import_sheet", "/app/x y.csv", "--sheet", "p"),
                      ("import_sheet", "/app/x.csv", "--create", "--sheet", "p"), ("import_sheet", "/app/x.csv", "--sheet", "p", "--force"),
                      ("import_sheet", "/app/x.csv", "--sheet", "-p"), ("import_sheet", "/app/x.csv", "--sheet", "p", "--create", "--create"),
-                     ("import_sheet", "/app/x.csv", "--sheet", "p$(id)")):
+                     ("import_sheet", "/app/x.csv", "--sheet", "p$(id)"),
+                     ("import_incumbent",), ("import_incumbent", "/app/mockups/imports/cap"),
+                     ("import_incumbent", "/app/mockups/imports/cap", "--source"),
+                     ("import_incumbent", "/data/cap", "--source", "agentlocator"),
+                     ("import_incumbent", "/app/mockups/imports/../../data", "--source", "agentlocator"),
+                     ("import_incumbent", "/app/mockups/imports/cap/x", "--source", "agentlocator"),
+                     ("import_incumbent", "/app/mockups/imports/cap/", "--source", "agentlocator"),
+                     ("import_incumbent", "/app/mockups/imports/a b", "--source", "agentlocator"),
+                     ("import_incumbent", "/app/mockups/imports/-cap", "--source", "agentlocator"),
+                     ("import_incumbent", "/app/crm", "--source", "agentlocator"),
+                     ("import_incumbent", "/app/mockups/imports/cap", "--source", "-x"),
+                     ("import_incumbent", "/app/mockups/imports/cap", "--source", "agent;id"),
+                     ("import_incumbent", "/app/mockups/imports/cap", "--apply", "--source", "agentlocator"),
+                     ("import_incumbent", "/app/mockups/imports/cap", "--source", "agentlocator", "--force"),
+                     ("import_incumbent", "/app/mockups/imports/cap", "--source", "agentlocator", "--apply", "--apply"),
+                     ("import_incumbent", "/app/mockups/imports/cap$(id)", "--source", "agentlocator")):
             with self.subTest(args=args):
                 result = self.run_cli("manage", *args)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

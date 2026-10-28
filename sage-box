@@ -21,7 +21,7 @@ set -euo pipefail
 #   me      --as-me: the person's own SSH agent, such as a FIDO key.
 #   legacy  BOX_SSH_KEY and BOX_SUDO from the vault, until every box has windows.
 # Admin verbs take the first of window, me and legacy that is there, or stop.
-VERSION="0.1.2"
+VERSION="0.1.3"
 PROG="sage-box"
 # The runtime code lives in lib/ beside this script, in a checkout and in the
 # formula's libexec alike. A link to it, such as one in ~/bin, leads there.
@@ -136,6 +136,7 @@ usage() {
 Usage: $PROG <box> [--as-me] [--apply] [--reboot]
        $PROG <box> [--as-me] update | mailbox ... | manage CMD [ARGS]
        $PROG <box> [--as-me] tunnel install --env-file PATH
+       $PROG <box> [--as-me] import push DIR NAME
        $PROG <box> backup [--init | --nightly]
        $PROG <box> status | read VERB
        $PROG <box> unlock [--hours N] | lock
@@ -173,6 +174,11 @@ changes nothing. docs/boxes/access.md has the doors and their keys.
   manage      trellis-crm manage on the box, the same way: seed_profile,
               loaddata NAME, import_sheet /app/FILE.csv --sheet NAME [--create];
               the box refuses anything else with exit 2
+  import push DIR NAME
+              send a capture folder to a source-mode box's checkout as
+              mockups/imports/NAME, which git ignores and Trellis reads as
+              /app/mockups/imports/NAME (manage import_incumbent); base64 on
+              stdin, so nothing rides a command line; a new push replaces it
   tunnel install --env-file PATH
               send the env file sage-tunnel create wrote (it holds the token)
               to the box on stdin, mode 600, then load the tunnel LaunchDaemon
@@ -1932,6 +1938,26 @@ cmd_manage() {
   remote "trellis-crm manage$(quoted "$@")" </dev/null
 }
 
+# --- a capture folder to import --------------------------------------------------------
+
+# The folder lands in the checkout as mockups/imports/NAME: git ignores
+# mockups/, and Trellis's container mounts the checkout at /app, so trellis-crm
+# manage import_incumbent reads it there. It travels as base64 on stdin through
+# the admin door (a NUL byte survives no shell), unpacks into NAME.new and only
+# then replaces NAME, so a broken push leaves the last good one. umask 077: the
+# capture holds real people's data.
+cmd_import() {
+  local name="$1" verb="${2:-}" dir="${3:-}" label="${4:-}" checkout
+  [[ "$verb" == push && $# -eq 4 ]] || die "import takes: push DIR NAME"
+  [[ -d "$dir" ]] || die "no folder at $dir"
+  [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "NAME is letters, digits, _ and -, starting with a letter or digit"
+  trellis_box "$name" "checkout to import into"
+  [[ "$BOX_MODE" == source ]] || die "import push needs a source-mode box: the folder lands in its checkout, which Trellis mounts at /app"
+  checkout="$(printf '%q' "$BOX_CHECKOUT")"
+  echo "Sending $dir to $name as /app/mockups/imports/$label, $DOOR_WORDS..."
+  tar -C "$dir" -cf - . | base64 | remote_stdin "set -e; umask 077; d=$checkout/mockups/imports/$label; rm -rf \"\$d.new\"; mkdir -p \"\$d.new\"; base64 -d | tar -xf - -C \"\$d.new\"; rm -rf \"\$d\"; mv \"\$d.new\" \"\$d\"; echo \"  \$(du -sh \"\$d\" | cut -f1) in \$d\""
+}
+
 # --- the tunnel ------------------------------------------------------------------------
 
 # What the box sources at each start of the tunnel: NAME=value lines, comments
@@ -2089,6 +2115,7 @@ case "$sub" in
   lock) cmd_lock "$name" ;;
   mailbox) shift; cmd_mailbox "$name" "$@" ;;
   manage) shift; cmd_manage "$name" "$@" ;;
+  import) shift; cmd_import "$name" "$@" ;;
   tunnel) shift; cmd_tunnel "$name" "$@" ;;
   ""|--apply|--reboot|--as-me)
     while [[ $# -gt 0 ]]; do
