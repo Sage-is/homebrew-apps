@@ -49,8 +49,9 @@ VERSION = "0.1.0"
 STORE = Path.home() / ".config" / "configstore" / "caprover.json"
 API = "/api/v2"
 # A name holding any of these hides its value in every summary. ADMIN: STALWART_RECOVERY_ADMIN
-# is user:secret, and ensure printed it in clear three times before ADMIN was listed.
-SECRET_KEYS = ("PASSWORD", "SECRET", "KEY", "TOKEN", "ADMIN")
+# is user:secret, and ensure printed it in clear three times before ADMIN was listed. PASS and PWD:
+# GITEA__database__PASSWD and MYSQL_PWD hold none of the other words.
+SECRET_KEYS = ("PASS", "PWD", "SECRET", "KEY", "TOKEN", "ADMIN")
 OK = 100
 DEPLOY_STARTED = 101  # a detached upload answers this, not 100
 PARTIAL = 102  # done, with a caveat in the description (e.g. a volume still in use was not deleted)

@@ -15,13 +15,18 @@
   - [x] [WE] Steps `access` and `keys`: dispatcher, root helper (fixed verbs), sudoers drop-in per verb (`visudo -cf`), tagged key lines; root installs only copies matching digests on its own command line, `/usr/bin/sudo` by path
   - [x] [WE] `load_box` resolves only what a command needs; `-F none` and `IdentitiesOnly=yes`; ControlMaster per door; `sudo_remote` gone with the `sudo -n` bug; 87 tests, shellcheck, bash 3.2
   - [x] [WE] `sage-box.1`, `docs/boxes/access.md`, `example.env`; `make box_read` in Trellis (feature branch) and AI-UI: `$(value)` and env only, `$` refused; injection tried, nothing ran
-  - [ ] [MANUALLY] Commit, bump `sage-box` to 0.1.1, `make tool_release TOOL=sage-box VERSION=0.1.1 APPLY=1`; then `--as-me --apply` on pilot installs the doors (the password once)
+  - [ ] [MANUALLY] Committed `56f9412`, README `d10298c`, bump `e8cb01d` (2026-10-25); next `make tool_release TOOL=sage-box VERSION=0.1.1 APPLY=1`; then `make box_up BOX=pilot APPLY=1` installs the doors
   - [x] [WE] The root helper's Homebrew install needs Apple's notarization and Homebrew's signing team `927JGANW46` (read from the real package 2026-10-22); any other signer is refused
   - [x] [WE] `status` says whether launchd holds the backup job and how old the newest backup is, WARNING past 26 h; `--apply` reloads a job that was never loaded (the pilot's, 2026-10-22: 0.1.0's `sudo -n` bootstrap failed)
   - [x] [WE] Fixed: `load_box` cleared the tool's own `BOX_BACKUPS` constant (every `BOX_` name goes), which broke the backup pull; now `TRELLIS_BACKUPS`, and a test refuses any `BOX_` constant; 90 tests
-  - [ ] Open: `rotate-key read`, `unlock --all`, an ops key for the unattended nightly pull (it still needs the legacy key)
+  - [x] [WE] `trellis-crm manage` (allowlisted manage.py), `sage-box <box> manage`, Trellis `make box_manage` (`40fb450`, Trellis `3f39d1e`, 2026-10-26)
+  - [x] [WE] Root verb `tunnel-daemon` and `sage-box <box> tunnel install --env-file` (checked env file on stdin); `cloudflared` via the tools step when `BOX_TUNNEL` is set
+  - [x] [WE] Box backups never recopy: `trellis-crm backup --dir` staging, rsync `--link-dest` pull into an encrypted sparse bundle, own read-only rrsync door key; `age`/`scp` gone; 118 + 117 tests
+  - [ ] [MANUALLY] Release sage-box 0.1.2 and trellis-crm 0.1.3 after the push packet (run sheet 3b)
+  - [ ] Upstream: homebrew-core's rsync installs an `rrsync` that runs `/usr/bin/rsync` (openrsync on macOS), so `-ro` confinement fails; our door swaps in brew rsync until fixed
+  - [ ] Open: `rotate-key read`, `unlock --all`; `trellis-crm restore` from a snapshot folder (it takes only `.tar.gz` today)
   - [ ] [MANUALLY] FIDO: an `ed25519-sk` CA and admin key on each device (`ecdsa-sk` on U2F-only), a spare of each; `brew install openssh` here if Apple's `ssh-keygen -t ed25519-sk` refuses
-  - [ ] [MANUALLY] Vault: `<box>-read-key` into `Agents`; after the window ships, retire `<box>-ssh-key` and move `<box>-user` to a humans-only collection
+  - [ ] Vault: `<box>-read-key` per box (pilot's stored 2026-10-25 as `bw:pilot-read-key` in Agents-edit); after the window ships, retire `<box>-ssh-key` and move `<box>-user` to a humans-only collection
   - [x] [WE] Tailnet policy drafted (2026-10-22): OPS-Sage `deploy/tailscale/policy.hujson`; `tag:box` reachable from `autogroup:admin` on port 22 only, no box-initiated traffic, Tailscale SSH off
   - [ ] [MANUALLY] Tailnet: tag both boxes `tag:box`, rename them `box-pilot` and `box-school-b` (both names carry real names today), then paste the policy
   - [ ] [MANUALLY] Allow rule `Bash(make box_read BOX=* WHAT=*)` in the Trellis and AI-UI `.claude/settings.json`

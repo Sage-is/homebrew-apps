@@ -75,6 +75,8 @@ DATA MODEL — OFFLOAD_TARGETS
     <TARGET_HOME> -> same as <TH> (older configs)
     <U>     -> $(basename "$TARGET_HOME")
     <DATE>  -> YYYY-MM-DD
+    <DARWIN_X> -> the X folder beside $(getconf DARWIN_USER_TEMP_DIR); only
+               your own (in another user's home the row is absent)
     HOT/    -> a HOT drive: $OFFLOAD_HOT, else an OFFLOAD_DRIVES SSD
     COLD/   -> a COLD drive: $OFFLOAD_COLD, else an OFFLOAD_DRIVES spinner
     CLOUD/  -> the first rclone remote in OFFLOAD_APPROVED_REMOTES
@@ -93,11 +95,23 @@ DATA MODEL — OFFLOAD_TARGETS
     merge       — rsync --update into existing dest, rm source
                   (dest is authoritative; source is gone)
     sweep       — find subdirs matching internal patterns and delete
-                  (no destination; data is rebuildable from source code)
+                  (no destination; data is rebuildable from source code).
+                  On <DARWIN_X> it takes only stale Chromium code-sign
+                  clones (<bundle-id>.code_sign_clone/code_sign_clone.*):
+                  a clone held open (lsof +D) or made in the last
+                  OFFLOAD_CLONE_GRACE_MIN minutes stays
     purge       — delete the entire source dir, recreate empty. For
                   caches and rebuild-on-demand support files (iOS
                   DeviceSupport, ~/.cache, ~/.npm, Homebrew cache,
                   simulator runtimes/caches). Apps re-populate.
+    trim        — database-driven trim of old, large files inside an
+                  app's own store (today: Signal attachments, chosen
+                  from the app's database by age and size). Files only;
+                  message rows stay as placeholders, exactly like
+                  in-app delete. Needs the sqlcipher CLI and the python
+                  cryptography package; refuses --apply while the app
+                  runs. Scope from OFFLOAD_TRIM_BEFORE_DAYS (365),
+                  OFFLOAD_TRIM_MIN_MB (10) and OFFLOAD_TRIM_WHO ("").
     native-ui   — printed instructions only; the tool never auto-mutates
                   media libraries (Photos, Music.app, iMovie) because
                   those apps have safer native "Choose Library" UIs
@@ -160,9 +174,14 @@ CONFIGURATION
     OFFLOAD_APPROVED_REMOTES=( "team-b2-crypt:offload" )  rclone remotes for CLOUD/
 
   Environment: OFFLOAD_HOT, OFFLOAD_COLD, OFFLOAD_HEADROOM, OFFLOAD_CONF,
-  OFFLOAD_REPO_COLD_DAYS (90), OFFLOAD_ALLOW_PLAINTEXT=1 (private data on a
-  plain drive, at your own risk), OFFLOAD_PRICES_URL; OFFLOAD_VOLUMES and
-  OFFLOAD_BZINFO point the drive scan elsewhere (tests).
+  OFFLOAD_REPO_COLD_DAYS (90), OFFLOAD_CLONE_GRACE_MIN (10),
+  OFFLOAD_TRIM_BEFORE_DAYS (365), OFFLOAD_TRIM_MIN_MB (10),
+  OFFLOAD_TRIM_WHO ("" matches all conversations), OFFLOAD_TRIM_RAW_KEY
+  (tests only: 64-hex SQLCipher key, skips the Keychain unwrap),
+  OFFLOAD_ALLOW_PLAINTEXT=1 (private data on a plain drive, at your own
+  risk), OFFLOAD_PRICES_URL; OFFLOAD_VOLUMES and
+  OFFLOAD_BZINFO point the drive scan elsewhere, and
+  OFFLOAD_DARWIN_USER_TEMP_DIR stands in for getconf's (tests).
 
 DESIGN — Poka-Yoke Discipline
   1. Single source of truth. OFFLOAD_TARGETS is the only list.
@@ -239,8 +258,19 @@ EXAMPLES
     offload move BuildCruft
     offload move BuildCruft --apply
 
+  Stale browser copies (Chrome, Brave, any Chromium browser):
+    offload move CodeSignClones            # what goes, what stays and why
+    offload move CodeSignClones --apply    # frees up to the total; APFS clones
+                                           # share blocks and a Time Machine local
+                                           # snapshot can hold them a while
+
   Move one specific app:
     offload move Signal --apply
+
+  Trim old, large files inside an app's own store (report, then delete):
+    offload move SignalStorage                   # per-conversation table + proposed batch
+    offload move SignalStorage --apply           # Signal must be quit; scope from
+                                                 # OFFLOAD_TRIM_BEFORE_DAYS/MIN_MB/WHO
 
   Move every entry in a category:
     offload move app --apply        # all Application Support entries
@@ -291,6 +321,7 @@ AUTHOR
 
 from __future__ import annotations
 
+import datetime
 import getpass
 import json
 import math
@@ -313,6 +344,8 @@ VERSION = "0.8.1"
 DEFAULT_TARGETS = [
     # Application Support symlinks
     "Signal|app|<TH>/Library/Application Support/Signal|HOT/MovedAppData/<U>/Signal|symlink|no|Signal",
+    # Signal attachment trim (files-only delete of old, large attachments; message rows stay)
+    "SignalStorage|app|<TH>/Library/Application Support/Signal|(in-place trim)|trim|no|-",
     "Obsidian|app|<TH>/Library/Application Support/obsidian|HOT/MovedAppData/<U>/Obsidian|symlink|no|Obsidian",
     "Steam|app|<TH>/Library/Application Support/Steam|HOT/MovedAppData/<U>/Steam|symlink|no|Steam",
     "Keybase|app|<TH>/Library/Application Support/Keybase|HOT/MovedAppData/<U>/Keybase|symlink|no|Keybase",
@@ -342,6 +375,8 @@ DEFAULT_TARGETS = [
     "CoreSimulator|dev|<TH>/Library/Developer/CoreSimulator|HOT/MovedAppData/<U>/CoreSimulator|symlink|no|-",
     # Build-cruft sweep (delete in place; rebuildable from source)
     "BuildCruft|sweep|<TH>/Documents/Projects/GitHub|(in-place delete)|sweep|no|-",
+    # Chromium browsers copy themselves here at launch and can leave the copy; a sweep on <DARWIN_X> takes stale ones only
+    "CodeSignClones|sweep|<DARWIN_X>|(in-place delete)|sweep|no|-",
     # Cold git clones: clean + pushed ones leave a bundle on COLD and go; the rest move whole to COLD
     "Repos|repos|<TH>/Documents/Projects|COLD/offload/Repos/<U>|repos|no|-",
     # Purge: delete the source dir, recreate empty; apps re-populate
@@ -366,6 +401,12 @@ DEFAULT_TARGETS = [
 
 # Build-cruft folder names (sweep strategy; repos treat them as rebuildable).
 SWEEP_DIRNAMES = ["node_modules", ".venv", "venv", "target", "build", "dist", "__pycache__", ".next"]
+
+# Chromium's code-sign clones: <DARWIN_X>/<bundle-id>.code_sign_clone/code_sign_clone.XXXXXX (mkdtemp).
+CLONE_NAME = re.compile(r"code_sign_clone\..+")
+CLONE_GRACE_MIN = int(os.environ.get("OFFLOAD_CLONE_GRACE_MIN", "10"))   # a clone this young may not be open yet
+CLONE_CAVEAT = ("the clones share APFS blocks, so du overstates the reclaim, and a Time Machine local "
+                "snapshot holds deleted blocks, so free space can lag")
 
 GIB = 1 << 30
 
@@ -611,8 +652,25 @@ def target_user() -> str:
     return os.path.basename(S.target_home.rstrip("/"))
 
 
+_DARWIN_X: Optional[str] = None
+
+
+def darwin_x() -> str:
+    """The X folder beside $(getconf DARWIN_USER_TEMP_DIR); "" in another user's home, as getconf names only ours."""
+    global _DARWIN_X
+    if S.target_home.rstrip("/") != S.home.rstrip("/"):
+        return ""
+    if _DARWIN_X is None:
+        temp = os.environ.get("OFFLOAD_DARWIN_USER_TEMP_DIR") or capture(["getconf", "DARWIN_USER_TEMP_DIR"]).strip()
+        _DARWIN_X = os.path.normpath(os.path.join(temp, "..", "X")) if temp else ""
+    return _DARWIN_X
+
+
 def expand(path: str, drives: bool = True) -> str:
-    """Replace <TH> <TARGET_HOME> <U> <DATE>; with drives=True also HOT/ and COLD/ (the primary drives)."""
+    """Replace <TH> <TARGET_HOME> <U> <DATE> <DARWIN_X>; with drives=True also HOT/ and COLD/ (the primary drives)."""
+    if "<DARWIN_X>" in path:
+        x = darwin_x()
+        path = path.replace("<DARWIN_X>", x) if x else ""   # never a path with the folder left out
     path = (path.replace("<TH>", S.target_home).replace("<TARGET_HOME>", S.target_home)
             .replace("<U>", target_user()).replace("<DATE>", S.date_tag))
     if drives and path.startswith("HOT/"):
@@ -729,6 +787,76 @@ def sweep_dirs(root: str) -> Iterator[str]:
             elif not os.path.islink(full):
                 keep.append(name)
         dirs[:] = keep
+
+
+def clone_root(src: str) -> bool:
+    """A sweep row on the user's X folder takes stale code-sign clones, never build cruft."""
+    x = darwin_x()
+    return bool(x and src) and os.path.realpath(src) == os.path.realpath(x)
+
+
+def clone_path_ok(path: str, root: str) -> bool:
+    """path is root/*.code_sign_clone/code_sign_clone.?*, a real folder, with no link between it and root."""
+    root = os.path.normpath(root)
+    holder, name = os.path.split(path)
+    if os.path.dirname(holder) != root or not holder.endswith(".code_sign_clone") or not CLONE_NAME.fullmatch(name):
+        return False
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):   # a link or a file is never a clone
+            return False
+    except OSError:
+        return False
+    # Resolved, a link anywhere below root (the holder or the clone) lands somewhere else.
+    return os.path.realpath(path) == os.path.join(os.path.realpath(root), os.path.basename(holder), name)
+
+
+def clones_held_open(holder: str) -> Optional[set]:
+    """Clone names in holder with a file open below them; None when lsof cannot tell, which keeps them all."""
+    real = os.path.realpath(holder)                   # lsof names files by real path (/private/var/...)
+    try:
+        proc = subprocess.run(["lsof", "-w", "-Fn", "+D", real], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.stderr.strip():
+        return None                                   # lsof exits 1 both for "nothing open" and for a failure
+    prefix = "n" + real + "/"
+    return {line[len(prefix):].split("/", 1)[0] for line in proc.stdout.splitlines() if line.startswith(prefix)}
+
+
+def code_sign_clones(root: str) -> tuple:
+    """Stale clone paths, and (path, reason) for each kept: a clone held open or younger than the grace stays.
+
+    Chromium makes the clone at launch and its cleanup helper removes it on a clean exit (macOS also empties X
+    at boot), so a clone no process holds is dead, newest or not. The grace covers making a clone and opening it."""
+    root, stale, kept = os.path.normpath(root), [], []
+    fresh = time.time() - CLONE_GRACE_MIN * 60
+    try:
+        holders = sorted(e.path for e in os.scandir(root)
+                         if e.name.endswith(".code_sign_clone") and e.is_dir(follow_symlinks=False))
+    except OSError:
+        return stale, kept
+    for holder in holders:
+        try:
+            clones = sorted((e.stat(follow_symlinks=False).st_mtime, e.path)
+                            for e in os.scandir(holder) if clone_path_ok(e.path, root))
+        except OSError:
+            continue                                  # an unreadable browser folder keeps every clone
+        held = clones_held_open(holder) if clones else set()
+        for mtime, path in clones:
+            if held is None:
+                kept.append((path, "lsof cannot tell what is open"))
+            elif os.path.basename(path) in held:
+                kept.append((path, "held open"))
+            elif mtime > fresh:
+                kept.append((path, f"made under {CLONE_GRACE_MIN} min ago"))
+            else:
+                stale.append(path)
+    return stale, kept
+
+
+def swept(src: str) -> Iterator[str]:
+    """What a sweep row deletes: stale code-sign clones on the user's X folder, build cruft anywhere else."""
+    return iter(code_sign_clones(src)[0]) if clone_root(src) else sweep_dirs(src)
 
 
 # ----------------------------------------------------------------------------
@@ -875,8 +1003,14 @@ def strategy_merge(src: str, dst: str, label: str) -> None:
 
 def strategy_sweep(src: str, _dst: str, label: str) -> None:
     log(f"=== {label} (strategy=sweep) ===")
+    if not src:
+        log("  SKIP: another user's temp folder; run offload as that user")
+        return
     if not os.path.isdir(src):
         log(f"  SKIP: {src} missing")
+        return
+    if clone_root(src):
+        sweep_clones(src)
         return
     manual_step("Confirm no active builds running (npm run dev, cargo watch, etc.)")
     total = 0
@@ -888,6 +1022,23 @@ def strategy_sweep(src: str, _dst: str, label: str) -> None:
     log(f"  Total: {human(total)}")
 
 
+def sweep_clones(root: str) -> None:
+    """Delete stale code-sign clones; each path is checked again just before its rm."""
+    stale, kept = code_sign_clones(root)
+    for path, why in kept:
+        log(f"  KEEP ({why}): {path}")
+    total = 0
+    for path in stale:
+        size = du_bytes(path)
+        if not clone_path_ok(path, root):
+            warn(f"  SKIP: {path} is no longer a plain clone folder")
+            continue
+        total += size
+        log(f"  {size // 1024:>10} KB  {path}")
+        run(["rm", "-rf", path])
+    log(f"  Total: up to {human(total)}; {CLONE_CAVEAT}" if total else "  Total: nothing stale")
+
+
 def strategy_purge(src: str, _dst: str, label: str) -> None:
     log(f"=== {label} (strategy=purge) ===")
     if not os.path.isdir(src):
@@ -897,6 +1048,235 @@ def strategy_purge(src: str, _dst: str, label: str) -> None:
     run(["rm", "-rf", src])
     run(["mkdir", "-p", src])
     log(f"  DONE: {src} purged (recreated empty)")
+
+
+# Signal attachment trim (strategy=trim): database-driven, files-only delete
+# of old, large attachments. Message rows stay as placeholders, exactly like
+# in-app delete. Scope from OFFLOAD_TRIM_BEFORE_DAYS (365),
+# OFFLOAD_TRIM_MIN_MB (10) and OFFLOAD_TRIM_WHO ("" matches all).
+OFFLOAD_TRIM_BEFORE_DAYS = int(os.environ.get("OFFLOAD_TRIM_BEFORE_DAYS", "365"))
+OFFLOAD_TRIM_MIN_MB = float(os.environ.get("OFFLOAD_TRIM_MIN_MB", "10"))
+OFFLOAD_TRIM_WHO = os.environ.get("OFFLOAD_TRIM_WHO", "")
+OFFLOAD_TRIM_RAW_KEY = os.environ.get("OFFLOAD_TRIM_RAW_KEY", "")  # tests only
+
+TRIM_SAFE_STORAGE_SERVICE = "Signal Safe Storage"
+
+
+def trim_select(rows: list, cutoff_ms: int, min_bytes: int, who: str) -> list:
+    """Pick (name, size, sent, path) rows for deletion: old, big, deduped by
+    path. Pure: no filesystem, no database."""
+    seen, picked, needle = set(), [], (who or "").lower()
+    for name, size, sent, path in rows:
+        if not path or path in seen:
+            continue
+        if sent >= cutoff_ms or size < min_bytes:
+            continue
+        if needle and needle not in (name or "").lower():
+            continue
+        seen.add(path)
+        picked.append((name, size, sent, path))
+    return picked
+
+
+def trim_target_path(base: str, relpath: str) -> Optional[str]:
+    """Absolute path for a store-relative attachment path, or None when it
+    escapes the store. Every path is checked again just before its rm."""
+    full = os.path.realpath(os.path.join(base, relpath))
+    if not full.startswith(base.rstrip(os.sep) + os.sep):
+        return None
+    return full
+
+
+def trim_crypto():
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    except ImportError:
+        die("trim needs the python 'cryptography' package (pip install cryptography)")
+    return hashes, Cipher, algorithms, modes, PBKDF2HMAC
+
+
+def signal_sqlkey(profile: str) -> str:
+    """Unwrap Signal Desktop's SQLCipher key. Production path: the Safe Storage
+    password from the login keychain, PBKDF2-SHA1 (salt 'saltysalt', 1003 iters)
+    to AES-128, CBC with a spaces IV over the config.json 'v10' blob. The key
+    lives in memory only: never printed, never on a command line."""
+    if OFFLOAD_TRIM_RAW_KEY:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", OFFLOAD_TRIM_RAW_KEY):
+            die("OFFLOAD_TRIM_RAW_KEY must be 64 hex chars")
+        return OFFLOAD_TRIM_RAW_KEY
+    hashes, Cipher, algorithms, modes, PBKDF2HMAC = trim_crypto()
+    pw = subprocess.run(["security", "find-generic-password",
+                         "-s", TRIM_SAFE_STORAGE_SERVICE, "-w"],
+                        capture_output=True, text=True, timeout=30)
+    if pw.returncode != 0:
+        die(f"trim needs the login-keychain item '{TRIM_SAFE_STORAGE_SERVICE}'")
+    blob = bytes.fromhex(json.load(open(os.path.join(profile, "config.json")))["encryptedKey"])
+    ct = blob[3:]
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA1(), length=16, salt=b"saltysalt", iterations=1003)
+    key = kdf.derive(pw.stdout.strip().encode())
+    d = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).decryptor()
+    pt = d.update(ct) + d.finalize()
+    return pt[:-pt[-1]].decode()
+
+
+def signal_query(profile: str, sql: str) -> list:
+    """Run read-only SQL against Signal's store. Callers select a single hex()
+    blob per row: this sqlcipher build renders raw 0x1F bytes as ^_ on stdout,
+    so the separator travels as hex and is decoded here."""
+    if not shutil.which("sqlcipher"):
+        die("trim needs the sqlcipher CLI (brew install sqlcipher)")
+    key = signal_sqlkey(profile)
+    db = os.path.join(profile, "sql", "db.sqlite")
+    p = subprocess.run(["sqlcipher", db],
+                       input=f"PRAGMA key = \"x'{key}'\";\n.mode list\n" + sql,
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        die("trim could not open Signal's database: " + (p.stderr or "")[:200])
+    rows = []
+    for line in (p.stdout or "").splitlines():
+        line = line.strip()
+        if not line or line == "ok" or set(line) - set("0123456789abcdefABCDEF"):
+            continue
+        try:
+            text = bytes.fromhex(line).decode("utf-8")
+        except ValueError:
+            continue
+        rows.append(text.split(""))
+    return rows
+
+
+TRIM_TOTALS_SQL = ("SELECT hex(a.conversationId || CHAR(31) ||"
+                   " COALESCE(c.name,c.profileName,c.e164,c.id) || CHAR(31) ||"
+                   " COUNT(*) || CHAR(31) || SUM(a.size)) FROM message_attachments a"
+                   " LEFT JOIN conversations c ON c.id=a.conversationId"
+                   " WHERE a.attachmentType='attachment' GROUP BY a.conversationId"
+                   " ORDER BY SUM(a.size) DESC;")
+
+
+def trim_batch_sql(cutoff_ms: int, min_bytes: int, who: str) -> str:
+    who_clause = ""
+    if who:
+        esc = who.replace("'", "''")
+        who_clause = (f" AND (c.name LIKE '%{esc}%' OR c.profileName LIKE '%{esc}%'"
+                      f" OR c.e164 LIKE '%{esc}%')")
+    return ("SELECT hex(COALESCE(c.name,c.profileName,c.e164,c.id) || CHAR(31) || a.size"
+            " || CHAR(31) || datetime(a.sentAt/1000,'unixepoch','localtime')"
+            " || CHAR(31) || a.path) FROM message_attachments a"
+            " LEFT JOIN conversations c ON c.id=a.conversationId"
+            " WHERE a.attachmentType='attachment' AND a.path IS NOT NULL"
+            f" AND a.sentAt < {cutoff_ms} AND a.size >= {min_bytes}{who_clause}"
+            " ORDER BY a.size DESC;")
+
+
+def signal_running() -> bool:
+    p = subprocess.run(["pgrep", "-f", "Signal.app/Contents/MacOS/Signal"],
+                       capture_output=True, text=True)
+    return bool(p.stdout.strip())
+
+
+TRIM_SUMMARY_SQL = ("SELECT hex(COUNT(*) || CHAR(31) || COALESCE(SUM(a.size),0))"
+                    " FROM message_attachments a LEFT JOIN conversations c"
+                    " ON c.id=a.conversationId WHERE a.attachmentType='attachment'"
+                    " AND a.path IS NOT NULL AND a.sentAt < {cutoff} AND a.size >= {floor}{who};")
+
+
+def trim_summary(src: str) -> Optional[tuple]:
+    """(count, bytes) of the default trim batch; None when the toolchain, key
+    or store is unavailable. Never dies: `list` must stay read-only and quiet."""
+    if not (os.path.isfile(os.path.join(src, "config.json"))
+            and os.path.isfile(os.path.join(src, "sql", "db.sqlite"))
+            and os.path.isdir(os.path.join(src, "attachments.noindex"))):
+        return None
+    if not shutil.which("sqlcipher"):
+        return None
+    try:
+        cutoff_ms = int((time.time() - OFFLOAD_TRIM_BEFORE_DAYS * 86400) * 1000)
+        min_bytes = int(OFFLOAD_TRIM_MIN_MB * 1048576)
+        esc = OFFLOAD_TRIM_WHO.replace("'", "''")
+        who = (f" AND (c.name LIKE '%{esc}%' OR c.profileName LIKE '%{esc}%'"
+               f" OR c.e164 LIKE '%{esc}%')") if OFFLOAD_TRIM_WHO else ""
+        rows = signal_query(src, TRIM_SUMMARY_SQL.format(cutoff=cutoff_ms, floor=min_bytes, who=who))
+        if not rows:
+            return (0, 0)
+        return (int(rows[0][0]), int(rows[0][1]))
+    except (Exception, SystemExit):
+        return None
+
+
+def trim_batch_bytes(src: str) -> int:
+    summary = trim_summary(src)
+    return summary[1] if summary else 0
+
+
+def trim_state(src: str) -> str:
+    if not os.path.isdir(src):
+        return "absent"
+    summary = trim_summary(src)
+    if summary is None:
+        return "unknown (needs sqlcipher + keychain)"
+    n, size = summary
+    return f"{n} files, {human(size)} in default batch (see 'offload move SignalStorage')"
+
+
+def trim_report(profile: str, cutoff_ms: int, min_bytes: int, who: str) -> list:
+    """Per-conversation table plus the selected batch. Returns (targets, missing)."""
+    totals = signal_query(profile, TRIM_TOTALS_SQL)
+    log(f"  {'CONVERSATION':30} {'FILES':>7} {'SIZE':>9}")
+    for _cid, name, n, size in totals[:10]:
+        log(f"  {name[:30]:30} {int(n):>7} {int(size) / 1048576:>8.0f}M")
+    parsed = []
+    for r in signal_query(profile, trim_batch_sql(cutoff_ms, min_bytes, who)):
+        sent_ms = int(datetime.datetime.strptime(r[2], "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+        parsed.append((r[0], int(r[1]), sent_ms, r[3]))
+    batch, missing = [], 0
+    base = os.path.realpath(os.path.join(profile, "attachments.noindex"))
+    for name, size, sent, path in trim_select(parsed, cutoff_ms, min_bytes, who):
+        full = trim_target_path(base, path)
+        if full is None:
+            warn(f"  SKIP (outside store): {path}")
+            continue
+        if not os.path.isfile(full):
+            missing += 1
+            continue
+        batch.append((name, size, sent, full))
+    total = sum(b[1] for b in batch)
+    log(f"  match: {len(batch)} files, {human(total)} (already gone: {missing})")
+    for name, size, sent, full in batch[:10]:
+        log(f"    {size / 1048576:8.0f}M {sent} {name[:28]:28} {os.path.basename(full)}")
+    if len(batch) > 10:
+        log(f"    ... and {len(batch) - 10} more")
+    return batch, missing
+
+
+def strategy_trim(src: str, _dst: str, label: str) -> None:
+    log(f"=== {label} (strategy=trim) ===")
+    cfg = os.path.join(src, "config.json")
+    db = os.path.join(src, "sql", "db.sqlite")
+    attach = os.path.join(src, "attachments.noindex")
+    if not (os.path.isfile(cfg) and os.path.isfile(db) and os.path.isdir(attach)):
+        log(f"  SKIP: {src} is not a Signal Desktop store")
+        return
+    cutoff_ms = int((time.time() - OFFLOAD_TRIM_BEFORE_DAYS * 86400) * 1000)
+    min_bytes = int(OFFLOAD_TRIM_MIN_MB * 1048576)
+    log(f"  Policy: attachments older than {OFFLOAD_TRIM_BEFORE_DAYS}d"
+        f" and >= {OFFLOAD_TRIM_MIN_MB:g}MB"
+        + (f" matching '{OFFLOAD_TRIM_WHO}'" if OFFLOAD_TRIM_WHO else ""))
+    batch, _missing = trim_report(src, cutoff_ms, min_bytes, OFFLOAD_TRIM_WHO)
+    if S.dry:
+        log("  (dry run; rerun with --apply to delete)")
+        return
+    if signal_running():
+        die("quit Signal first (its database is open)")
+    freed = 0
+    for _name, _size, _sent, full in batch:
+        if not os.path.isfile(full):  # changed under us; never rm blind
+            continue
+        size = os.path.getsize(full)
+        run(["rm", "-f", full])
+        freed += size
+    log(f"  DONE: deleted {len(batch)} files, freed {human(freed)}")
 
 
 def strategy_native_ui(_src: str, _dst: str, label: str) -> None:
@@ -913,6 +1293,7 @@ STRATEGIES = {
     "purge": (None, strategy_purge),
     "native-ui": (None, strategy_native_ui),
     "repos": (None, lambda src, dest, label: strategy_repos(src, dest, label)),
+    "trim": (None, lambda src, dest, label: strategy_trim(src, dest, label)),
     "cloud": (None, lambda src, dest, label: strategy_cloud(src, dest, label)),
 }
 
@@ -1003,9 +1384,11 @@ def row_bytes(t: Target) -> int:
     if strat == "merge":
         return du_bytes(src) if os.path.isdir(src) else 0
     if strat == "sweep":
-        return sum(du_bytes(d) for d in sweep_dirs(src)) if os.path.isdir(src) else 0
+        return sum(du_bytes(d) for d in swept(src)) if os.path.isdir(src) else 0
     if strat == "purge":
         return du_bytes(src) if readable_dir(src) else 0
+    if strat == "trim":
+        return trim_batch_bytes(src)
     return 0
 
 
@@ -1030,7 +1413,12 @@ def row_state(t: Target) -> str:
             return f"on-disk ({du_human(src)})"
         return "unreadable" if os.path.isdir(src) else "absent"
     if strat == "sweep":
-        return f"{sum(1 for _ in sweep_dirs(src))} cruft dirs" if os.path.isdir(src) else "absent"
+        if not os.path.isdir(src):
+            return "absent"
+        if clone_root(src):
+            stale, kept = code_sign_clones(src)
+            return f"{len(stale)} stale clones, {len(kept)} kept"
+        return f"{sum(1 for _ in sweep_dirs(src))} cruft dirs"
     if strat == "native-ui":
         if os.path.islink(src):
             return "symlinked (via native UI)"
@@ -1041,6 +1429,8 @@ def row_state(t: Target) -> str:
         repos = repo_find(src)
         cold = sum(repo_age_days(p) >= REPO_COLD_DAYS for p in repos)
         return f"{len(repos)} repos, {cold} cold (see 'offload repos')"
+    if strat == "trim":
+        return trim_state(src)
     return "unknown"
 
 
@@ -2500,7 +2890,7 @@ def cmd_plan(_args: list) -> None:
         print(f"  {os.path.basename(v.mount):<24} {v.role:<9} {pct:>4} free  backup {v.backup:<8} "
               f"encrypted {yes_no(v.encrypted):<3}  owners {yes_no(v.owners, 'on', 'off')}")
     print()
-    placeable, immediate, admin, manual = [], 0, 0, 0
+    placeable, immediate, admin, manual, notes = [], 0, 0, 0, []
     for t in iter_targets(drives=False):
         size = row_bytes(t)
         if not size:
@@ -2510,12 +2900,14 @@ def cmd_plan(_args: list) -> None:
             admin += size
         elif t.strategy in ("sweep", "purge"):
             immediate += size
+            if t.strategy == "sweep" and clone_root(t.source):
+                notes.append(f"{t.label} frees up to {human(size)}: {CLONE_CAVEAT}.")
         elif t.strategy in TIERED and tier:
             placeable.append((size, t, tier))
         else:
             manual += size
     print("--- Fit: on-disk targets, largest first ---")
-    placed, hot_placed, hot_waiting, notes, backed = 0, 0, 0, [], set()
+    placed, hot_placed, hot_waiting, backed = 0, 0, 0, set()
     for size, t, tier in sorted(placeable, key=lambda x: -x[0]):
         path, why = try_pick(tier, size, t.label)
         verdict = ""

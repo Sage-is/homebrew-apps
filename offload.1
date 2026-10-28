@@ -214,6 +214,13 @@ basename of
 .Pa $TARGET_HOME .
 .It Sy <DATE>
 YYYY-MM-DD.
+.It Sy <DARWIN_X>
+The
+.Pa X
+folder beside
+.Ic $(getconf DARWIN_USER_TEMP_DIR) ;
+only your own.
+In another user's home the row is absent.
 .It Sy HOT/
 Prefix —
 .Ev $OFFLOAD_HOT/ ,
@@ -254,11 +261,48 @@ into existing dest, rm source. Dest is authoritative; source is gone.
 subdirs matching internal patterns
 .Pq node_modules , .venv , target , build , dist , __pycache__ , .next
 and delete. No destination; data is rebuildable from source.
+On
+.Sy <DARWIN_X>
+it takes only stale Chromium code-sign clones, the copies a browser
+makes at
+.Pa <bundle-id>.code_sign_clone/code_sign_clone.*
+at launch and can leave behind.
+A clone held open
+.Pq Ic lsof +D
+or made in the last
+.Ev OFFLOAD_CLONE_GRACE_MIN
+minutes stays; if
+.Ic lsof
+fails, every clone stays.
+No link is followed, and every path is checked again before
+.Ic rm .
+The total is an upper bound: the clones share APFS blocks, and a
+Time Machine local snapshot can hold the freed space for a while.
 .It Cm purge
 Delete the source directory entirely, then recreate it empty. For
 caches and rebuild-on-demand support files
 .Pq iOS DeviceSupport , ~/.cache , ~/.npm , Homebrew cache .
 Apps re-populate the dir as needed.
+.It Cm trim
+Database-driven trim of old, large files inside an app's own store
+(today: Signal attachments, chosen from the app's database by age and
+size). Files only; message rows stay as placeholders, exactly like
+in-app delete. Scope from
+.Ev OFFLOAD_TRIM_BEFORE_DAYS
+.Pq 365 ,
+.Ev OFFLOAD_TRIM_MIN_MB
+.Pq 10
+and
+.Ev OFFLOAD_TRIM_WHO
+.Pq "" matches all conversations .
+Needs the
+.Xr sqlcipher 1
+CLI and the python
+.Em cryptography
+package; refuses
+.Fl -apply
+while the app runs. Dry-run prints a per-conversation table plus the
+proposed batch.
 .It Cm native-ui
 Printed instructions only. The tool never auto-mutates media
 libraries.
@@ -381,15 +425,20 @@ Environment variables:
 .Ev OFFLOAD_HEADROOM ,
 .Ev OFFLOAD_CONF ,
 .Ev OFFLOAD_REPO_COLD_DAYS ,
+.Ev OFFLOAD_CLONE_GRACE_MIN ,
 .Ev OFFLOAD_ALLOW_PLAINTEXT ,
 and
 .Ev OFFLOAD_PRICES_URL .
 .Ev OFFLOAD_VOLUMES
 and
 .Ev OFFLOAD_BZINFO
-point the drive scan elsewhere (tests).
+point the drive scan elsewhere, and
+.Ev OFFLOAD_DARWIN_USER_TEMP_DIR
+stands in for getconf's (tests).
 .Ev OFFLOAD_REPO_COLD_DAYS
-defaults to 90.
+defaults to 90;
+.Ev OFFLOAD_CLONE_GRACE_MIN
+defaults to 10.
 .Ev OFFLOAD_ALLOW_PLAINTEXT Ns =1
 lets private data land on a plain drive, at the user's risk.
 .Pp
@@ -496,6 +545,11 @@ offload checklist
 .Bd -literal -offset indent
 offload move BuildCruft
 offload move BuildCruft --apply
+.Ed
+.Ss Stale browser copies
+.Bd -literal -offset indent
+offload move CodeSignClones            # what goes, what stays and why
+offload move CodeSignClones --apply
 .Ed
 .Ss Move one app or an entire category
 .Bd -literal -offset indent

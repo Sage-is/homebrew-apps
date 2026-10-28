@@ -3,6 +3,8 @@
 import json
 import os
 import plistlib
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,9 +31,10 @@ class Base(unittest.TestCase):
         (self.hot / "Old").mkdir()
         (self.hot / "Old" / "notes.txt").write_text("old notes")
         # Headroom 0: the scratch "drives" share the boot disk, which may have less than 10% free.
+        # The user temp dir is scratch too, so CodeSignClones never reads the real X folder.
         self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin", "OFFLOAD_HOT": str(self.hot),
                     "OFFLOAD_COLD": str(self.cold), "OFFLOAD_CONF": str(root / "absent.conf"),
-                    "OFFLOAD_HEADROOM": "0"}
+                    "OFFLOAD_HEADROOM": "0", "OFFLOAD_DARWIN_USER_TEMP_DIR": str(root / "T")}
         self.root = root
 
     def run_tool(self, *args, **env):
@@ -345,6 +348,137 @@ class Contract(Helpers):
         result = self.run_tool("launch", "Signal")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.home / "open.log").read_text().strip(), "-a Signal")
+
+
+class TrimPure(unittest.TestCase):
+    """Signal trim selection is pure: cutoffs, sizes, names, dedupe, containment."""
+
+    def test_old_big_rows_are_picked_and_paths_deduped(self):
+        mod = load_offload()
+        rows = [("Ann", 20 << 20, 1000, "ab/c1"), ("Ann", 20 << 20, 1000, "ab/c1"),
+                ("Bob", 1 << 20, 1000, "ab/c2"), ("Ann", 20 << 20, 9999, "ab/c3")]
+        picked = mod.trim_select(rows, cutoff_ms=2000, min_bytes=10 << 20, who="")
+        self.assertEqual([p[3] for p in picked], ["ab/c1"])
+
+    def test_who_filters_by_conversation_substring(self):
+        mod = load_offload()
+        rows = [("Ann Lee", 20 << 20, 1000, "a"), ("Bob", 20 << 20, 1000, "b")]
+        self.assertEqual([p[3] for p in mod.trim_select(rows, 2000, 1, "ann")], ["a"])
+        self.assertEqual(mod.trim_select(rows, 2000, 1, "zzz"), [])
+
+    def test_escaping_paths_are_rejected(self):
+        mod = load_offload()
+        with tempfile.TemporaryDirectory() as scratch:
+            base = os.path.realpath(os.path.join(scratch, "attachments.noindex"))
+            os.makedirs(base)
+            self.assertEqual(mod.trim_target_path(base, "ab/c1"), os.path.join(base, "ab/c1"))
+            self.assertIsNone(mod.trim_target_path(base, "../../evil"))
+            self.assertIsNone(mod.trim_target_path(base, "ab/../../../evil"))
+
+
+@unittest.skipUnless(shutil.which("sqlcipher"), "trim reads Signal's store through the sqlcipher CLI")
+class TrimMove(Helpers):
+    """SignalStorage end to end against a fake store: real SQLCipher db, real files."""
+
+    KEY = "ab" * 32
+    OLD = 1700000000000  # Nov 2023: older than any sane cutoff under test
+
+    def setUp(self):
+        super().setUp()
+        # The tool subprocess sees only self.bin:/usr/bin:/bin: link the real
+        # sqlcipher in (guarded present by the class skipUnless).
+        (self.bin / "sqlcipher").symlink_to(shutil.which("sqlcipher"))
+
+    def signal_profile(self, attaches, convs=(("c1", "Ann"),)):
+        prof = self.home / "Library/Application Support/Signal"
+        (prof / "config.json").parent.mkdir(parents=True, exist_ok=True)
+        (prof / "config.json").write_text(json.dumps({"encryptedKey": "00"}))
+        stmts = ["PRAGMA key=\"x'%s'\";" % self.KEY,
+                 "CREATE TABLE message_attachments(conversationId TEXT, attachmentType TEXT,"
+                 " sentAt INTEGER, size INTEGER, path TEXT);",
+                 "CREATE TABLE conversations(id TEXT, name TEXT, profileName TEXT, e164 TEXT);"]
+        for cid, name in convs:
+            stmts.append(f"INSERT INTO conversations VALUES ('{cid}', '{name}', NULL, NULL);")
+        for cid, atype, sent, size, path in attaches:
+            stmts.append(f"INSERT INTO message_attachments VALUES ('{cid}', '{atype}',"
+                         f" {sent}, {size}, '{path}');")
+        db = prof / "sql/db.sqlite"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(["sqlcipher", str(db)], input="\n".join(stmts),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return prof
+
+    def attach_files(self, spec):
+        for rel, size in spec.items():
+            p = self.home / "Library/Application Support/Signal/attachments.noindex" / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x" * size)
+
+    def trim_env(self, **extra):
+        env = {"OFFLOAD_TRIM_RAW_KEY": self.KEY, "OFFLOAD_TRIM_BEFORE_DAYS": "30",
+               "OFFLOAD_TRIM_MIN_MB": "1"}
+        env.update(extra)
+        return env
+
+    def standard_fixtures(self):
+        now_ms = int(time.time() * 1000)
+        self.signal_profile([("c1", "attachment", self.OLD, 2 << 20, "ab/old.bin"),
+                             ("c1", "attachment", now_ms, 2 << 20, "ab/new.bin"),
+                             ("c1", "attachment", self.OLD, 100, "ab/small.bin")])
+        self.attach_files({"ab/old.bin": 2 << 20, "ab/new.bin": 2 << 20, "ab/small.bin": 100})
+
+    def test_trim_skips_a_non_signal_store(self):
+        result = self.run_tool("move", "SignalStorage", **self.trim_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SKIP:", result.stdout)
+
+    def test_trim_dry_run_reports_the_batch_and_changes_nothing(self):
+        self.standard_fixtures()
+        result = self.run_tool("move", "SignalStorage", **self.trim_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Ann", result.stdout)
+        self.assertIn("match: 1 files", result.stdout)
+        store = self.home / "Library/Application Support/Signal/attachments.noindex/ab"
+        self.assertTrue((store / "old.bin").exists())
+
+    def test_trim_apply_deletes_only_the_batch(self):
+        self.standard_fixtures()
+        self.stub("pgrep", "exit 1")  # Signal not running
+        result = self.run_tool("move", "SignalStorage", "--apply", **self.trim_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        store = self.home / "Library/Application Support/Signal/attachments.noindex/ab"
+        self.assertFalse((store / "old.bin").exists())
+        self.assertTrue((store / "new.bin").exists())
+        self.assertTrue((store / "small.bin").exists())
+        self.assertIn("freed", result.stdout)
+
+    def test_trim_skips_a_path_that_escapes_the_store(self):
+        self.signal_profile([("c1", "attachment", self.OLD, 2 << 20, "../../evil.bin")])
+        (self.home / "Library/Application Support/Signal/attachments.noindex").mkdir(parents=True)
+        evil = self.home / "Library/Application Support/evil.bin"
+        evil.parent.mkdir(parents=True, exist_ok=True)
+        evil.write_text("precious")
+        self.stub("pgrep", "exit 1")
+        result = self.run_tool("move", "SignalStorage", "--apply", **self.trim_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SKIP (outside store)", result.stderr)
+        self.assertEqual(evil.read_text(), "precious")
+
+    def test_trim_refuses_apply_while_signal_runs(self):
+        self.standard_fixtures()
+        self.stub("pgrep", "echo 99999")  # Signal running
+        result = self.run_tool("move", "SignalStorage", "--apply", **self.trim_env())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("quit Signal first", result.stderr)
+        store = self.home / "Library/Application Support/Signal/attachments.noindex/ab"
+        self.assertTrue((store / "old.bin").exists())
+
+    def test_list_shows_the_trim_batch(self):
+        self.standard_fixtures()
+        out = self.run_tool("list", **self.trim_env()).stdout
+        row = next(l for l in out.splitlines() if l.startswith("SignalStorage "))
+        self.assertIn("1 files,", row)
 
 
 class IntendedFixes(Helpers):
@@ -847,6 +981,136 @@ esac''')
         self.assertEqual((self.home / "Old/a.txt").read_text(), "alpha")
 
 
+class CodeSignClones(FakeVolumes):
+    """Stale Chromium code-sign clones go; a clone held open or younger than the grace stays; no link is followed."""
+    DAY = 24 * 60                                      # clone ages are in minutes
+
+    def setUp(self):
+        super().setUp()
+        self.x = self.root / "X"                      # beside OFFLOAD_DARWIN_USER_TEMP_DIR, as getconf's T is
+        self.lsof_out = self.root / "lsof.out"
+        self.stub("lsof", f'echo "$@" >> "{self.root}/lsof.args"; cat "{self.lsof_out}" 2>/dev/null; exit 1')
+
+    def clone(self, bundle, name, age_min):
+        path = self.x / f"{bundle}.code_sign_clone" / name
+        self.tree(path, {"App.app.bundle/Contents/MacOS/App": "binary"})
+        self.age(path, age_min)
+        return path
+
+    def age(self, path, age_min, follow_symlinks=True):
+        when = time.time() - age_min * 60
+        os.utime(path, (when, when), follow_symlinks=follow_symlinks)
+
+    def held(self, path):
+        """lsof -Fn output for a file open in the clone, named by its real path as lsof names it."""
+        with open(self.lsof_out, "a") as f:
+            f.write(f"p4242\nftxt\nn{path.resolve()}/App.app.bundle/Contents/MacOS/App\n")
+
+    def sweep(self, *args, **env):
+        result = self.run_tool("move", "CodeSignClones", *args, **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def test_a_dry_run_names_what_goes_and_what_stays(self):
+        old = self.clone("com.google.Chrome", "code_sign_clone.Old", 9 * self.DAY)
+        young = self.clone("com.google.Chrome", "code_sign_clone.Young", 2)
+        brave = self.clone("com.brave.Browser", "code_sign_clone.Only", 30 * self.DAY)
+        out = self.sweep()
+        self.assertIn(f"RUN: rm -rf {old}", out)
+        self.assertIn(f"RUN: rm -rf {brave}", out)
+        self.assertIn(f"KEEP (made under 10 min ago): {young}", out)
+        self.assertIn("Total: up to", out)
+        self.assertIn("free space can lag", out)
+        self.assertTrue(all(p.is_dir() for p in (old, young, brave)))
+
+    def test_an_old_unheld_clone_goes_even_when_it_is_the_only_or_newest_one(self):
+        old = self.clone("com.google.Chrome", "code_sign_clone.Old", 9 * self.DAY)
+        newest = self.clone("com.google.Chrome", "code_sign_clone.Newest", self.DAY)
+        only = self.clone("com.brave.Browser", "code_sign_clone.Only", 30 * self.DAY)
+        self.sweep("--apply")
+        self.assertFalse(any(p.exists() for p in (old, newest, only)))
+        self.assertTrue(newest.parent.is_dir() and only.parent.is_dir())
+
+    def test_a_clone_younger_than_the_grace_stays(self):
+        old = self.clone("com.google.Chrome", "code_sign_clone.Old", 9 * self.DAY)
+        young = self.clone("com.google.Chrome", "code_sign_clone.Young", 2)
+        out = self.sweep("--apply")
+        self.assertFalse(old.exists())
+        self.assertTrue(young.is_dir())
+        self.assertIn(f"KEEP (made under 10 min ago): {young}", out)
+        self.assertIn(f"RUN: rm -rf {young}", self.sweep(OFFLOAD_CLONE_GRACE_MIN="1"))
+
+    def test_a_held_open_clone_stays_at_any_age(self):
+        old = self.clone("com.google.Chrome", "code_sign_clone.Old", 9 * self.DAY)
+        busy = self.clone("com.google.Chrome", "code_sign_clone.Busy", 30 * self.DAY)
+        self.held(busy)
+        out = self.sweep("--apply")
+        self.assertFalse(old.exists())
+        self.assertTrue(busy.is_dir())
+        self.assertIn(f"KEEP (held open): {busy}", out)
+        holder = (self.x / "com.google.Chrome.code_sign_clone").resolve()
+        self.assertIn(f"-w -Fn +D {holder}", (self.root / "lsof.args").read_text())
+
+    def test_only_clone_folders_inside_a_code_sign_clone_folder_go(self):
+        stale = self.clone("com.google.Chrome", "code_sign_clone.Old", 9 * self.DAY)
+        others = ["X/com.google.Chrome.code_sign_clone/other.Old/a", "X/com.google.Chrome.code_sign_clone/code_sign_clone./a",
+                  "X/com.google.Chrome.code_sign_clone/code_sign_clone.File", "X/com.example.cache/code_sign_clone.Old/a",
+                  "X/code_sign_clone.Old/a"]
+        self.tree(self.root, {rel: "keep" for rel in others})
+        for rel in others:                            # old, so none is spared by the grace
+            self.age(self.root / rel, 30 * self.DAY)
+            self.age((self.root / rel).parent, 30 * self.DAY)
+        self.sweep("--apply")
+        self.assertFalse(stale.exists())
+        for rel in others:
+            self.assertEqual((self.root / rel).read_text(), "keep", rel)
+
+    def test_links_are_never_followed(self):
+        outside = self.root / "precious"
+        self.tree(outside, {"doc.txt": "keep", "code_sign_clone.Old/doc.txt": "keep"})
+        for folder in (outside, outside / "code_sign_clone.Old"):
+            self.age(folder, 30 * self.DAY)
+        links = [self.x / "com.google.Chrome.code_sign_clone/code_sign_clone.Link",   # a linked clone
+                 self.x / "com.evil.code_sign_clone"]                                  # a linked browser folder
+        for link in links:
+            self.link(link, outside)
+            self.age(link, 30 * self.DAY, follow_symlinks=False)   # old itself, so the grace spares nothing
+        out = self.sweep("--apply")
+        self.assertNotIn("rm -rf", out)
+        self.assertEqual((outside / "doc.txt").read_text(), "keep")
+        self.assertEqual((outside / "code_sign_clone.Old/doc.txt").read_text(), "keep")
+        self.assertTrue(links[0].is_symlink())
+
+    def test_a_failed_lsof_keeps_every_clone(self):
+        old = self.clone("com.google.Chrome", "code_sign_clone.Old", 9 * self.DAY)
+        self.clone("com.google.Chrome", "code_sign_clone.Other", self.DAY)
+        self.stub("lsof", 'echo "lsof: status error: Permission denied" >&2; exit 1')
+        out = self.sweep("--apply")
+        self.assertTrue(old.is_dir())
+        self.assertIn(f"KEEP (lsof cannot tell what is open): {old}", out)
+        self.assertIn("Total: nothing stale", out)
+
+    def test_list_status_checklist_and_plan_show_the_row(self):
+        absent = int(re.search(r"absent: (\d+)", self.run_tool("status").stdout).group(1))
+        self.clone("com.google.Chrome", "code_sign_clone.Old", 9 * self.DAY)
+        self.clone("com.google.Chrome", "code_sign_clone.Young", 2)
+        self.clone("com.brave.Browser", "code_sign_clone.Only", 3 * self.DAY)
+        self.assertRegex(self.row(self.run_tool("list").stdout, "CodeSignClones"),
+                         r"^CodeSignClones +sweep +sweep +no +\S+ +2 stale clones, 1 kept$")
+        self.assertIn(f"absent: {absent - 1} |", self.run_tool("status").stdout)
+        self.assertIn("offload move CodeSignClones --apply", self.run_tool("checklist").stdout)
+        plan = self.run_tool("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        self.assertIn("CodeSignClones frees up to", plan.stdout)
+        self.assertIn("free space can lag", plan.stdout)
+
+    def test_another_users_home_has_no_clones_to_sweep(self):
+        self.clone("com.google.Chrome", "code_sign_clone.Old", 9 * self.DAY)
+        (self.root / "alice").mkdir()
+        row = self.row(self.run_tool("--target-home", str(self.root / "alice"), "list").stdout, "CodeSignClones")
+        self.assertTrue(row.rstrip().endswith("absent"), row)
+
+
 def load_offload():
     """The script as a module (it has no .py suffix), registered so dataclasses can resolve it."""
     import importlib.util
@@ -873,6 +1137,31 @@ class PickDest(unittest.TestCase):
                 with self.assertRaises(mod.Fatal) as refused:
                     mod.pick_dest("HOT", 300, "Steam")
             self.assertIn("would leave less than 10% free", str(refused.exception))
+
+
+class ClonePathOk(unittest.TestCase):
+    """The check run on every clone path, again just before its rm: one real folder, two levels below X."""
+
+    def test_only_a_real_clone_folder_passes(self):
+        mod = load_offload()
+        with tempfile.TemporaryDirectory() as scratch:
+            x = Path(scratch) / "X"                    # unresolved: /var links to /private/var
+            for rel in ("com.google.Chrome.code_sign_clone/code_sign_clone.Ok", "elsewhere/code_sign_clone.Old",
+                        "com.example.cache/code_sign_clone.Old", "com.google.Chrome.code_sign_clone/code_sign_clone.Ok/code_sign_clone.In"):
+                (x / rel).mkdir(parents=True)
+            (x / "com.google.Chrome.code_sign_clone/code_sign_clone.File").write_text("f")
+            (x / "com.google.Chrome.code_sign_clone/code_sign_clone.Link").symlink_to(x / "elsewhere")
+            (x / "com.link.code_sign_clone").symlink_to(x / "elsewhere")
+            ok = lambda rel: mod.clone_path_ok(str(x / rel), str(x))
+            self.assertTrue(ok("com.google.Chrome.code_sign_clone/code_sign_clone.Ok"))
+            self.assertFalse(ok("com.link.code_sign_clone/code_sign_clone.Old"))         # through a linked holder
+            self.assertFalse(ok("com.google.Chrome.code_sign_clone/code_sign_clone.Link"))
+            self.assertFalse(ok("com.google.Chrome.code_sign_clone/code_sign_clone.File"))
+            self.assertFalse(ok("com.example.cache/code_sign_clone.Old"))
+            self.assertFalse(ok("com.google.Chrome.code_sign_clone/code_sign_clone.Ok/code_sign_clone.In"))
+            self.assertFalse(ok("com.google.Chrome.code_sign_clone/code_sign_clone."))
+            self.assertFalse(mod.clone_path_ok(str(x / "com.google.Chrome.code_sign_clone/code_sign_clone.Ok"),
+                                               str(x / "com.google.Chrome.code_sign_clone")))
 
 
 if __name__ == "__main__":

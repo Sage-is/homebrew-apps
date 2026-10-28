@@ -42,6 +42,16 @@ class Ensure(unittest.TestCase):
         want = cr_deploy.desired({"app": "a", "node": "n1", "port": 8000, "volumes": []}, FLOATING)
         self.assertEqual((want["containerHttpPort"], want["nodeId"], want["volumes"]), (8000, "n1", []))
 
+    def test_a_password_named_passwd_or_pwd_never_prints(self):
+        live = {"envVars": [{"key": "DB_PASSWD", "value": "old-value"}]}
+        want = {"envVars": [{"key": "GITEA__database__PASSWD", "value": "new-value"},
+                            {"key": "MYSQL_PWD", "value": "pwd-value"}, {"key": "LOG_LEVEL", "value": "info"}]}
+        shown = "\n".join(cr_deploy.diff(live, want))
+        for value in ("old-value", "new-value", "pwd-value"):
+            self.assertNotIn(value, shown)
+        self.assertIn("env GITEA__database__PASSWD: set <hidden>", shown)
+        self.assertIn("env LOG_LEVEL: set info", shown)
+
 
 
 class ForceSsl(unittest.TestCase):
