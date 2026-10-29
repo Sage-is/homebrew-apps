@@ -54,6 +54,25 @@ class ImagePushed(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertIn("ghcr.io/sage-is/trellis:0.1.4 is not in the registry", missing.stderr)
 
+    def gh_says(self, script):
+        with __import__("tempfile").TemporaryDirectory() as bin_dir:
+            gh = Path(bin_dir) / "gh"
+            gh.write_text("#!/bin/sh\n" + script)
+            gh.chmod(0o755)
+            return subprocess.run(["bash", "-c", 'source "$1"; image_pushed trellis-crm 0.1.4', "_", str(SCRIPT)],
+                                  capture_output=True, text=True, env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+
+    def test_a_tag_that_comes_first_is_found_while_gh_still_writes(self):
+        # The newest tag comes first; a later page is written after grep would have its match.
+        run = self.gh_says("echo 0.1.4\nsleep 0.2\nseq 1 200000\n")
+        self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_a_failed_query_says_so_and_never_missing(self):
+        run = self.gh_says("echo 'HTTP 502: Bad Gateway' >&2\nexit 1\n")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("could not list ghcr.io/sage-is/trellis's tags (gh: HTTP 502: Bad Gateway)", run.stderr)
+        self.assertNotIn("is not in the registry", run.stderr)
+
     def test_other_tools_are_not_asked(self):
         self.assertEqual(self.check("sage-box", "9.9.9", []).returncode, 0)
 

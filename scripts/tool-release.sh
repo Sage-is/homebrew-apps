@@ -24,8 +24,16 @@ version_of_url() {  # URL TOOL
 # 2026-10-28. Prints why and fails; any other tool passes.
 image_pushed() {  # TOOL VERSION
   [ "$1" = trellis-crm ] || return 0
-  gh api "/orgs/sage-is/packages/container/trellis/versions" --paginate \
-    -q '.[].metadata.container.tags[]' 2>/dev/null | grep -qxF "$2" && return 0
+  local tags
+  # Every tag first, then the match. Piped into grep -q under pipefail, gh
+  # would die of SIGPIPE on a page written after the match, and a pushed image
+  # would read as missing. A query that fails says so, never "missing".
+  if ! tags=$(gh api "/orgs/sage-is/packages/container/trellis/versions" --paginate \
+      -q '.[].metadata.container.tags[]' 2>&1); then
+    echo "could not list ghcr.io/sage-is/trellis's tags (gh: ${tags##*$'\n'}); run this again" >&2
+    return 1
+  fi
+  grep -qxF "$2" <<<"$tags" && return 0
   echo "ghcr.io/sage-is/trellis:$2 is not in the registry: ship Trellis $2 first (its make ship pushes the image)" >&2
   return 1
 }
