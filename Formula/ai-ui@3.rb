@@ -1,8 +1,8 @@
 class AiUiAT3 < Formula
   desc "One-command local deployment of Sage AI UI via Docker"
   homepage "https://github.com/Sage-is/AI-UI"
-  url "https://github.com/Sage-is/AI-UI/archive/refs/tags/v3.2.2.tar.gz"
-  sha256 "e1330b3a4e8534da40eaa8dafa0d0bc899c55ba32dbfd70a67fc1e42ec9119c2"
+  url "https://github.com/Sage-is/AI-UI/archive/refs/tags/v3.3.0.tar.gz"
+  sha256 "904893159bfacc78c9a59dc59efd346f2a2a35493ee9a85bca73f1d796070fa9"
   license "AGPL-3.0-or-later"
   keg_only :versioned_formula
 
