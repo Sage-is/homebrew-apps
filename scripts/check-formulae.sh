@@ -4,8 +4,8 @@
 # - The sha256 matches the tarball at its url.
 # - From 3.x, an ai-ui formula's version equals the SERVER_TAG in that
 #   tarball's distribution.env: the version brew shows is the AI-UI it pins.
-# - The tarball holds every file the formula installs: sage-runtime and
-#   trellis-crm install the shared lib/. ai-ui is checked from 3.x only: a
+# - The tarball holds every file the formula installs: sage-runtime,
+#   trellis-crm and tinker-web install the shared lib/. ai-ui is checked from 3.x only: a
 #   release from before the CLI moved into AI-UI has no cli/.
 #
 # A formula with a placeholder sha256 is not released yet: listed, not failed.

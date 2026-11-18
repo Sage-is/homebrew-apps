@@ -1,0 +1,657 @@
+#!/bin/bash
+set -euo pipefail
+
+# tinker-web runs web Tinker on this machine: upstream's tenkts-server in web
+# mode, from the image Sage-is/tinker-web builds unmodified from a pinned
+# upstream commit. Upstream says never to put it on a public address, so it
+# listens on 127.0.0.1 only, and another machine reaches it through `tinker-web
+# tunnel`. Its settings, the node token among them, sit in one file at mode 600.
+
+PROG="tinker-web"
+# The runtime code it shares with sage-runtime and ai-ui lives in lib/ beside
+# this script, in a checkout and in the formula's libexec alike. A link to it,
+# such as one in ~/bin, leads there.
+here="${BASH_SOURCE[0]}"
+while [[ -L "$here" ]]; do
+  target="$(readlink "$here")"
+  if [[ "$target" == /* ]]; then here="$target"; else here="$(dirname "$here")/$target"; fi
+done
+here="$(dirname "$here")"
+[[ -f "$here/lib/sage-runtime.sh" ]] || { echo "Error: $here/lib/sage-runtime.sh is missing. Reinstall the formula (brew reinstall $PROG), or run $PROG from a checkout of the tap, which has lib/." >&2; exit 1; }
+# shellcheck source=lib/sage-runtime.sh
+source "$here/lib/sage-runtime.sh"
+
+IMAGE_REGISTRY="ghcr.io/sage-is/tinker-web"
+# The tool's own version; the release bumps it. The image tag is separate: the
+# formula pins it to the same version at install, and a checkout runs latest.
+VERSION="0.1.0"
+DEFAULT_TAG="latest"
+IMAGE="$IMAGE_REGISTRY:$DEFAULT_TAG"
+# TINKER_WEB_NAME runs a second copy beside the first: its own container,
+# volume and settings file.
+NAME="${TINKER_WEB_NAME:-tinker-web}"
+[[ "$NAME" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || die "TINKER_WEB_NAME may hold only a-z, 0-9, _, . and -, and start with a letter or digit."
+CONTAINER="$NAME"
+VOLUME="$NAME-data"
+ENV_FILE="${SAGE_CONFIG_DIR}/$NAME.env"
+# AI-UI and Trellis share this network, so a node there is reached by its
+# container name.
+NETWORK="sage-network"
+DEFAULT_PORT=8799
+# The port inside the container; start publishes it on 127.0.0.1 only.
+SERVER_PORT=8799
+# Containers reach this machine by name on every runtime: Colima resolves it
+# only through Lima's DNS, and Linux not at all. host-gateway is the machine's
+# address as the engine sees it (192.168.5.2 in a Colima VM).
+HOST_ENTRY="--add-host=host.docker.internal:host-gateway"
+# The node the image asks when the settings name none: upstream's.
+UPSTREAM_NODE="https://app.tinker.click"
+# The AI-UI account web Tinker's builds run as; link-ai-ui makes it.
+NODE_EMAIL="tinker-node@sage.is"
+
+usage() {
+  cat <<EOF
+Usage: $PROG <command> [options]
+
+Web Tinker: type a sentence in a browser tab and an app appears. Upstream says
+never to put it on a public address, so it listens on 127.0.0.1 only.
+
+Commands:
+  start  [--port PORT] [--tag X.Y.Z]
+                        Start web Tinker (default: http://localhost:$DEFAULT_PORT). The port is
+                        saved in $ENV_FILE
+  stop                  Stop it; it stays stopped across reboots until start
+  update [--tag X.Y.Z]  Pull the image and start again
+  status                Container, image, address, page and model
+  logs                  Follow the container's output
+  open                  Print the address; on this Mac's own screen, open it too
+  invite [--name NAME] [--count N]
+                        Make invite codes (default: 3, named demo). Nobody signs
+                        up without one. They print only this once; the file
+                        named on stderr keeps them in the volume
+  tunnel HOST [--port PORT] [--remote-port PORT]
+                        Reach web Tinker on HOST from here, over SSH: then open
+                        http://localhost:PORT (default: $DEFAULT_PORT on both ends)
+  link-ai-ui URL [--base-model ID] [--node URL] [--vault ITEM]
+                        Make the AI-UI at URL web Tinker's node, so AI-UI guards
+                        every model call. Signs in as an AI-UI admin
+                        (AI_UI_ADMIN_EMAIL and AI_UI_ADMIN_PASSWORD, else asked
+                        at the terminal), then makes what is missing: the user
+                        $NODE_EMAIL with an API key, and the preset AI-UI
+                        names, on --base-model with no system prompt. A key it
+                        finds stays as it is. The key goes to the settings file,
+                        and with --vault to the vault (sage-secret), never to
+                        the screen. --node is the address the container uses
+                        (default: URL, with localhost as host.docker.internal).
+                        A running web Tinker starts again to read it
+  version               Show the version
+
+Every command also takes:
+  --runtime NAME        macOS container runtime: colima (the default),
+                        docker-desktop or orbstack. Shared with ai-ui.
+
+Environment:
+  TINKER_WEB_NAME       Run a second copy beside the first (default: $PROG):
+                        container NAME, volume NAME-data, settings
+                        $SAGE_CONFIG_DIR/NAME.env
+
+Open http://localhost:PORT, never 127.0.0.1: the apps Tinker builds open at
+<id>.widget.localhost, and only names under localhost resolve without DNS.
+
+EOF
+}
+
+cmd_version() {
+  echo "$PROG $VERSION (image $IMAGE_REGISTRY:$DEFAULT_TAG)"
+}
+
+set_tag() {
+  IMAGE="$IMAGE_REGISTRY:$1"
+}
+
+# ---------------------------------------------------------------------------
+# Container runtime. The code lives in lib/sage-runtime.sh; ai-ui, trellis-crm
+# and sage-runtime share the choice in ~/.sage-is/runtime. --runtime saves it.
+# ---------------------------------------------------------------------------
+RUNTIME_FLAG=""
+RUNTIME=""
+
+select_runtime() {
+  RUNTIME="${RUNTIME_FLAG:-$(current_runtime)}"
+  check_runtime "$RUNTIME"
+  if [[ -n "$RUNTIME_FLAG" ]]; then
+    mkdir -p "$SAGE_CONFIG_DIR"
+    echo "$RUNTIME" > "$RUNTIME_FILE"
+  fi
+  DOCKER_CONTEXT="$(runtime_context "$RUNTIME")"
+  export DOCKER_CONTEXT
+}
+
+# Make sure the chosen runtime answers, starting it if needed.
+ensure_docker() {
+  if [[ "$(uname)" == Darwin ]]; then
+    fix_credentials "$RUNTIME"
+    start_runtime "$RUNTIME"
+    return 0
+  fi
+  docker info &>/dev/null && return 0
+  command -v docker &>/dev/null || die "Docker is not installed. See: https://docs.docker.com/engine/install/"
+  die "the Docker daemon is not running. Start it with: sudo systemctl start docker"
+}
+
+# ---------------------------------------------------------------------------
+# Settings: one env file at mode 600. The container reads every line through
+# --env-file; tinker-web itself reads TINKER_WEB_PORT.
+# ---------------------------------------------------------------------------
+# A setting's last value.
+env_get() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
+}
+
+env_set() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+  grep -v "^$key=" "$ENV_FILE" > "$tmp" || true
+  echo "$key=$value" >> "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+ensure_env_file() {
+  [[ -f "$ENV_FILE" ]] && return 0
+  mkdir -p "$SAGE_CONFIG_DIR"
+  (umask 077 && cat > "$ENV_FILE") <<EOF
+# Web Tinker on this machine, written by \`$PROG start\` on its first run.
+# The container reads every line. Edit, then run \`$PROG start\` again.
+# This file holds the node token, a secret: keep it at mode 600.
+
+# The port on this machine's loopback. Open http://localhost:PORT.
+TINKER_WEB_PORT=$DEFAULT_PORT
+# The node that hands web Tinker its model: upstream's unless set here.
+# \`$PROG link-ai-ui URL\` sets both lines for an AI-UI.
+# TENKTS_WEB_NODE=$UPSTREAM_NODE
+# A session token for your account on the node. Without one the page
+# serves, but nothing new can be built.
+# TENKTS_WEB_NODE_TOKEN=
+# Every other setting the image reads: https://github.com/Sage-is/tinker-web#settings
+EOF
+  chmod 600 "$ENV_FILE"
+}
+
+check_port() {
+  if [[ ! "$1" =~ ^[0-9]{1,5}$ ]] || (( 10#$1 < 1 || 10#$1 > 65535 )); then die "not a port: $1"; fi
+}
+
+web_port() {
+  local port
+  port="$(env_get TINKER_WEB_PORT)"
+  echo "${port:-$DEFAULT_PORT}"
+}
+
+page_url() {
+  echo "http://localhost:$(web_port)"
+}
+
+# Asks 127.0.0.1, where the port is published: localhost may try ::1 first.
+page_answers() {
+  curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$(web_port)/" 2>/dev/null
+}
+
+container_running() {
+  docker container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true
+}
+
+# The image is public, so the pull signs in nowhere. docker would still ask its
+# credential helper, and the Keychain's refuses a session without a screen, such
+# as SSH: "keychain cannot be accessed because the current session does not
+# allow user interaction". An empty docker config has no helper; it has no
+# contexts either, so the engine's address comes from the context in use.
+pull_image() {
+  local host config status=0
+  echo "Pulling $IMAGE..."
+  host="$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null)" || host=""
+  if [[ -n "$host" ]]; then
+    config="$(mktemp -d)"
+    env -u DOCKER_CONTEXT DOCKER_CONFIG="$config" DOCKER_HOST="$host" docker pull "$IMAGE" || status=$?
+    rm -rf "$config"
+  else
+    docker pull "$IMAGE" || status=$?
+  fi
+  [[ $status == 0 ]] || die "could not pull $IMAGE. The image is public: check the tag and the network."
+}
+
+ensure_network() {
+  docker network inspect "$NETWORK" &>/dev/null || docker network create "$NETWORK" >/dev/null
+}
+
+# The first start makes the database before the page answers.
+wait_page() {
+  echo "Waiting for web Tinker to answer..."
+  for _ in $(seq 1 60); do
+    page_answers && return 0
+    sleep 1
+  done
+  docker logs --tail 20 "$CONTAINER" >&2 || true
+  die "web Tinker did not answer at $(page_url) within a minute. See: $PROG logs"
+}
+
+# The server asks its node for a model once, at start, and logs the answer on
+# a "web demo:" line. Upstream serves the page even when the node refused the
+# token, so this line is how to tell.
+model_line() {
+  docker logs "$CONTAINER" 2>&1 | grep 'web demo:' | tail -n 1 || true
+}
+
+has_token() {
+  [[ -n "$(env_get TENKTS_WEB_NODE_TOKEN)" ]]
+}
+
+# With a token, wait out the node's 20-second answer and say what came of it.
+report_model() {
+  local line=""
+  if ! has_token; then
+    echo "  No node token: the page serves, but nothing new can be built."
+    echo "  Give it a node: $PROG link-ai-ui URL, or set TENKTS_WEB_NODE and TENKTS_WEB_NODE_TOKEN in $ENV_FILE"
+    return 0
+  fi
+  for _ in $(seq 1 25); do
+    line="$(model_line)"
+    [[ -z "$line" ]] || break
+    sleep 1
+  done
+  case "$line" in
+    *"the model comes from"*) echo "  ${line#*web demo: }" ;;
+    "") echo "  Warning: the node has not answered yet. Check later: $PROG status" ;;
+    *)  echo "  Warning: the node gave no model: ${line#*web demo: }"
+        echo "  Check TENKTS_WEB_NODE and TENKTS_WEB_NODE_TOKEN in $ENV_FILE, then: $PROG start" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_start() {
+  local port="" first_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) [[ $# -ge 2 ]] || die "--port needs a port"; check_port "$2"; port="$2"; shift 2 ;;
+      --tag)  [[ $# -ge 2 ]] || die "--tag needs a tag"; set_tag "$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  [[ -f "$ENV_FILE" ]] || first_run=1
+  ensure_env_file
+  [[ -z "$port" ]] || env_set TINKER_WEB_PORT "$port"
+  port="$(web_port)"
+  check_port "$port"
+
+  ensure_docker
+  docker image inspect "$IMAGE" &>/dev/null || pull_image
+  ensure_network
+  docker rm -f "$CONTAINER" &>/dev/null || true
+
+  # The server's own address follows the published port, whatever the file says.
+  echo "Starting web Tinker ($IMAGE)..."
+  docker run -d --name "$CONTAINER" \
+    --restart unless-stopped \
+    --network "$NETWORK" \
+    "$HOST_ENTRY" \
+    -p "127.0.0.1:$port:$SERVER_PORT" \
+    -v "$VOLUME:/data" \
+    --env-file "$ENV_FILE" \
+    -e "TENKTS_SERVER_BIND=0.0.0.0:$SERVER_PORT" \
+    "$IMAGE" >/dev/null
+  wait_page
+
+  echo ""
+  echo "Web Tinker is running at $(page_url), on this machine only."
+  report_model
+  if [[ $first_run == 1 ]]; then
+    echo "  Nobody signs up without an invite code: $PROG invite"
+    echo "  Settings: $ENV_FILE"
+  fi
+}
+
+cmd_stop() {
+  if container_running; then
+    docker stop "$CONTAINER" >/dev/null
+    echo "Stopped. Web Tinker stays stopped, across reboots too, until: $PROG start"
+  else
+    echo "Web Tinker is not running."
+  fi
+}
+
+cmd_update() {
+  # --tag is start's option too; read it here so the pull fetches that image.
+  local arg prev=""
+  for arg in "$@"; do
+    [[ "$prev" == --tag ]] && set_tag "$arg"
+    prev="$arg"
+  done
+  ensure_docker
+  pull_image
+  cmd_start "$@"
+}
+
+cmd_status() {
+  if ! docker container inspect "$CONTAINER" &>/dev/null; then
+    echo "Web Tinker is not set up here. Start it with: $PROG start"
+    return 0
+  fi
+  docker container inspect -f 'Container: {{.State.Status}}
+Image:     {{.Config.Image}}' "$CONTAINER"
+  echo "Address:   $(page_url) (this machine only)"
+  echo "Settings:  $ENV_FILE"
+  if page_answers; then echo "Page:      answers"; else echo "Page:      not answering"; fi
+  local node token=none line
+  node="$(env_get TENKTS_WEB_NODE)"
+  ! has_token || token="set"
+  echo "Node:      ${node:-$UPSTREAM_NODE} (token: $token)"
+  line="$(model_line)"
+  [[ -n "$line" ]] && line="${line#*web demo: }"
+  echo "Model:     ${line:-none yet}"
+}
+
+cmd_logs() {
+  docker logs -f --tail 100 "$CONTAINER"
+}
+
+cmd_open() {
+  local url
+  url="$(page_url)"
+  echo "$url"
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    echo "Over SSH, this Mac's browser is not yours. On your machine: $PROG tunnel $(hostname -s), then open $url there." >&2
+  elif [[ "$(uname)" == Darwin ]]; then
+    open "$url"
+  fi
+}
+
+# tinker-cli works on the server's database, which the first start makes, so
+# the page must answer first. --to keeps the codes in the volume, readable by
+# the server's user only, so `tinker-web invite >/dev/null` keeps them off the screen.
+cmd_invite() {
+  local name=demo count=3 file
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)  [[ $# -ge 2 ]] || die "--name needs a name"; name="$2"; shift 2 ;;
+      --count) [[ $# -ge 2 ]] || die "--count needs a number"; count="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+  [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] || die "--name may hold only letters, digits, _, . and -"
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "--count must be a whole number above 0"
+  container_running || die "web Tinker is not running. Start it first: $PROG start"
+  page_answers || die "web Tinker does not answer yet at $(page_url). See: $PROG logs"
+  file="/data/invites-$name-$(date -u +%Y%m%dT%H%M%SZ).txt"
+  docker exec "$CONTAINER" tinker-cli invites new --name "$name" --count "$count" --to "$file"
+  echo "The codes are also in $file: docker exec $CONTAINER cat $file" >&2
+}
+
+# No docker here: the tunnel runs on the machine you sit at. ExitOnForwardFailure
+# ends it when the local port is taken, where ssh would otherwise stay up with
+# no tunnel.
+cmd_tunnel() {
+  local host="" port=$DEFAULT_PORT remote_port=$DEFAULT_PORT
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)        [[ $# -ge 2 ]] || die "--port needs a port"; check_port "$2"; port="$2"; shift 2 ;;
+      --remote-port) [[ $# -ge 2 ]] || die "--remote-port needs a port"; check_port "$2"; remote_port="$2"; shift 2 ;;
+      -*) echo "Unknown option: $1"; usage; exit 1 ;;
+      *)  [[ -z "$host" ]] || die "one host only: $host, then $1"; host="$1"; shift ;;
+    esac
+  done
+  [[ -n "$host" ]] || die "which host? $PROG tunnel HOST"
+  echo "Web Tinker on $host: open http://localhost:$port here. Ctrl-C closes the tunnel."
+  exec ssh -N -o ExitOnForwardFailure=yes -L "$port:127.0.0.1:$remote_port" "$host"
+}
+
+# The AI-UI side of link-ai-ui, over AI-UI's HTTP API. The admin's login comes
+# in the environment and never leaves this process. Messages go to stderr; on
+# success, stdout carries three lines for the caller only: the node's key, the
+# new account's password (empty when the account was there), and the base URL
+# AI-UI hands web Tinker. A User-Agent, since Cloudflare refuses urllib's own.
+provision() {  # URL BASE_MODEL
+  AI_UI_URL="$1" BASE_MODEL="$2" NODE_EMAIL="$NODE_EMAIL" /usr/bin/python3 - <<'PY'
+import json, os, secrets, sys, urllib.error, urllib.parse, urllib.request
+
+url, base, node_email = os.environ["AI_UI_URL"], os.environ["BASE_MODEL"], os.environ["NODE_EMAIL"]
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    sys.exit(1)
+
+def say(message):
+    print(message, file=sys.stderr)
+
+def call(method, path, token=None, body=None):
+    request = urllib.request.Request(url + path, method=method,
+                                     headers={"User-Agent": "tinker-web", "Accept": "application/json"})
+    if token:
+        request.add_header("Authorization", "Bearer " + token)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, data, timeout=30) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    except (urllib.error.URLError, OSError) as error:
+        fail(f"no answer from {url}: {getattr(error, 'reason', error)}")
+    try:
+        return status, json.loads(raw) if raw else None
+    except ValueError:
+        return status, None
+
+# The route answers 404 while ENABLE_TINKER_NODE is off, before it asks for a key.
+status, _ = call("GET", "/v1/model-login")
+if status == 404:
+    fail(f"{url} does not answer /v1/model-login. Its AI-UI needs a release with the route, then "
+         "ENABLE_TINKER_NODE=true (and TINKER_NODE_BASE_URL, the address web Tinker posts to) in its settings, and a restart.")
+if status != 401:
+    fail(f"{url}/v1/model-login answered {status} to a call without a key, where AI-UI answers 401. Is it an AI-UI?")
+
+status, admin = call("POST", "/api/v1/auths/signin",
+                     body={"email": os.environ["AI_UI_ADMIN_EMAIL"], "password": os.environ["AI_UI_ADMIN_PASSWORD"]})
+if status != 200 or not isinstance(admin, dict) or not admin.get("token"):
+    fail(f"the admin sign-in was refused ({status}). Check AI_UI_ADMIN_EMAIL and AI_UI_ADMIN_PASSWORD.")
+if admin.get("role") != "admin":
+    fail(f"{admin.get('email')} is no admin on {url}.")
+token = admin["token"]
+
+status, config = call("GET", "/api/v1/auths/admin/config", token)
+if status != 200 or not isinstance(config, dict):
+    fail(f"could not read the admin settings ({status}).")
+if not config.get("ENABLE_API_KEY"):
+    fail("API keys are off on this AI-UI, and web Tinker signs in with one. Turn them on in Admin Settings, General.")
+if config.get("ENABLE_API_KEY_ENDPOINT_RESTRICTIONS"):
+    allowed = [path.strip() for path in (config.get("API_KEY_ALLOWED_ENDPOINTS") or "").split(",")]
+    missing = [path for path in ("/v1/model-login", "/api/chat/completions") if path not in allowed]
+    if missing:
+        fail("API keys may reach only some endpoints here. Add " + " and ".join(missing) +
+             " to the allowed endpoints in Admin Settings, General.")
+
+# An admin reads a user's key from the user list. Only the user may make one,
+# so a new account makes its own with the token it signs up with.
+status, found = call("GET", "/api/v1/users/?" + urllib.parse.urlencode({"query": node_email, "page": 1}), token)
+if status != 200 or not isinstance(found, dict):
+    fail(f"could not list the users ({status}).")
+node = next((user for user in found.get("users") or [] if (user.get("email") or "").lower() == node_email), None)
+password = ""
+if node:
+    if node.get("role") == "pending":
+        fail(f"{node_email} waits as pending on {url}. Make it a user in Admin, Users, then run this again.")
+    key = node.get("api_key") or ""
+    if not key:
+        fail(f"{node_email} is on {url} without an API key. Sign in as it and make one, or remove the account, then run this again.")
+    say(f"User {node_email}: there already. Its key stays as it is.")
+else:
+    password = secrets.token_urlsafe(24)
+    status, node = call("POST", "/api/v1/auths/add", token,
+                        {"name": "Tinker node", "email": node_email, "password": password, "role": "user"})
+    if status != 200 or not isinstance(node, dict) or not node.get("token"):
+        fail(f"could not add the user {node_email} ({status}).")
+    status, made = call("POST", "/api/v1/auths/api_key", node["token"])
+    key = (made or {}).get("api_key") or ""
+    if status != 200 or not key.startswith("sk-"):
+        fail(f"{node_email} is made, but no API key came back ({status}). Make one as it, then run this again.")
+    say(f"User {node_email}: made, with an API key.")
+
+status, login = call("GET", "/v1/model-login", key)
+if status != 200 or not isinstance(login, dict) or not login.get("model"):
+    fail(f"/v1/model-login refused {node_email}'s key ({status}).")
+model = login["model"]
+
+# The preset AI-UI names: read access for the node only, and no system prompt,
+# so Tinker's own prompts are the only instructions.
+status, preset = call("GET", "/api/v1/models/model?" + urllib.parse.urlencode({"id": model}), token)
+if status == 200 and isinstance(preset, dict):
+    access = preset.get("access_control")
+    readers = ((access or {}).get("read") or {}).get("user_ids") or []
+    if access is not None and node["id"] not in readers:
+        fail(f"the preset {model} is there, but {node_email} may not use it. Give it read access by name "
+             f"in Workspace, Models, {model}, then run this again.")
+    say(f"Preset {model}: there already, and {node_email} may use it.")
+else:
+    status, served = call("GET", "/api/models", token)
+    ids = [entry.get("id") for entry in (served or {}).get("data") or []] if status == 200 else []
+    if not base:
+        fail(f"{url} has no preset {model} yet. Name the model it runs on: --base-model ID. "
+             "This AI-UI serves: " + (", ".join(ids[:20]) or "nothing"))
+    if base not in ids:
+        fail(f"{url} serves no model {base}. It serves: " + (", ".join(ids[:20]) or "nothing"))
+    status, _ = call("POST", "/api/v1/models/create", token, {
+        "id": model, "base_model_id": base, "name": "Tinker build",
+        "meta": {"description": f"Web Tinker's builds: {base} with no system prompt, "
+                                "so Tinker's own prompts are the only instructions."},
+        "params": {},
+        "access_control": {"read": {"group_ids": [], "user_ids": [node["id"]]},
+                           "write": {"group_ids": [], "user_ids": []}},
+        "is_active": True})
+    if status != 200:
+        fail(f"could not make the preset {model} ({status}).")
+    say(f"Preset {model}: made on {base}, with no system prompt, for {node_email} only.")
+
+print(key)
+print(password)
+print(login.get("base_url") or "")
+PY
+}
+
+# localhost in URL means this machine, which a container reaches as host.docker.internal.
+node_address() {
+  local url="$1" rest host
+  rest="${url#*://}"
+  host="${rest%%/*}"
+  host="${host%:*}"
+  case "$host" in
+    localhost|127.0.0.1|"[::1]") echo "${url%%://*}://host.docker.internal${rest#"$host"}" ;;
+    *) echo "$url" ;;
+  esac
+}
+
+cmd_link_ai_ui() {
+  local url="" base="" node="" item="" key="" password="" base_url="" base_host
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --base-model) [[ $# -ge 2 ]] || die "--base-model needs a model id"; base="$2"; shift 2 ;;
+      --node)       [[ $# -ge 2 ]] || die "--node needs a URL"; node="${2%/}"; shift 2 ;;
+      --vault)      [[ $# -ge 2 ]] || die "--vault needs an item name"; item="$2"; shift 2 ;;
+      -*) echo "Unknown option: $1"; usage; exit 1 ;;
+      *)  [[ -z "$url" ]] || die "one URL only: $url, then $1"; url="${1%/}"; shift ;;
+    esac
+  done
+  [[ "$url" =~ ^https?://[^/]+ ]] || die "which AI-UI? $PROG link-ai-ui URL, such as http://localhost:8080"
+  [[ -z "$node" || "$node" =~ ^https?://[^/]+ ]] || die "--node must be an http or https address"
+  [[ -z "$item" ]] || command -v sage-secret &>/dev/null \
+    || die "--vault needs sage-secret: brew install sage-is/apps/sage-secret"
+
+  # The admin's login: from the environment (sage-secret run can put it there), else asked.
+  local email="${AI_UI_ADMIN_EMAIL:-}" admin_password="${AI_UI_ADMIN_PASSWORD:-}"
+  if [[ -z "$email" || -z "$admin_password" ]]; then
+    [[ -t 0 ]] || die "set AI_UI_ADMIN_EMAIL and AI_UI_ADMIN_PASSWORD, or run this at a terminal."
+    [[ -n "$email" ]] || read -rp "Admin email on $url: " email
+    [[ -n "$admin_password" ]] || { read -rsp "Password for $email: " admin_password; echo >&2; }
+  fi
+
+  # Read through a pipe, so the key is never in a file but the settings.
+  { IFS= read -r key; IFS= read -r password; IFS= read -r base_url; } \
+    < <(AI_UI_ADMIN_EMAIL="$email" AI_UI_ADMIN_PASSWORD="$admin_password" provision "$url" "$base")
+  [[ -n "$key" ]] || exit 1
+
+  node="${node:-$(node_address "$url")}"
+  ensure_env_file
+  env_set TENKTS_WEB_NODE "$node"
+  env_set TENKTS_WEB_NODE_TOKEN "$key"
+  echo "Node: $node. Its key is in $ENV_FILE."
+  base_host="${base_url#*://}"
+  base_host="${base_host%%[:/]*}"
+  case "$base_host" in
+    localhost|127.0.0.1|"[")
+      echo "Warning: AI-UI hands web Tinker $base_url, which is the container itself from inside it."
+      echo "  Set TINKER_NODE_BASE_URL in AI-UI's settings to an address a container reaches, such as ${node}/api, and restart AI-UI." ;;
+  esac
+
+  if [[ -n "$item" ]]; then
+    # Through the environment, never an argument; --replace keeps the item's other fields.
+    TINKER_NODE_KEY="$key" sage-secret put "$item" --from-env TINKER_NODE_KEY --username "$NODE_EMAIL" --replace
+    if [[ -n "$password" ]]; then
+      TINKER_NODE_PASSWORD="$password" sage-secret put "$item" --field account_password \
+        --from-env TINKER_NODE_PASSWORD --replace
+    fi
+  fi
+
+  if container_running; then
+    echo "Web Tinker asks its node only at start: starting it again, on the image it runs."
+    IMAGE="$(docker container inspect -f '{{.Config.Image}}' "$CONTAINER")"
+    ensure_docker
+    cmd_start
+  else
+    echo "Start web Tinker to use it: $PROG start"
+  fi
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+command="$1"; shift
+
+# --runtime NAME works with every command: take it out before the command reads its own options.
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runtime)
+      [[ $# -ge 2 ]] || die "--runtime needs one of: $RUNTIMES"
+      RUNTIME_FLAG="$2"; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+# macOS runs bash 3.2, where "${args[@]}" on an empty array trips `set -u`.
+set -- ${args[@]+"${args[@]}"}
+
+if [[ "$(uname)" == Darwin ]]; then
+  case "$command" in
+    start|stop|update|status|logs|invite|link-ai-ui) select_runtime ;;
+  esac
+fi
+
+case "$command" in
+  start)   cmd_start "$@" ;;
+  stop)    cmd_stop ;;
+  update)  cmd_update "$@" ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs ;;
+  open)    cmd_open ;;
+  invite)  cmd_invite "$@" ;;
+  tunnel)  cmd_tunnel "$@" ;;
+  link-ai-ui) cmd_link_ai_ui "$@" ;;
+  version|-v|--version) cmd_version ;;
+  -h|--help|help) usage ;;
+  *) echo "Unknown command: $command"; usage; exit 1 ;;
+esac

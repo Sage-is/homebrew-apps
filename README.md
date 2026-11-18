@@ -238,6 +238,22 @@ trellis-crm mailbox list      # the mail accounts Trellis reads
 
 For a demo, `--env-file FILE` (mode 600) hands the dev install API keys and the demo's switches, never mail settings. Every line is `NAME=value` with a value, a `#` comment or blank. Any other line stops the run with its number (`line 4 is not NAME=value`) and is never printed. `--reset` starts its synthetic data afresh: it tries `docker volume rm` up to five times, and if the volume survives it stops with "the dev volume is still there; nothing was reset". `--link-ai-ui` is opt-in and needs an `--env-file` that carries `AI_UI_API_KEY` and `NOTIFY_SPACE_ID`. It puts the dev install on `sage-network`, which it makes if missing, connects `sage-ai` to it when that container exists, and sets `AI_UI_URL=http://sage-ai:8080` itself, so the file may not carry `AI_UI_URL`. AI-UI then reaches the dev install at `http://trellis-crm-dev:8000`, and the summary says which Space gets the notices. Give the dev install its own AI-UI key and a test Space: it stops when the file's key or Space is the real settings file's, and prints neither. Mail settings never pass.
 
+## tinker-web
+
+**tinker-web** runs web Tinker on a Mac: type a sentence in a browser tab and an app appears. The image, `ghcr.io/sage-is/tinker-web`, is public and AGPL-3.0-only, built unmodified from a pinned upstream commit by [Sage-is/tinker-web](https://github.com/Sage-is/tinker-web), whose README holds the one `docker run` line and every setting. The command wraps that line: loopback only (upstream says never put it on a public address), invite-only, settings and the node token in `~/.sage-is/tinker-web.env` at mode 600.
+
+```bash
+brew tap sage-is/apps && brew tap libkrun/krun && brew trust --tap sage-is/apps libkrun/krun && brew install tinker-web
+tinker-web start              # http://localhost:8799
+tinker-web invite             # 3 invite codes, printed once and kept in the volume
+tinker-web link-ai-ui URL     # an AI-UI as its node, so AI-UI guards every model call
+tinker-web tunnel HOST        # from another Mac: ssh -L 8799:127.0.0.1:8799 HOST
+```
+
+Open `http://localhost:8799`, never `127.0.0.1`: the apps Tinker builds open at `<id>.widget.localhost`, and only names under `localhost` resolve without DNS. The pull signs in nowhere and skips docker's credential helper, whose Keychain refuses a session without a screen, such as SSH. `TINKER_WEB_NAME=NAME` runs a second copy beside the first, with container `NAME`, volume `NAME-data` and settings `~/.sage-is/NAME.env`.
+
+`tinker-web link-ai-ui URL` signs in as an AI-UI admin (`AI_UI_ADMIN_EMAIL` and `AI_UI_ADMIN_PASSWORD`, else asked at the terminal) and makes what is missing: the user `tinker-node@sage.is` with an API key, and the preset AI-UI's `/v1/model-login` names, on `--base-model ID` with no system prompt and read access for that user only. A key it finds stays as it is, so a second Mac linked to the same AI-UI breaks no other. The key goes to the settings file and, with `--vault ITEM`, to the vault through `sage-secret put`; it never reaches the screen or a command line. A running web Tinker starts again on its image, since it asks its node only at start. AI-UI must run with `ENABLE_TINKER_NODE=true` and a `TINKER_NODE_BASE_URL` the container reaches.
+
 ## sage-box
 
 **sage-box** makes a Mac a Sage.is box: one file per box names its address, its login, the vault items that unlock it and what it runs; one run reaches it over SSH, prints what it found and what it would change, and with `--apply` does it. Tools from the tap, a krunkit VM, Colima at power-on, restart after a power cut, the Trellis checkout or image, the registry sign-in, `trellis-crm start`, a nightly backup on the box and an encrypted copy pulled here. Every step is idempotent; secrets travel from the vault on stdin, never on a command line.
