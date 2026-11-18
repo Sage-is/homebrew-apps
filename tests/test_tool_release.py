@@ -38,7 +38,7 @@ class VersionOfUrl(unittest.TestCase):
 
 
 class ImagePushed(unittest.TestCase):
-    """trellis-crm pins the Trellis image of its own version: no image, no release."""
+    """trellis-crm and tinker-web pin the image of their own version: no image, no release."""
 
     def check(self, tool, version, tags):
         with __import__("tempfile").TemporaryDirectory() as bin_dir:
@@ -53,6 +53,12 @@ class ImagePushed(unittest.TestCase):
         missing = self.check("trellis-crm", "0.1.4", ["latest", "0.1.2", "0.1.3", "0.1.40"])
         self.assertEqual(missing.returncode, 1)
         self.assertIn("ghcr.io/sage-is/trellis:0.1.4 is not in the registry", missing.stderr)
+
+    def test_a_tinker_web_release_needs_its_image(self):
+        self.assertEqual(self.check("tinker-web", "0.1.0", ["latest", "0.1.0"]).returncode, 0)
+        missing = self.check("tinker-web", "0.1.1", ["latest", "0.1.0"])
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("ghcr.io/sage-is/tinker-web:0.1.1 is not in the registry", missing.stderr)
 
     def gh_says(self, script):
         with __import__("tempfile").TemporaryDirectory() as bin_dir:
@@ -72,6 +78,12 @@ class ImagePushed(unittest.TestCase):
         self.assertEqual(run.returncode, 1)
         self.assertIn("could not list ghcr.io/sage-is/trellis's tags (gh: HTTP 502: Bad Gateway)", run.stderr)
         self.assertNotIn("is not in the registry", run.stderr)
+
+    def test_a_package_never_pushed_is_missing(self):
+        run = self.gh_says("echo 'gh: Package not found. (HTTP 404)' >&2\nexit 1\n")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("ghcr.io/sage-is/trellis:0.1.4 is not in the registry", run.stderr)
+        self.assertNotIn("run this again", run.stderr)
 
     def test_other_tools_are_not_asked(self):
         self.assertEqual(self.check("sage-box", "9.9.9", []).returncode, 0)

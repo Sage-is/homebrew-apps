@@ -18,23 +18,31 @@ version_of_url() {  # URL TOOL
   name=${name#"$2"-}  # a tool's own tag carries its name
   printf '%s\n' "$name" | sed -n 's/^v\([0-9][0-9.]*\)$/\1/p'
 }
-# The image a release pins must already be in the registry. trellis-crm pins
-# the Trellis image of its own version (the formula's inreplace), so a
-# trellis-crm whose image is missing breaks every box that updates: it did on
-# 2026-10-28. Prints why and fails; any other tool passes.
+# The image a release pins must already be in the registry. trellis-crm and
+# tinker-web pin the image of their own version (the formula's inreplace), so
+# a release whose image is missing breaks every box that updates: trellis-crm's
+# did on 2026-10-28. Prints why and fails; any other tool passes.
 image_pushed() {  # TOOL VERSION
-  [ "$1" = trellis-crm ] || return 0
-  local tags
+  local package ship tags
+  case "$1" in
+    trellis-crm) package=trellis; ship="ship Trellis $2 first (its make ship pushes the image)" ;;
+    tinker-web)  package=tinker-web; ship="push it from Sage-is/tinker-web's v$2 tag first (make it_build_multi_arch_push_GHCR)" ;;
+    *)           return 0 ;;
+  esac
   # Every tag first, then the match. Piped into grep -q under pipefail, gh
   # would die of SIGPIPE on a page written after the match, and a pushed image
-  # would read as missing. A query that fails says so, never "missing".
-  if ! tags=$(gh api "/orgs/sage-is/packages/container/trellis/versions" --paginate \
+  # would read as missing. A query that fails says so, never "missing"; a
+  # package never pushed answers 404, and that is missing.
+  if ! tags=$(gh api "/orgs/sage-is/packages/container/$package/versions" --paginate \
       -q '.[].metadata.container.tags[]' 2>&1); then
-    echo "could not list ghcr.io/sage-is/trellis's tags (gh: ${tags##*$'\n'}); run this again" >&2
-    return 1
+    if [[ "$tags" != *"(HTTP 404)"* ]]; then
+      echo "could not list ghcr.io/sage-is/$package's tags (gh: ${tags##*$'\n'}); run this again" >&2
+      return 1
+    fi
+    tags=""
   fi
   grep -qxF "$2" <<<"$tags" && return 0
-  echo "ghcr.io/sage-is/trellis:$2 is not in the registry: ship Trellis $2 first (its make ship pushes the image)" >&2
+  echo "ghcr.io/sage-is/$package:$2 is not in the registry: $ship" >&2
   return 1
 }
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0  # sourced by the tests: the functions are all they need
@@ -95,8 +103,8 @@ if [ -z "$(git ls-remote --tags "$remote" "refs/tags/$tag")" ]; then
     exit 0
   fi
   echo "$tool $version: tag HEAD and push it"
-  # Every file the formula installs rides the tag too: sage-runtime and
-  # trellis-crm install the shared lib/.
+  # Every file the formula installs rides the tag too: sage-runtime,
+  # trellis-crm and tinker-web install the shared lib/.
   installs=$(sed -n 's/.*\.install \(.*\)$/\1/p' "$formula" | grep -o '"[^"]*"' | tr -d '"')
   if [ -n "$(git status --porcelain -- "$tool" "$formula" $installs)" ]; then
     [ "$apply" = 0 ] || die "commit $tool, $formula and the files it installs first: the tag takes HEAD"
