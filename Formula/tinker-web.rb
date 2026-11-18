@@ -58,8 +58,12 @@ class TinkerWeb < Formula
   end
 
   test do
+    # The tool's own version, then the image tag: the formula's version once
+    # installed, latest from a --HEAD install.
     tag = build.head? ? "latest" : version
-    assert_match(/^tinker-web #{tag} \(image \S+:#{tag}\)$/, shell_output("#{bin}/tinker-web version"))
+    out = shell_output("#{bin}/tinker-web version")
+    assert_match(/^tinker-web \d+\.\d+\.\d+ \(image \S+:#{tag}\)$/, out)
+    assert_match "tinker-web #{version} ", out unless build.head?
     assert_match "tunnel HOST", shell_output("#{bin}/tinker-web --help")
   end
 end
