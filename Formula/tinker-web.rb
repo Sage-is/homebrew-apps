@@ -3,7 +3,7 @@ class TinkerWeb < Formula
   homepage "https://github.com/Sage-is/tinker-web"
   url "https://github.com/Sage-is/homebrew-apps/archive/refs/tags/tinker-web-v0.1.0.tar.gz"
   version "0.1.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "05fef4257f02ffe72e814db2200c16c2ecd2c4dab3d9a6c3ed603d96fc76bb58"
   license "MIT"
 
   head "https://github.com/Sage-is/homebrew-apps.git", branch: "develop"
