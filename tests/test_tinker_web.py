@@ -20,8 +20,8 @@ MODEL_LINE = "web demo: the model comes from http://sage-ai:8080 (tinker-build)"
 
 # Stand-ins log each call to $STATE/calls. Docker keeps a little state as marker
 # files: the image, the network, the container, whether it is up and the image
-# it runs. A pull writes the engine address and the size of the docker config it
-# was given to $STATE/pull-env. `logs` prints $STATE/logs; `exec` prints invite
+# it runs. A pull writes the engine address and the docker config it was given
+# to $STATE/pull-env. `logs` prints $STATE/logs; `exec` prints invite
 # codes. With $STATE/page-down, nothing answers on the page.
 STUBS = {
     "docker": """ctx="${DOCKER_CONTEXT:-default}"
@@ -32,7 +32,7 @@ case "$1 ${2:-}" in
   "context show")    echo colima ;;
   "context inspect") echo "unix://$STATE/$ctx.sock" ;;
   "image inspect")   [[ -e "$STATE/image" ]] ;;
-  "pull "*)          echo "DOCKER_HOST=${DOCKER_HOST:-} config=$(ls -A "${DOCKER_CONFIG:-$HOME/.docker}" 2>/dev/null | wc -l | tr -d ' ')" > "$STATE/pull-env"
+  "pull "*)          { echo "DOCKER_HOST=${DOCKER_HOST:-}"; cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json"; } > "$STATE/pull-env"
                      touch "$STATE/image" ;;
   "network inspect") [[ -e "$STATE/network" ]] ;;
   "network create")  touch "$STATE/network" ;;
@@ -158,8 +158,14 @@ class FirstStart(Mac):
         (self.home / ".docker").mkdir()
         (self.home / ".docker" / "config.json").write_text('{"credsStore": "osxkeychain"}')
         self.ok("start")
-        self.assertEqual((self.state / "pull-env").read_text().strip(),
-                         f"DOCKER_HOST=unix://{self.state}/colima.sock config=0")
+        host, config = (self.state / "pull-env").read_text().split("\n", 1)
+        self.assertEqual(host, f"DOCKER_HOST=unix://{self.state}/colima.sock")
+        # docker picks the Keychain helper for a config that names no login, so this one names one.
+        config = json.loads(config)
+        self.assertNotIn("credsStore", config)
+        self.assertNotIn("credHelpers", config)
+        self.assertTrue(config["auths"])
+        self.assertFalse(any(config["auths"].values()))
         (pull,) = [c for c in self.calls() if " pull " in c]
         self.assertTrue(pull.startswith("docker default pull "), pull)
 

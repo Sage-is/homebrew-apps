@@ -205,14 +205,17 @@ container_running() {
 # The image is public, so the pull signs in nowhere. docker would still ask its
 # credential helper, and the Keychain's refuses a session without a screen, such
 # as SSH: "keychain cannot be accessed because the current session does not
-# allow user interaction". An empty docker config has no helper; it has no
-# contexts either, so the engine's address comes from the context in use.
+# allow user interaction". A docker config that names no login at all gets the
+# Keychain helper by default, so this one names a login for a host that does
+# not exist. It has no contexts, so the engine's address comes from the context
+# in use.
 pull_image() {
   local host config status=0
   echo "Pulling $IMAGE..."
   host="$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null)" || host=""
   if [[ -n "$host" ]]; then
     config="$(mktemp -d)"
+    echo '{"auths": {"anonymous.invalid": {}}}' > "$config/config.json"
     env -u DOCKER_CONTEXT DOCKER_CONFIG="$config" DOCKER_HOST="$host" docker pull "$IMAGE" || status=$?
     rm -rf "$config"
   else
